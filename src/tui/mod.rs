@@ -154,6 +154,8 @@ pub(crate) enum Msg {
     TailLog(String),
     DeployLogsCleared,
     SoftwareLogsCleared,
+    /// Shutdown requested by a termination signal (SIGTERM/SIGHUP).
+    Terminate,
 }
 
 pub(crate) struct App {
@@ -168,6 +170,9 @@ pub(crate) struct App {
     pub software_history: Vec<String>,
     deploy_tail_keep: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     software_tail_keep: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Cleanup notices collected on early exit, printed after the terminal is
+    /// restored so the user sees what was cleaned up.
+    exit_notices: Vec<String>,
 }
 
 /// Entry point: sets up the terminal, runs the loop, restores the terminal.
@@ -178,6 +183,19 @@ pub fn run() -> anyhow::Result<()> {
     terminal.clear()?;
 
     let (tx, rx) = mpsc::channel();
+    // Termination signals (kill, terminal closed) are routed through the event
+    // loop so the in-flight deploy (if any) gets its clean removal and the
+    // terminal is restored, instead of the process just being dropped.
+    let sig_tx = tx.clone();
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([signal_hook::consts::SIGTERM, signal_hook::consts::SIGHUP]) {
+        std::thread::spawn(move || {
+            // Consume one signal, ask the loop to shut down, then restore
+            // default dispositions so a follow-up signal kills us normally.
+            if signals.forever().next().is_some() {
+                let _ = sig_tx.send(Msg::Terminate);
+            }
+        });
+    }
     let mut app = App {
         screen: Screen::Main { selected: 0 },
         rx,
@@ -188,11 +206,15 @@ pub fn run() -> anyhow::Result<()> {
         software_history: Vec::new(),
         deploy_tail_keep: None,
         software_tail_keep: None,
+        exit_notices: Vec::new(),
     };
     let res = event_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
+    for m in &app.exit_notices {
+        eprintln!("{m}");
+    }
     res
 }
 
@@ -286,6 +308,10 @@ fn event_loop(
                         *scroll = 0;
                     }
                 }
+                Msg::Terminate => {
+                    // Termination signal: leave exactly like a deliberate exit.
+                    return exit_with_reconcile(app);
+                }
             }
         }
 
@@ -305,7 +331,7 @@ fn event_loop(
                         let before = std::mem::discriminant(&app.screen);
                         match on_key(app, key.code, key.modifiers) {
                             Flow::Continue => {}
-                            Flow::Exit => return Ok(()),
+                            Flow::Exit => return exit_with_reconcile(app),
                         }
                         // Screen switched: ratatui's cell-diff would keep glyphs
                         // from the longer previous screen — force a full repaint.
@@ -376,6 +402,16 @@ fn command_char(key: KeyCode) -> Option<char> {
         .iter()
         .find(|(nat, _)| *nat == lower)
         .map(|(_, lat)| *lat)
+}
+
+/// Leave the loop after cleaning up anything a still-in-flight deploy left
+/// behind. The deploy worker thread dies with the process, so its journal
+/// entry is reconciled (clean removal) here instead. Safe to call when no
+/// deploy is running — `reconcile_stale` is a no-op then.
+fn exit_with_reconcile(app: &mut App) -> anyhow::Result<()> {
+    let msgs = crate::hoster::deploy::reconcile_stale();
+    app.exit_notices.extend(msgs);
+    Ok(())
 }
 
 fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {

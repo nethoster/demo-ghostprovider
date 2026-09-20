@@ -7,6 +7,7 @@ use std::process::Command;
 use anyhow::Context;
 
 use super::gitclone;
+use super::journal::{self, DeployState};
 use super::models::{HostResult, RepoAnalysis};
 use super::port::find_free_port;
 use super::recipes::DemoRecipe;
@@ -270,6 +271,11 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
         clone_path: None,
         errors: vec![],
     };
+    // Journal the in-flight deploy. The entry is what lets an out-of-band
+    // interruption (panel exit/kill, shutdown/reboot) become a clean removal
+    // at the next launch; it is cleared at the end of this function for every
+    // in-process outcome (success or rollback).
+    journal::begin(recipe.service_name, url);
 
     let result = deploy_service(
         &analysis,
@@ -283,6 +289,10 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
     for u in &result.urls {
         screen(format!("listening on {u}"));
     }
+    // The deploy reached a terminal state the process itself handled (success
+    // or the in-process rollback already removed artifacts); clear our journal
+    // entry so the next launch does not re-clean a finished deploy.
+    journal::clear(recipe.service_name);
     if !result.service_names.is_empty() && result.errors.is_empty() {
         DeployOutcome::Deployed
     } else {
@@ -672,6 +682,11 @@ pub fn deploy_service(
         ));
     }
 
+    // Registration is the last step; mark it in the journal so a later
+    // reconciliation knows whether a leftover entry belongs to a deployed
+    // (live) service or to an interrupted deploy. `state.json` is written
+    // atomically, so `Registering` + a present registry entry means "live".
+    journal::mark(recipe.service_name, DeployState::Registering);
     crate::state::register(
         recipe.service_name,
         crate::state::ServiceEntry {
@@ -683,6 +698,7 @@ pub fn deploy_service(
     )
     .context("registering state")
     .ok();
+    journal::mark(recipe.service_name, DeployState::Registered);
 
     result.service_names = vec![recipe.service_name.into()];
     result.urls = vec![format!("http://localhost:{port}")];
@@ -813,6 +829,100 @@ pub fn remove_unit_and_state(service_name: &str) {
     let _ = Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();
+    // An explicit delete also settles any leftover journal entry for the
+    // service, so a later reconciliation does not try to clean it again.
+    journal::clear(service_name);
+}
+
+/// Does a leftover journal entry require actual cleanup, or only be forgot?
+///
+/// Reconciliation must never tear down a *live* service: `Registered` entries
+/// are settlements of a finished deploy, and a `Registering` entry whose
+/// registration already landed in `state.json` belongs to a service that is
+/// up and should keep running. Only truly unfinished deploys are returned as
+/// needing cleanup.
+fn stale_action(state: DeployState, registered: bool) -> bool {
+    match state {
+        DeployState::Registered => false,
+        DeployState::Registering if registered => false,
+        DeployState::Deploying | DeployState::Registering => true,
+    }
+}
+
+/// Remove everything a *single* in-flight deploy recorded in the journal may
+/// have left behind, whether or not `state.json` mentions the service.
+///
+/// Idempotent: safe to run repeatedly, and to run while the tail of an
+/// interrupted deploy worker is still winding down (both sides touch the same
+/// paths and tolerate already-absent files). Returns `true` when the project
+/// tree is gone (or never existed) — i.e. full removal; `false` keeps the
+/// journal entry so the next launch retries.
+fn cleanup_stale(service: &str, url: &str) -> bool {
+    remove_unit(service);
+    super::secrets::remove_env_file(service);
+
+    // The journal may outlive the registry entry (state.json is written last,
+    // during `Registering`): derive the clone dir from the repository URL,
+    // exactly as `clone_repo` would name it. The services_dir parent guard in
+    // `wipe_project_dir` still applies.
+    let mut removed = true;
+    if let Some((_, repo)) = super::github::parse_github_url(url) {
+        let dir = crate::paths::services_dir().join(safe_dirname(&repo));
+        if dir.is_dir() {
+            removed = wipe_project_dir(&dir.to_string_lossy());
+        }
+    }
+
+    // Free any announced port. Must be read BEFORE unregistering.
+    if let Some(e) = crate::state::get(service) {
+        for url in &e.urls {
+            if let Some(port) = url
+                .rsplit_once(':')
+                .and_then(|(_, p)| p.parse::<u16>().ok())
+            {
+                wait_port_released(port, std::time::Duration::from_secs(3));
+            }
+        }
+    }
+    crate::state::unregister(service).ok();
+    let _ = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .status();
+    removed
+}
+
+/// Sweep leftover deploy-journal entries and clean their artifacts with a
+/// full "clean removal" (unit + env file + project tree + registry slot).
+///
+/// Called on the next launch (TUI and `__deploy`) and on a deliberate early
+/// exit while a deploy is in flight (Ctrl+C / q / Esc, SIGTERM, SIGHUP). It
+/// never touches finished (`Registered`) or live (`Registering` with a
+/// registry slot) services. Returns human-readable notice lines for the
+/// deploy log so the panel surfaces what it cleaned.
+pub fn reconcile_stale() -> Vec<String> {
+    let mut msgs = Vec::new();
+    for (service, entry) in journal::entries() {
+        if !stale_action(entry.state, crate::state::get(&service).is_some()) {
+            journal::clear(&service);
+            continue;
+        }
+        msgs.push(format!(
+            "cleanup: interrupted deploy of {service} ({}) — removing leftover unit, env file and project tree",
+            entry.url
+        ));
+        if cleanup_stale(&service, &entry.url) {
+            msgs.push(format!("cleanup: {service}: removed"));
+            journal::clear(&service);
+        } else {
+            msgs.push(format!(
+                "cleanup: {service}: project tree still in use, retrying on next launch"
+            ));
+        }
+    }
+    for m in &msgs {
+        crate::tui::workers::append_deploy_log(m);
+    }
+    msgs
 }
 
 fn short(s: &str) -> String {
@@ -998,5 +1108,21 @@ mod tests {
         assert!(!address_is_non_loopback("127.0.0.1:8080"));
         assert!(!address_is_non_loopback("[::1]:8080"));
         assert!(!address_is_non_loopback("localhost:8080"));
+    }
+
+    /// Reconciliation must clean only genuinely unfinished deploys; a finished
+    /// or already-registered service is never torn down.
+    #[test]
+    fn stale_action_cleans_unfinished_but_preserves_live_services() {
+        // Registered: deploy finished; only forget the journal entry.
+        assert!(!stale_action(DeployState::Registered, true));
+        assert!(!stale_action(DeployState::Registered, false));
+        // Registering with the registry slot present: service is live.
+        assert!(!stale_action(DeployState::Registering, true));
+        // Registering without the slot: registration never landed → clean.
+        assert!(stale_action(DeployState::Registering, false));
+        // Still cloning/building: always clean.
+        assert!(stale_action(DeployState::Deploying, true));
+        assert!(stale_action(DeployState::Deploying, false));
     }
 }

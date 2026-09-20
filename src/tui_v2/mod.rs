@@ -225,6 +225,12 @@ fn event_loop(
                         software_lines.push("Logs cleared.".into());
                     }
                 }
+                Msg::Terminate => {
+                    // Termination signal: clean up any in-flight deploy, then
+                    // leave (mirrors the primary TUI's early-exit behaviour).
+                    let _ = crate::hoster::deploy::reconcile_stale();
+                    return Ok(());
+                }
             }
         }
 
@@ -241,7 +247,10 @@ fn event_loop(
                         let before = std::mem::discriminant(&app.screen);
                         match on_key(app, key.code, key.modifiers) {
                             Flow::Continue => {}
-                            Flow::Exit => return Ok(()),
+                            Flow::Exit => {
+                                let _ = crate::hoster::deploy::reconcile_stale();
+                                return Ok(());
+                            }
                         }
                         if std::mem::discriminant(&app.screen) != before {
                             terminal.clear()?;

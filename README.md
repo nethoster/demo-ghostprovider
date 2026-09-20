@@ -54,6 +54,28 @@ GhostProvider uses systemd user-level services because they provide:
 
 This is the standard on Arch, Ubuntu, Fedora, Debian, and most modern Linux distributions.
 
+### When the clean removal happens
+
+GhostProvider cleans up everything it created for a service — the systemd unit,
+the secrets file, the cloned project tree (build caches included) and the
+announced port — in every scenario:
+
+- **Explicit delete** — removing a service from *My Services* cleans unit, env
+  file, clone and registry entry.
+- **Failed deploy** — a deploy that fails in-process is rolled back and wiped
+  immediately (`clean removal` applies to the failed attempt, not just to a
+  finished service).
+- **User leaves while a deploy is running** (Ctrl+C / `q` / closing the
+  terminal, `SIGTERM`/`SIGHUP`) — the in-flight deploy is cleaned up as the
+  panel exits.
+- **The system shut down or rebooted mid-deploy** (or the panel was killed with
+  `SIGKILL`) — nothing can run while the machine is off, so the deploy is
+  recorded in an on-disk journal and fully removed on the next panel start.
+
+A deploy that *finished* is never touched by this: its service is registered
+and survives reboots (auto-start on login), and removing it is always an
+explicit act.
+
 ## Security Model
 
 Here is the security module that Ghost Provider uses, this is the necessary architecture for the secure operation of the software.

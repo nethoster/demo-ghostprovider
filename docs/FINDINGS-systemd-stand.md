@@ -52,3 +52,28 @@
 ## 3. Артефакты стенда
 gp-stand-escape.service, gp-stand-slow.service, gp-stand-fail.service —
 удалены после экспериментов; env/out файлы удалены.
+
+## 4. Чистая зачистка прерванных деплоев (приложение)
+
+Деплой идёт в отдельном потоке TUI; при выходе из панели/гибели процесса/
+выключении машины его in-process откат (`rollback_failed`) не выполняется.
+Дизайн гарантии «чистого удаления»:
+
+- On-disk журнал `~/.local/state/demo-ghostprovider/deploy-journal.json`:
+  запись `deploying` → `registering`/`registered` → удаление при завершении
+  `run_deployment` (успех или штатный откат). Оставшаяся запись = деплой
+  прерван вне процесса.
+- `cleanup_stale` идемпотентна и переиспользует штатные `remove_unit`,
+  `remove_env_file`, `wipe_project_dir` (guard parent == services_dir) —
+  поэтому безопасна при гонке с доживающим воркером.
+- Реконсиляция (`reconcile_stale`) на следующем запуске: `registered` — только
+  забыть; `registering` с уже записанным `state.json` — сервис живой, не
+  трогать; `registering` без записи и `deploying` — полная зачистка. Живые
+  зарегистрированные сервисы при ребуте НЕ удаляются (unit-пары contain
+  `Restart=always` + `WantedBy=default.target`).
+- Если немедленная зачистка не смогла удалить проектное дерево (его держит
+  ещё живой sandbox-build), запись журнала сохраняется → повтор следующего
+  запуска.
+- SIGTERM/SIGHUP обрабатываются через signal-hook в потоке, рутятся в цикл
+  событий как `Msg::Terminate` (та же зачистка + корректное восстановление
+  терминала). Ctrl+C в raw-mode TUI — это key event, обрабатывается там же.

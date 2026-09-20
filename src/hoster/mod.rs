@@ -6,6 +6,7 @@ pub mod gitclone;
 pub mod github;
 pub mod goenv;
 pub mod httpclient;
+pub mod journal;
 pub mod models;
 pub mod port;
 pub mod preflight;

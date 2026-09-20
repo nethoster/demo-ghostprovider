@@ -78,6 +78,7 @@ fn main() -> anyhow::Result<()> {
         }
         // Internal subcommand for scripted E2E: full pipeline without the TUI.
         Some("__deploy") => {
+            reconcile_on_startup();
             use std::cell::RefCell;
             let url = args.get(1).context("usage: __deploy GITHUB_URL")?;
             let painter = RefCell::new(demo_ghostprovider::output::Painter::new());
@@ -105,10 +106,20 @@ fn main() -> anyhow::Result<()> {
             std::process::exit(2);
         }
         _ => {
+            reconcile_on_startup();
             demo_ghostprovider::tui::run()?;
         }
     }
     Ok(())
+}
+
+/// Clean up artifacts left by deploys interrupted out-of-band (panel exit,
+/// kill, shutdown/reboot) before the interactive/scripted entry starts, and
+/// surface what was removed on stderr.
+fn reconcile_on_startup() {
+    for m in demo_ghostprovider::hoster::deploy::reconcile_stale() {
+        eprintln!("{m}");
+    }
 }
 
 fn print_help() {
