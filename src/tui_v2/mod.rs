@@ -228,7 +228,7 @@ fn event_loop(
                 Msg::Terminate => {
                     // Termination signal: clean up any in-flight deploy, then
                     // leave (mirrors the primary TUI's early-exit behaviour).
-                    let _ = crate::hoster::deploy::reconcile_stale();
+                    let _ = crate::hoster::deploy::reconcile_stale(true);
                     return Ok(());
                 }
             }
@@ -248,7 +248,7 @@ fn event_loop(
                         match on_key(app, key.code, key.modifiers) {
                             Flow::Continue => {}
                             Flow::Exit => {
-                                let _ = crate::hoster::deploy::reconcile_stale();
+                                let _ = crate::hoster::deploy::reconcile_stale(true);
                                 return Ok(());
                             }
                         }

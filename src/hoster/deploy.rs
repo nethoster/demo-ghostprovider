@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 
@@ -28,6 +29,14 @@ fn safe_dirname(name: &str) -> String {
         })
         .collect()
 }
+
+/// True while a deploy pipeline is running in this process. The TUI's exit
+/// path consults it to decide whether a cleaned journal entry must be kept so
+/// the *next* launch re-verifies: a still-running worker thread can re-create
+/// artifacts (the wiped clone tree, a unit file) in the window between the
+/// cleanup and the process actually dying, and a retained entry turns that
+/// leftover into a guaranteed, idempotent clean-up rather than permanent junk.
+static DEPLOY_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
 /// Clone (or reuse) the repository into the permanent services directory.
 pub fn clone_repo(
@@ -275,6 +284,7 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
     // interruption (panel exit/kill, shutdown/reboot) become a clean removal
     // at the next launch; it is cleared at the end of this function for every
     // in-process outcome (success or rollback).
+    DEPLOY_IN_FLIGHT.store(true, Ordering::Relaxed);
     journal::begin(recipe.service_name, url);
 
     let result = deploy_service(
@@ -293,6 +303,7 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
     // or the in-process rollback already removed artifacts); clear our journal
     // entry so the next launch does not re-clean a finished deploy.
     journal::clear(recipe.service_name);
+    DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
     if !result.service_names.is_empty() && result.errors.is_empty() {
         DeployOutcome::Deployed
     } else {
@@ -849,27 +860,53 @@ fn stale_action(state: DeployState, registered: bool) -> bool {
     }
 }
 
+/// What a single [`cleanup_stale`] pass actually removed, so the caller can
+/// tell "leftovers wiped" from "nothing was there" — the latter is a silent
+/// journal settle rather than a spurious `cleanup:` notice.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct CleanResult {
+    unit_removed: bool,
+    env_removed: bool,
+    tree_removed: bool,
+}
+
+impl CleanResult {
+    fn did_anything(&self) -> bool {
+        self.unit_removed || self.env_removed || self.tree_removed
+    }
+}
+
 /// Remove everything a *single* in-flight deploy recorded in the journal may
 /// have left behind, whether or not `state.json` mentions the service.
 ///
 /// Idempotent: safe to run repeatedly, and to run while the tail of an
 /// interrupted deploy worker is still winding down (both sides touch the same
-/// paths and tolerate already-absent files). Returns `true` when the project
-/// tree is gone (or never existed) — i.e. full removal; `false` keeps the
-/// journal entry so the next launch retries.
-fn cleanup_stale(service: &str, url: &str) -> bool {
+/// paths and tolerate already-absent files). Reports what it removed so the
+/// caller can decide whether a journal entry should survive (leftovers may
+/// still be re-created by a living worker) or be settled right away.
+fn cleanup_stale(service: &str, url: &str) -> CleanResult {
+    let mut report = CleanResult::default();
+
+    let unit_path = crate::paths::user_unit_dir().join(format!("{service}.service"));
+    if unit_path.exists() {
+        report.unit_removed = true;
+    }
     remove_unit(service);
+
+    let env_path = super::secrets::env_file_for(service);
+    if env_path.exists() {
+        report.env_removed = true;
+    }
     super::secrets::remove_env_file(service);
 
     // The journal may outlive the registry entry (state.json is written last,
     // during `Registering`): derive the clone dir from the repository URL,
     // exactly as `clone_repo` would name it. The services_dir parent guard in
     // `wipe_project_dir` still applies.
-    let mut removed = true;
     if let Some((_, repo)) = super::github::parse_github_url(url) {
         let dir = crate::paths::services_dir().join(safe_dirname(&repo));
         if dir.is_dir() {
-            removed = wipe_project_dir(&dir.to_string_lossy());
+            report.tree_removed = wipe_project_dir(&dir.to_string_lossy());
         }
     }
 
@@ -888,7 +925,7 @@ fn cleanup_stale(service: &str, url: &str) -> bool {
     let _ = Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();
-    removed
+    report
 }
 
 /// Sweep leftover deploy-journal entries and clean their artifacts with a
@@ -897,32 +934,55 @@ fn cleanup_stale(service: &str, url: &str) -> bool {
 /// Called on the next launch (TUI and `__deploy`) and on a deliberate early
 /// exit while a deploy is in flight (Ctrl+C / q / Esc, SIGTERM, SIGHUP). It
 /// never touches finished (`Registered`) or live (`Registering` with a
-/// registry slot) services. Returns human-readable notice lines for the
-/// deploy log so the panel surfaces what it cleaned.
-pub fn reconcile_stale() -> Vec<String> {
+/// registry slot) services. `keep_if_inflight` is set by the early-exit path:
+/// when a deploy pipeline is still running in this process, a wiped journal
+/// entry would let a worker re-created artifact become permanent leftovers,
+/// so the entry is retained for the next launch to re-verify idempotently.
+/// Returns human-readable notice lines for the deploy log so the panel
+/// surfaces what it cleaned.
+pub fn reconcile_stale(keep_if_inflight: bool) -> Vec<String> {
     let mut msgs = Vec::new();
     for (service, entry) in journal::entries() {
         if !stale_action(entry.state, crate::state::get(&service).is_some()) {
             journal::clear(&service);
             continue;
         }
-        msgs.push(format!(
-            "cleanup: interrupted deploy of {service} ({}) — removing leftover unit, env file and project tree",
-            entry.url
-        ));
-        if cleanup_stale(&service, &entry.url) {
+        let report = cleanup_stale(&service, &entry.url);
+        let defer = keep_if_inflight && deploy_in_flight();
+        if report.did_anything() || defer {
+            msgs.push(format!(
+                "cleanup: interrupted deploy of {service} ({}) — removing leftover unit, env file and project tree",
+                entry.url
+            ));
+        }
+        if defer {
+            // The worker may still re-create files until the process dies; let
+            // the next launch finish the job (idempotent).
+            msgs.push(format!(
+                "cleanup: {service}: deploy still winding down here — finalizing on next launch"
+            ));
+        } else if report.did_anything() {
             msgs.push(format!("cleanup: {service}: removed"));
             journal::clear(&service);
         } else {
+            // Nothing to remove: the interruption left no artifacts (or the
+            // previous pass already wiped them). Settle the entry — but keep a
+            // visible closure line in the log so the deferred-cleanup flow
+            // (interrupted → finalizing on next launch → settled) is traceable.
             msgs.push(format!(
-                "cleanup: {service}: project tree still in use, retrying on next launch"
+                "cleanup: {service}: no leftovers to remove; journal entry settled"
             ));
+            journal::clear(&service);
         }
     }
     for m in &msgs {
         crate::tui::workers::append_deploy_log(m);
     }
     msgs
+}
+
+fn deploy_in_flight() -> bool {
+    DEPLOY_IN_FLIGHT.load(Ordering::Relaxed)
 }
 
 fn short(s: &str) -> String {
@@ -978,15 +1038,12 @@ mod tests {
         }
     }
 
-    /// Serializes tests that mutate the process-global XDG_DATA_HOME.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// README promise: deleting a service wipes the clone together with its
     /// caches — but only inside services_dir.
     #[test]
     #[allow(unsafe_code)] // test-only env mutation (XDG_DATA_HOME)
     fn wipe_removes_clone_inside_services_dir_only() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = crate::paths::ENV_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!(
             "dgp-wipe-test-{}-{}",
             std::process::id(),
@@ -1014,7 +1071,7 @@ mod tests {
     #[test]
     #[allow(unsafe_code)] // test-only env mutation (XDG_DATA_HOME)
     fn wipe_refuses_paths_outside_services_dir() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = crate::paths::ENV_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!("dgp-wipe-guard-{}", std::process::id()));
         unsafe {
             std::env::set_var("XDG_DATA_HOME", &tmp);
@@ -1038,7 +1095,7 @@ mod tests {
     #[test]
     #[allow(unsafe_code)] // test-only env mutation (XDG_DATA_HOME)
     fn rollback_failed_wipes_project_tree_on_failed_deploy() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = crate::paths::ENV_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!(
             "dgp-rollback-test-{}-{}",
             std::process::id(),
@@ -1124,5 +1181,108 @@ mod tests {
         // Still cloning/building: always clean.
         assert!(stale_action(DeployState::Deploying, true));
         assert!(stale_action(DeployState::Deploying, false));
+    }
+
+    /// Point every XDG root at a fresh temp dir so a reconcile pass can run
+    /// against isolated journal/registry/clone/unit paths (real systemctl
+    /// calls still fail harmlessly because the unit does not exist).
+    #[allow(unsafe_code)] // test-only env mutation (XDG roots)
+    fn isolated_env(
+        tag: &str,
+    ) -> (
+        std::path::PathBuf,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let lock = crate::paths::ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "dgp-reconcile-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", tmp.join("data"));
+            std::env::set_var("XDG_STATE_HOME", tmp.join("state"));
+            std::env::set_var("XDG_CONFIG_HOME", tmp.join("config"));
+        }
+        (tmp, lock)
+    }
+
+    /// Leftovers wiped + entry cleared when a deploy finished unwinding.
+    #[test]
+    #[allow(unsafe_code)] // test-only env mutation
+    fn reconcile_wipes_leftovers_and_clears_entry() {
+        let (tmp, _env) = isolated_env("wipes");
+        journal::begin("demo-memos", "https://github.com/usememos/memos");
+        let project = crate::paths::services_dir().join("memos");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("file.txt"), "clone").unwrap();
+
+        let msgs = reconcile_stale(false);
+
+        assert!(!project.exists(), "clone tree must be removed");
+        assert!(journal::entries().is_empty(), "entry settled after removal");
+        assert!(
+            msgs.iter().any(|m| m.contains("demo-memos") && m.contains("removed")),
+            "notices must report the removal: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Nothing left behind → the entry is settled without claiming a removal,
+/// but with a visible closure line so the deferred flow stays traceable.
+    #[test]
+    #[allow(unsafe_code)] // test-only env mutation
+    fn reconcile_settles_empty_leftover_with_closure_line() {
+        let (tmp, _env) = isolated_env("settle");
+        journal::begin("demo-memos", "https://github.com/usememos/memos");
+
+        let msgs = reconcile_stale(false);
+
+        assert!(journal::entries().is_empty(), "silent entries are settled");
+        assert_eq!(msgs.len(), 1, "one closure line: {msgs:?}");
+        assert!(
+            msgs[0].contains("settled") && msgs[0].contains("no leftovers"),
+            "closure must not claim a removal: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Early exit while the deploy worker is still alive must keep the journal
+    /// entry so the next launch re-verifies instead of leaving re-created
+    /// artifacts as permanent leftovers.
+    #[test]
+    #[allow(unsafe_code)] // test-only env mutation + in-flight flag
+    fn reconcile_keeps_entry_while_deploy_in_flight() {
+        let (tmp, _env) = isolated_env("inflight");
+        journal::begin("demo-memos", "https://github.com/usememos/memos");
+        let project = crate::paths::services_dir().join("memos");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("file.txt"), "clone").unwrap();
+
+        DEPLOY_IN_FLIGHT.store(true, Ordering::Relaxed);
+        let keep = reconcile_stale(true);
+        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
+
+        assert!(
+            keep.iter().any(|m| m.contains("finalizing on next launch")),
+            "exit path must announce deferred finalization: {keep:?}"
+        );
+        assert_eq!(journal::entries().len(), 1, "entry retained for next launch");
+
+        let settle = reconcile_stale(false);
+        assert!(journal::entries().is_empty(), "next launch settles the entry");
+        assert!(!project.exists(), "and finishes wiping the tree");
+        let _ = std::fs::remove_dir_all(&tmp);
+        // The first (deferred) pass already wiped everything, so the next
+        // launch has nothing left to remove — it settles the entry with one
+        // closure line instead of a duplicate removal claim.
+        assert_eq!(settle.len(), 1, "one closure line: {settle:?}");
+        assert!(
+            settle[0].contains("settled") && settle[0].contains("no leftovers"),
+            "closure must not claim a removal: {settle:?}"
+        );
     }
 }

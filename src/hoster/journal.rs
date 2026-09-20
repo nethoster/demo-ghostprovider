@@ -100,9 +100,6 @@ pub fn entries() -> Vec<(String, JournalEntry)> {
 mod tests {
     use super::*;
 
-    /// Serializes tests that mutate the process-global XDG_STATE_HOME.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn tmp_state_home(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "dgp-journal-{tag}-{}-{}",
@@ -117,7 +114,7 @@ mod tests {
     #[test]
     #[allow(unsafe_code)] // test-only env mutation (XDG_STATE_HOME)
     fn roundtrips_and_tracks_lifecycle() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = crate::paths::ENV_LOCK.lock().unwrap();
         let tmp = tmp_state_home("life");
         unsafe {
             std::env::set_var("XDG_STATE_HOME", &tmp);
@@ -146,7 +143,7 @@ mod tests {
     #[test]
     #[allow(unsafe_code)] // test-only env mutation (XDG_STATE_HOME)
     fn clear_preserves_unrelated_entries() {
-        let _env = ENV_LOCK.lock().unwrap();
+        let _env = crate::paths::ENV_LOCK.lock().unwrap();
         let tmp = tmp_state_home("other");
         unsafe {
             std::env::set_var("XDG_STATE_HOME", &tmp);

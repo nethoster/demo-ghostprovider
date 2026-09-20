@@ -117,7 +117,7 @@ fn main() -> anyhow::Result<()> {
 /// kill, shutdown/reboot) before the interactive/scripted entry starts, and
 /// surface what was removed on stderr.
 fn reconcile_on_startup() {
-    for m in demo_ghostprovider::hoster::deploy::reconcile_stale() {
+    for m in demo_ghostprovider::hoster::deploy::reconcile_stale(false) {
         eprintln!("{m}");
     }
 }

@@ -5,6 +5,12 @@
 
 use std::path::PathBuf;
 
+/// Serializes tests that mutate the process-global XDG_* env vars. Module-local
+/// locks would not protect *across* modules (journal.rs, deploy.rs…), so all
+/// env-mutating tests share one lock.
+#[cfg(test)]
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn data_home() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)

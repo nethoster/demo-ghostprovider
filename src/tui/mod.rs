@@ -187,7 +187,11 @@ pub fn run() -> anyhow::Result<()> {
     // loop so the in-flight deploy (if any) gets its clean removal and the
     // terminal is restored, instead of the process just being dropped.
     let sig_tx = tx.clone();
-    if let Ok(mut signals) = signal_hook::iterator::Signals::new([signal_hook::consts::SIGTERM, signal_hook::consts::SIGHUP]) {
+    if let Ok(mut signals) = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+        signal_hook::consts::SIGINT,
+    ]) {
         std::thread::spawn(move || {
             // Consume one signal, ask the loop to shut down, then restore
             // default dispositions so a follow-up signal kills us normally.
@@ -409,7 +413,10 @@ fn command_char(key: KeyCode) -> Option<char> {
 /// entry is reconciled (clean removal) here instead. Safe to call when no
 /// deploy is running — `reconcile_stale` is a no-op then.
 fn exit_with_reconcile(app: &mut App) -> anyhow::Result<()> {
-    let msgs = crate::hoster::deploy::reconcile_stale();
+    // keep_if_inflight: if a deploy pipeline is still running in this process
+    // (worker thread), its entry is retained so the next launch re-verifies —
+    // the worker may re-create artifacts in the window before process death.
+    let msgs = crate::hoster::deploy::reconcile_stale(true);
     app.exit_notices.extend(msgs);
     Ok(())
 }
