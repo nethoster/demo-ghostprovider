@@ -99,7 +99,85 @@ pub fn run() -> anyhow::Result<()> {
 
     units::remove_unit("gp-selftest");
     let _ = std::fs::remove_dir_all(&root);
+    check_cleanup_sweep()?;
     println!("SELFTEST PASS");
+    Ok(())
+}
+
+/// Cleanup-sweep integration check: create a real transient `ghost-build-*`
+/// unit (exactly the shape an interrupted deploy leaves behind), then run the
+/// background sweep and require it to stop the orphan. The sweep only proceeds
+/// while the deploy lock is free; if a real deploy is running in this user
+/// session at selftest time, the lock makes the sweep defer and we skip.
+fn check_cleanup_sweep() -> anyhow::Result<()> {
+    if std::process::Command::new("systemd-run")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_err()
+    {
+        println!("SKIP cleanup sweep check: systemd-run not available");
+        return Ok(());
+    }
+
+    const UNIT: &str = "ghost-build-selftest.service";
+    // A `--collect` transient unit mirrors a killed `sandbox.rs`/`egress.rs`
+    // run: it exists in the user manager until stopped, independent of any
+    // panel process.
+    let spawn = std::process::Command::new("systemd-run")
+        .args([
+            "--user",
+            "--collect",
+            "--unit=ghost-build-selftest",
+            "/bin/sleep",
+            "600",
+        ])
+        .status();
+    match spawn {
+        Ok(st) if st.success() => {}
+        other => {
+            println!("SKIP cleanup sweep check: could not spawn transient unit ({other:?})");
+            return Ok(());
+        }
+    }
+
+    // Let the transient unit reach "active" before sweeping.
+    for _ in 0..20 {
+        if units::list_units().contains(&UNIT.to_string()) {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    let outcome = crate::hoster::deploy::sweep_stale();
+    match outcome {
+        crate::hoster::deploy::SweepOutcome::Cleaned(msgs) => {
+            println!("cleanup sweep: {msgs:?}");
+            // Poll for the transient unit's disappearance (stop + --collect).
+            for _ in 0..20 {
+                if !units::list_units().contains(&UNIT.to_string()) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+            if units::list_units().contains(&UNIT.to_string()) {
+                let _ = std::process::Command::new("systemctl")
+                    .args(["--user", "stop", UNIT])
+                    .status();
+                bail!("cleanup sweep ran but the ghost-build unit is still loaded");
+            }
+            println!("cleanup sweep: orphaned ghost unit stopped");
+        }
+        crate::hoster::deploy::SweepOutcome::Deferred => {
+            // A deploy is mid-flight in this user session; the lock correctly
+            // deferred us. Drop our own stray unit and skip.
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "stop", UNIT])
+                .status();
+            println!("SKIP cleanup sweep check: deploy lock held (deploy in progress)");
+        }
+    }
     Ok(())
 }
 

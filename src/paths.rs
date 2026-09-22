@@ -58,6 +58,12 @@ pub fn deploy_journal_file() -> PathBuf {
     state_home().join("demo-ghostprovider/deploy-journal.json")
 }
 
+/// Cross-process deploy lock: held for the whole lifetime of a journaled
+/// deploy, free as soon as the deploying process dies. See `hoster::lock`.
+pub fn deploy_lock_file() -> PathBuf {
+    state_home().join("demo-ghostprovider/deploy.lock")
+}
+
 /// systemd user unit directory.
 pub fn user_unit_dir() -> PathBuf {
     let cfg = std::env::var_os("XDG_CONFIG_HOME")

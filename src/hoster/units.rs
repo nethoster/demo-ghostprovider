@@ -80,6 +80,31 @@ fn systemctl(args: &[&str]) -> Option<(bool, String)> {
     ))
 }
 
+/// Names of every service unit loaded (or previously loaded, with `--all`) in
+/// the user manager, sorted and de-duplicated. Used by the cleanup sweep and
+/// by the self-test to watch transient units come and go.
+pub fn list_units() -> Vec<String> {
+    let Some((ok, out)) = systemctl(&[
+        "list-units",
+        "--all",
+        "--type=service",
+        "--plain",
+        "--no-legend",
+    ]) else {
+        return Vec::new();
+    };
+    if !ok {
+        return Vec::new();
+    }
+    let mut names = std::collections::BTreeSet::new();
+    for line in out.lines() {
+        if let Some(name) = line.split_whitespace().next() {
+            names.insert(name.to_string());
+        }
+    }
+    names.into_iter().collect()
+}
+
 /// Optional systemd resource-limit knobs rendered into a unit. Values are
 /// literal directives (e.g. `"512M"`, `"300"`); `None` leaves systemd's
 /// defaults in place. A demo service getting away with unbounded memory/tasks
@@ -527,25 +552,25 @@ mod tests {
         ] {
             assert!(content.contains(needle), "missing {needle:?}");
         }
-// InaccessiblePaths is derived from $HOME (CI runs as /home/runner) and
-// only includes roots that actually exist, so assert the directive is
-// present and every existing secret root made it in.
-let ins = content
+        // InaccessiblePaths is derived from $HOME (CI runs as /home/runner) and
+        // only includes roots that actually exist, so assert the directive is
+        // present and every existing secret root made it in.
+        let ins = content
             .lines()
             .find(|l| l.starts_with("InaccessiblePaths="))
             .expect("InaccessiblePaths directive must be present");
-for candidate in [".ssh", ".config", ".local/state/demo-ghostprovider"] {
-    let p = crate::paths::home().join(candidate);
-    if !p.exists() {
-        continue;
-    }
-    assert!(
-        ins.contains(p.to_string_lossy().as_ref()),
-        "missing {} in {}",
-        p.display(),
-        ins
-    );
-}        
+        for candidate in [".ssh", ".config", ".local/state/demo-ghostprovider"] {
+            let p = crate::paths::home().join(candidate);
+            if !p.exists() {
+                continue;
+            }
+            assert!(
+                ins.contains(p.to_string_lossy().as_ref()),
+                "missing {} in {}",
+                p.display(),
+                ins
+            );
+        }
         assert!(!content.contains("ProtectHome=tmpfs"));
 
         let bare = UnitSpec {
@@ -601,6 +626,9 @@ for candidate in [".ssh", ".config", ".local/state/demo-ghostprovider"] {
                 "runtime UnsetEnvironment misses {name:?}"
             );
         }
-        assert!(!line.contains("*"), "no globs tolerated in UnsetEnvironment");
+        assert!(
+            !line.contains("*"),
+            "no globs tolerated in UnsetEnvironment"
+        );
     }
 }

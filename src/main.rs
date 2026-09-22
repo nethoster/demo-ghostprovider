@@ -77,8 +77,23 @@ fn main() -> anyhow::Result<()> {
             serve::serve_static(std::path::Path::new(dir), port)?;
         }
         // Internal subcommand for scripted E2E: full pipeline without the TUI.
+        // Internal subcommand for the demo-ghostprovider-cleanup systemd user
+        // timer: sweep leftovers of deploys interrupted out-of-band (exit,
+        // SIGKILL, shutdown/reboot) — but only while the deploy lock is free,
+        // i.e. no deploy is genuinely live in this user session.
+        Some("__cleanup") => {
+            demo_ghostprovider::hoster::deploy::cleanup_cmd()?;
+        }
         Some("__deploy") => {
             reconcile_on_startup();
+            // A scripted deploy gets the same clean-removal guarantee as the
+            // panel: on SIGINT/SIGTERM/SIGHUP (Ctrl+C, systemd shutdown,
+            // terminal close) a watchdog runs the removal-II reconciliation
+            // path before exiting, so a half-finished clone/build tree and the
+            // journal entry never survive the process. While the deploy is
+            // running, this process itself holds the deploy lock, so the
+            // watchdog has no concurrent live deploy to race.
+            arm_deploy_signal_watchdog();
             use std::cell::RefCell;
             let url = args.get(1).context("usage: __deploy GITHUB_URL")?;
             let painter = RefCell::new(demo_ghostprovider::output::Painter::new());
@@ -120,6 +135,37 @@ fn reconcile_on_startup() {
     for m in demo_ghostprovider::hoster::deploy::reconcile_stale(false) {
         eprintln!("{m}");
     }
+}
+
+/// Watchdog for scripted `__deploy` runs: the first SIGINT/SIGTERM/SIGHUP
+/// triggers the interruption reconciliation (stop the in-flight unit, wipe the
+/// tree, settle or retain the journal entry) and exits 128+signal. The TUI
+/// routes the same signals through its event loop instead, so nothing here
+/// applies to interactive runs.
+fn arm_deploy_signal_watchdog() {
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([
+        signal_hook::consts::SIGINT,
+        signal_hook::consts::SIGTERM,
+        signal_hook::consts::SIGHUP,
+    ]) else {
+        return;
+    };
+    std::thread::spawn(move || {
+        let Some(sig) = signals.forever().next() else {
+            return;
+        };
+        // Set EXITING (so the pipeline stops starting steps), tear down the
+        // deploy's own writers (host clone/build children and ghost-* build
+        // units) and wait for the worker to unwind, then reconcile with the
+        // entry settled — the clone/build tree and journal entry go *now*, not
+        // on the next launch.
+        demo_ghostprovider::hoster::cancel::request_exit();
+        demo_ghostprovider::hoster::deploy::quiesce(std::time::Duration::from_secs(3));
+        for m in demo_ghostprovider::hoster::deploy::reconcile_stale(false) {
+            eprintln!("{m}");
+        }
+        std::process::exit(128 + sig);
+    });
 }
 
 fn print_help() {

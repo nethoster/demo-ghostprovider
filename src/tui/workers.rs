@@ -300,7 +300,7 @@ pub(crate) fn service_rows() -> Vec<(String, String, String)> {
 pub(crate) fn service_action(name: &str, action: &str) -> String {
     let res = match action {
         "stop" => systemctl(&["--user", "stop", name]),
-        "start" => systemctl(&["--user", "start", name]),
+        "start" => start_service(name),
         "delete" => {
             deploy::remove_unit_and_state(name);
             return format!("{name}: deleted");
@@ -316,7 +316,10 @@ pub(crate) fn service_action(name: &str, action: &str) -> String {
 pub(crate) fn fetch_software_logs() -> Vec<String> {
     let entries = crate::state::list();
     if entries.is_empty() {
-        return vec!["No services deployed yet.".into(), "Deploy a service to see its journal here.".into()];
+        return vec![
+            "No services deployed yet.".into(),
+            "Deploy a service to see its journal here.".into(),
+        ];
     }
     let mut out = Vec::new();
     for (name, entry) in entries {
@@ -361,6 +364,19 @@ pub(crate) fn fetch_software_logs() -> Vec<String> {
         out.push(String::new());
     }
     out
+}
+
+/// Bring a service back up from the panel, even after a rough landing.
+///
+/// A unit can be left `failed`/`start-limit-hit` (or `disabled`) by an
+/// interrupted deploy, a crash loop, or a redeploy that never finished. A
+/// plain `systemctl start` is then refused outright, which is why the only
+/// way out used to be delete + redeploy. Clearing the failed state and
+/// re-arming the install link first makes a single `start` enough.
+fn start_service(name: &str) -> anyhow::Result<()> {
+    let _ = systemctl(&["--user", "reset-failed", name]);
+    let _ = systemctl(&["--user", "enable", name]);
+    systemctl(&["--user", "start", name])
 }
 
 fn systemctl(args: &[&str]) -> anyhow::Result<()> {

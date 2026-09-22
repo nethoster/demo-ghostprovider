@@ -145,12 +145,24 @@ fn random_hex(bytes: usize) -> anyhow::Result<String> {
     Ok(out)
 }
 
-/// Stop and delete a previously deployed unit so it can be replaced cleanly.
+/// Stop a previously deployed instance before replacing it, WITHOUT tearing
+/// its unit down.
+///
+/// The redeploy only needs the old process gone so its port is free for the
+/// replacement (see the install step). Deleting or disabling the unit here
+/// opened a dangerous window: if the deploy was interrupted (panel closed,
+/// kill, reboot) between this stop and `create_unit`, a live, working service
+/// was left with no unit at all — unrecoverable except by a full delete +
+/// redeploy. Keeping the old unit in place means an interruption leaves the
+/// service intact (stopped, still enabled, same port), so the next boot or a
+/// plain `start` brings it back. `create_unit` replaces the file atomically
+/// on success, and `rollback_failed` still removes it if the deploy fails.
 fn stop_existing(service_name: &str) {
     let unit = crate::paths::user_unit_dir().join(format!("{service_name}.service"));
     if unit.is_file() {
-        remove_unit(service_name);
-        super::secrets::remove_env_file(service_name);
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", service_name])
+            .status();
     }
 }
 
@@ -186,8 +198,13 @@ fn screen_line(line: &str) -> bool {
 /// an installed-but-old `go` is left to GOTOOLCHAIN=auto + the seeded file://
 /// toolchain proxy, while a *missing* `go` always gets the pinned baseline
 /// (`None`), whose own default toolchain mode covers the rest.
-fn toolbox_needs(recipe: &DemoRecipe, project_dir: &Path) -> Vec<(super::toolcheck::Tool, Option<super::toolcheck::Ver>)> {
-    use super::toolcheck::{Tool, is_auto_provisionable, installed_version, manifest_requirements, tool_from_bin};
+fn toolbox_needs(
+    recipe: &DemoRecipe,
+    project_dir: &Path,
+) -> Vec<(super::toolcheck::Tool, Option<super::toolcheck::Ver>)> {
+    use super::toolcheck::{
+        Tool, installed_version, is_auto_provisionable, manifest_requirements, tool_from_bin,
+    };
     let reqs = manifest_requirements(project_dir);
     let min_for = |t: Tool| reqs.iter().find(|(mt, _)| *mt == t).map(|(_, m)| *m);
     let mut out = Vec::new();
@@ -248,7 +265,9 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
         }
     }
     if crate::netlog::logging_disabled() {
-        screen("warn: GHOSTPROVIDER_NO_NETLOG — outbound requests are not written to net.log".into());
+        screen(
+            "warn: GHOSTPROVIDER_NO_NETLOG — outbound requests are not written to net.log".into(),
+        );
     }
 
     let Some((owner, name)) = super::github::parse_github_url(url) else {
@@ -284,8 +303,36 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
     // interruption (panel exit/kill, shutdown/reboot) become a clean removal
     // at the next launch; it is cleared at the end of this function for every
     // in-process outcome (success or rollback).
+    //
+    // The cross-process deploy lock serializes pipelines: only one deploy may
+    // be running per user session (a second TUI, a scripted `__deploy`, or a
+    // stale caller would otherwise race the same clone/unit/port namespace).
+    // The lock is held from just before `journal::begin` until just after
+    // `journal::clear`, so a background sweeper that finds "journal entry
+    // present + lock free" knows the deploying process is dead and may remove
+    // leftovers without ever tearing down a live deploy.
     DEPLOY_IN_FLIGHT.store(true, Ordering::Relaxed);
+    let Some(_lock) = super::lock::try_lock_exclusive() else {
+        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
+        screen(
+            "! another deployment is already running (deploy.lock held) — refusing to \
+             start a second one"
+                .into(),
+        );
+        return DeployOutcome::Rejected("deploy-locked");
+    };
     journal::begin(recipe.service_name, url);
+
+    // Race guard for a just-spawned worker: if the exit path already asked us
+    // to stop (it set `EXITING` before this thread reached this line), settle
+    // our own entry now — nothing has been cloned or built yet, so there is
+    // nothing for the exit path to find and we must not leave a fresh entry
+    // behind after it reconciled.
+    if super::cancel::is_exiting() {
+        journal::clear(recipe.service_name);
+        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
+        return DeployOutcome::Rejected("exiting");
+    }
 
     let result = deploy_service(
         &analysis,
@@ -301,9 +348,21 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
     }
     // The deploy reached a terminal state the process itself handled (success
     // or the in-process rollback already removed artifacts); clear our journal
-    // entry so the next launch does not re-clean a finished deploy.
-    journal::clear(recipe.service_name);
-    DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
+    // entry so the next launch does not re-clean a finished deploy. The deploy
+    // lock is released here — after the entry is gone, so a sweeper can never
+    // see a live deploy's entry while the lock is free.
+    //
+    // The one exception is a graceful exit in progress: the exit path is about
+    // to reconcile and performs the *final* clean removal, and it needs the
+    // entry to remain so it can wipe a partial clone tree that never got a
+    // rollback (e.g. `clone_repo` failed — there is no project path to remove
+    // on our side). Leave the entry; the exit path settles it. See `cancel.rs`.
+    if super::cancel::is_exiting() {
+        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
+    } else {
+        journal::clear(recipe.service_name);
+        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
+    }
     if !result.service_names.is_empty() && result.errors.is_empty() {
         DeployOutcome::Deployed
     } else {
@@ -328,6 +387,12 @@ pub fn deploy_service(
         emit(&format!("! {msg}"));
         result.errors.push(msg);
     };
+
+    // A shutdown that began before this deploy even started must not clone:
+    // nothing exists yet, and the exit path handles the empty case.
+    if interrupted() {
+        return result;
+    }
 
     emit("cloning repository...");
     let Some(project_dir) = clone_repo(analysis, work_dir, Some(recipe.commit)) else {
@@ -425,8 +490,13 @@ pub fn deploy_service(
     // the sandboxed build has no network, so without a filled cache it cannot
     // produce a working tree — fail closed rather than build a broken service.
     for step in recipe.prefetch_steps {
+        if interrupted() {
+            rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
+            return result;
+        }
         let resolved = resolve_project_step(step, &project_dir);
-        if let Err(e) = super::prefetch::run_host_step(&resolved, &project_dir, &path_prefix, &emit) {
+        if let Err(e) = super::prefetch::run_host_step(&resolved, &project_dir, &path_prefix, &emit)
+        {
             report_err(
                 &mut result,
                 format!(
@@ -546,6 +616,10 @@ pub fn deploy_service(
         build_env.extend(super::prefetch::pip_offline_env(&project_dir));
     }
     for step in recipe.pre_build.iter().chain(recipe.build_steps.iter()) {
+        if interrupted() {
+            rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
+            return result;
+        }
         let resolved = resolve_project_step(step, &project_dir);
         match run_build_cmd(&resolved, &project_dir, &build_env, None) {
             Ok(r) if r.success => {}
@@ -570,6 +644,13 @@ pub fn deploy_service(
     }
 
     // ── install ──
+    // Last chance to bail before any systemd state is touched: once a unit is
+    // created/started the exit path's wipe must race systemd, so stop here and
+    // let the exit path remove the clone/build tree.
+    if interrupted() {
+        rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
+        return result;
+    }
     // Stop the previous instance BEFORE picking a port: a still-running old
     // unit holds the port and would push every redeploy one port up, silently
     // breaking the previously announced URL.
@@ -582,7 +663,9 @@ pub fn deploy_service(
             return result;
         }
     };
-    if recipe.searxng && let Err(e) = prepare_searxng_config(&project_dir, port) {
+    if recipe.searxng
+        && let Err(e) = prepare_searxng_config(&project_dir, port)
+    {
         report_err(&mut result, format!("searxng config failed: {e}"));
         rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
         return result;
@@ -637,12 +720,24 @@ pub fn deploy_service(
                     recipe.service_name
                 ),
             );
-            rollback_failed(&mut result, recipe.service_name, &project_dir, Some(port), &emit);
+            rollback_failed(
+                &mut result,
+                recipe.service_name,
+                &project_dir,
+                Some(port),
+                &emit,
+            );
             return result;
         }
         Err(_) => {
             report_err(&mut result, "failed to invoke systemctl start".into());
-            rollback_failed(&mut result, recipe.service_name, &project_dir, Some(port), &emit);
+            rollback_failed(
+                &mut result,
+                recipe.service_name,
+                &project_dir,
+                Some(port),
+                &emit,
+            );
             return result;
         }
     }
@@ -655,7 +750,13 @@ pub fn deploy_service(
                 &mut result,
                 format!("Service crashed immediately after start:\n{}", short(&logs)),
             );
-            rollback_failed(&mut result, recipe.service_name, &project_dir, Some(port), &emit);
+            rollback_failed(
+                &mut result,
+                recipe.service_name,
+                &project_dir,
+                Some(port),
+                &emit,
+            );
             return result;
         }
         StartOutcome::TimeoutWhileActivating => {
@@ -668,12 +769,24 @@ pub fn deploy_service(
                     short(&logs)
                 ),
             );
-            rollback_failed(&mut result, recipe.service_name, &project_dir, Some(port), &emit);
+            rollback_failed(
+                &mut result,
+                recipe.service_name,
+                &project_dir,
+                Some(port),
+                &emit,
+            );
             return result;
         }
         StartOutcome::SystemdUnavailable => {
             report_err(&mut result, "systemd user manager unavailable".into());
-            rollback_failed(&mut result, recipe.service_name, &project_dir, Some(port), &emit);
+            rollback_failed(
+                &mut result,
+                recipe.service_name,
+                &project_dir,
+                Some(port),
+                &emit,
+            );
             return result;
         }
     }
@@ -931,15 +1044,15 @@ fn cleanup_stale(service: &str, url: &str) -> CleanResult {
 /// Sweep leftover deploy-journal entries and clean their artifacts with a
 /// full "clean removal" (unit + env file + project tree + registry slot).
 ///
-/// Called on the next launch (TUI and `__deploy`) and on a deliberate early
-/// exit while a deploy is in flight (Ctrl+C / q / Esc, SIGTERM, SIGHUP). It
-/// never touches finished (`Registered`) or live (`Registering` with a
-/// registry slot) services. `keep_if_inflight` is set by the early-exit path:
-/// when a deploy pipeline is still running in this process, a wiped journal
-/// entry would let a worker re-created artifact become permanent leftovers,
-/// so the entry is retained for the next launch to re-verify idempotently.
-/// Returns human-readable notice lines for the deploy log so the panel
-/// surfaces what it cleaned.
+/// Called on the next launch (TUI and `__deploy`) and on exit while a deploy
+/// was in flight — but only *after* [`quiesce`] has stopped and waited for the
+/// in-process worker, so this removal is final rather than racing a writer.
+/// It never touches finished (`Registered`) or live (`Registering` with a
+/// registry slot) services. `keep_if_inflight = true` (used by the surviving
+/// `tui_v2` fork and unit tests) retains a still-running entry for the next
+/// launch to re-verify idempotently; the live exit paths always pass `false`
+/// because they have already quiesced. Returns human-readable notice lines for
+/// the deploy log so the panel surfaces what it cleaned.
 pub fn reconcile_stale(keep_if_inflight: bool) -> Vec<String> {
     let mut msgs = Vec::new();
     for (service, entry) in journal::entries() {
@@ -961,17 +1074,18 @@ pub fn reconcile_stale(keep_if_inflight: bool) -> Vec<String> {
             msgs.push(format!(
                 "cleanup: {service}: deploy still winding down here — finalizing on next launch"
             ));
-        } else if report.did_anything() {
-            msgs.push(format!("cleanup: {service}: removed"));
-            journal::clear(&service);
         } else {
-            // Nothing to remove: the interruption left no artifacts (or the
-            // previous pass already wiped them). Settle the entry — but keep a
-            // visible closure line in the log so the deferred-cleanup flow
-            // (interrupted → finalizing on next launch → settled) is traceable.
-            msgs.push(format!(
-                "cleanup: {service}: no leftovers to remove; journal entry settled"
-            ));
+            if report.did_anything() {
+                msgs.push(format!("cleanup: {service}: removed"));
+            } else {
+                // Nothing to remove: the interruption left no artifacts (or the
+                // previous pass already wiped them). Settle the entry — but keep a
+                // visible closure line in the log so the deferred-cleanup flow
+                // (interrupted → finalizing on next launch → settled) is traceable.
+                msgs.push(format!(
+                    "cleanup: {service}: no leftovers to remove; journal entry settled"
+                ));
+            }
             journal::clear(&service);
         }
     }
@@ -981,8 +1095,158 @@ pub fn reconcile_stale(keep_if_inflight: bool) -> Vec<String> {
     msgs
 }
 
-fn deploy_in_flight() -> bool {
+/// True while a deploy pipeline is running in this process. The TUI's exit
+/// path consults it to decide whether it must quiesce (stop the deploy's
+/// writers) before reconciling.
+pub fn deploy_in_flight() -> bool {
     DEPLOY_IN_FLIGHT.load(Ordering::Relaxed)
+}
+
+/// True once a graceful exit is in progress. The pipeline polls this between
+/// phases: an exit path owns the final clean removal, so a step that has not
+/// started must not start, and a step that is mid-flight returns without
+/// journaling a fresh terminal state.
+fn interrupted() -> bool {
+    super::cancel::is_exiting()
+}
+
+/// Stop every writer an in-flight deploy owns and wait (bounded by `timeout`)
+/// for the worker to observe [`interrupted`] and unwind. This is called on the
+/// exit path *before* the clean removal so that removal is final: it kills the
+/// deploy's host-side descendants (a running `git clone`/build step) and stops
+/// any orphaned `ghost-*` transient build units, then lets the worker notice and
+/// return. Once this returns, no deploy-owned process is still writing into the
+/// tree that `reconcile_stale` is about to wipe.
+pub fn quiesce(timeout: std::time::Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while deploy_in_flight() && std::time::Instant::now() < deadline {
+        stop_ghost_units();
+        super::cancel::kill_descendants(std::process::id());
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Transient-unit name prefixes this binary creates while deploying. Unlike
+/// deployed `demo-*.service` units they are managed by the user manager, not
+/// by the panel process, so a killed panel (SIGKILL, power loss) leaves them
+/// running for up to their `RuntimeMaxSec`. They are only stopped by a sweep
+/// that holds the deploy lock, which proves no deploy is live here. See
+/// `sandbox.rs` (`ghost-build-*`) and `egress.rs` (`ghost-egress-*`).
+const GHOST_UNIT_PREFIXES: &[&str] = &["ghost-build-", "ghost-egress-"];
+
+/// Names of every ghost transient unit currently loaded in the user manager.
+fn ghost_units() -> Vec<String> {
+    let Ok(out) = Command::new("systemctl")
+        .args([
+            "--user",
+            "list-units",
+            "--all",
+            "--type=service",
+            "--plain",
+            "--no-legend",
+        ])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    parse_ghost_units(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Map `systemctl --user list-units --plain --no-legend` output to the ghost
+/// unit names in it. Split out so unit tests exercise the parsing with
+/// synthetic rows and never need a live user manager.
+fn parse_ghost_units(output: &str) -> Vec<String> {
+    let mut units: Vec<String> = output
+        .lines()
+        .filter_map(|l| l.split_whitespace().next().map(str::to_owned))
+        .filter(|name| GHOST_UNIT_PREFIXES.iter().any(|p| name.starts_with(p)))
+        .collect();
+    units.sort_unstable();
+    units.dedup();
+    units
+}
+
+/// Stop and re-arm every orphaned ghost unit. Returns how many were stopped.
+fn stop_ghost_units() -> usize {
+    let mut stopped = 0;
+    for unit in ghost_units() {
+        let ok = Command::new("systemctl")
+            .args(["--user", "stop", &unit])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if ok {
+            stopped += 1;
+        }
+        // `--collect` units vanish once stopped; clear any failed state so a
+        // later sweep is not confused by a dead-but-loaded listing.
+        let _ = Command::new("systemctl")
+            .args(["--user", "reset-failed", &unit])
+            .output();
+    }
+    stopped
+}
+
+/// Outcome of a [`sweep_stale`] pass, reported by the `__cleanup` subcommand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SweepOutcome {
+    /// The deploy lock is held by another process (a deploy is running, or
+    /// another sweeper is mid-pass): this pass deferred and touched nothing.
+    Deferred,
+    /// The pass ran under the lock; `msgs` are the human-readable notices of
+    /// what was removed (empty = nothing was there).
+    Cleaned(Vec<String>),
+}
+
+/// Background sweep for the `demo-ghostprovider-cleanup` systemd user timer.
+///
+/// This is the only entry point allowed to kill ghost transient units: it runs
+/// exclusively while holding the deploy lock, which guarantees no deploy is
+/// live in this user session, so every `ghost-build-*` / `ghost-egress-*` unit
+/// it finds is an orphan of an interrupted deploy. Ghost units are stopped
+/// BEFORE the journal reconciliation removes their project trees, so a
+/// still-running build process cannot keep the directory (or its caches)
+/// busy. A `Deferred` pass is silent: the timer simply runs again later.
+pub fn sweep_stale() -> SweepOutcome {
+    let Some(_lock) = super::lock::try_lock_exclusive() else {
+        return SweepOutcome::Deferred;
+    };
+    let killed = stop_ghost_units();
+    let mut msgs = reconcile_stale(false);
+    if killed > 0 {
+        let line = format!("cleanup: stopped {killed} orphaned ghost build/probe unit(s)");
+        crate::tui::workers::append_deploy_log(&line);
+        msgs.insert(0, line);
+    }
+    SweepOutcome::Cleaned(msgs)
+}
+
+/// Top-level handler for the `__cleanup` subcommand (cleanup timer / manual
+/// run): runs a lock-guarded sweep and reports the outcome on stdout (captured
+/// by journald for the unit).
+pub fn cleanup_cmd() -> anyhow::Result<()> {
+    use std::io::Write;
+    match sweep_stale() {
+        SweepOutcome::Deferred => {
+            let _ = write!(
+                std::io::stdout(),
+                "cleanup: deferred — a deployment is in progress\n"
+            );
+        }
+        SweepOutcome::Cleaned(msgs) => {
+            if msgs.is_empty() {
+                let _ = write!(std::io::stdout(), "cleanup: nothing to remove\n");
+            } else {
+                for m in &msgs {
+                    let _ = write!(std::io::stdout(), "{m}\n");
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn short(s: &str) -> String {
@@ -1117,15 +1381,14 @@ mod tests {
             ..Default::default()
         };
         let notes = std::cell::RefCell::new(Vec::new());
-        rollback_failed(
-            &mut result,
-            "demo-memos",
-            &project,
-            None,
-            &|m| notes.borrow_mut().push(m.to_string()),
-        );
+        rollback_failed(&mut result, "demo-memos", &project, None, &|m| {
+            notes.borrow_mut().push(m.to_string())
+        });
 
-        assert!(!project.exists(), "failed deploy must wipe the project tree");
+        assert!(
+            !project.exists(),
+            "failed deploy must wipe the project tree"
+        );
         assert_eq!(
             result.errors,
             vec!["Build step failed".to_string()],
@@ -1187,12 +1450,7 @@ mod tests {
     /// against isolated journal/registry/clone/unit paths (real systemctl
     /// calls still fail harmlessly because the unit does not exist).
     #[allow(unsafe_code)] // test-only env mutation (XDG roots)
-    fn isolated_env(
-        tag: &str,
-    ) -> (
-        std::path::PathBuf,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
+    fn isolated_env(tag: &str) -> (std::path::PathBuf, std::sync::MutexGuard<'static, ()>) {
         let lock = crate::paths::ENV_LOCK.lock().unwrap();
         let tmp = std::env::temp_dir().join(format!(
             "dgp-reconcile-{tag}-{}-{}",
@@ -1225,14 +1483,15 @@ mod tests {
         assert!(!project.exists(), "clone tree must be removed");
         assert!(journal::entries().is_empty(), "entry settled after removal");
         assert!(
-            msgs.iter().any(|m| m.contains("demo-memos") && m.contains("removed")),
+            msgs.iter()
+                .any(|m| m.contains("demo-memos") && m.contains("removed")),
             "notices must report the removal: {msgs:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Nothing left behind → the entry is settled without claiming a removal,
-/// but with a visible closure line so the deferred flow stays traceable.
+    /// but with a visible closure line so the deferred flow stays traceable.
     #[test]
     #[allow(unsafe_code)] // test-only env mutation
     fn reconcile_settles_empty_leftover_with_closure_line() {
@@ -1270,10 +1529,17 @@ mod tests {
             keep.iter().any(|m| m.contains("finalizing on next launch")),
             "exit path must announce deferred finalization: {keep:?}"
         );
-        assert_eq!(journal::entries().len(), 1, "entry retained for next launch");
+        assert_eq!(
+            journal::entries().len(),
+            1,
+            "entry retained for next launch"
+        );
 
         let settle = reconcile_stale(false);
-        assert!(journal::entries().is_empty(), "next launch settles the entry");
+        assert!(
+            journal::entries().is_empty(),
+            "next launch settles the entry"
+        );
         assert!(!project.exists(), "and finishes wiping the tree");
         let _ = std::fs::remove_dir_all(&tmp);
         // The first (deferred) pass already wiped everything, so the next
@@ -1284,5 +1550,67 @@ mod tests {
             settle[0].contains("settled") && settle[0].contains("no leftovers"),
             "closure must not claim a removal: {settle:?}"
         );
+    }
+
+    /// Synthetic `systemctl list-units --plain --no-legend` rows: only the
+    /// ghost build/egress units survive the filter, in sorted order.
+    #[test]
+    fn parse_ghost_units_picks_only_ghost_units() {
+        let output = "\
+demo-vert.service                        loaded active running   demo: VERT
+ghost-build-1a2b.service                 loaded active running   (transient)
+demo-searxng.service                     loaded inactive dead    demo: SearXNG
+ghost-egress-9c0d.service                loaded active running   (transient)
+run-user-1000.service                    loaded active exited    (transient)
+ghost-build-1a2b.service                 loaded active running   (dup row)
+";
+        assert_eq!(
+            parse_ghost_units(output),
+            vec![
+                "ghost-build-1a2b.service".to_string(),
+                "ghost-egress-9c0d.service".to_string(),
+            ]
+        );
+        assert!(parse_ghost_units("demo-vert.service\nrun-abc.service\n").is_empty());
+        assert!(parse_ghost_units("").is_empty());
+    }
+
+    /// A sweep must never run while the deploy lock is held — that is the
+    /// invariant that keeps the background timer from tearing down a live
+    /// deploy in another process.
+    #[test]
+    #[allow(unsafe_code)] // test-only env mutation
+    fn sweep_defers_while_lock_held() {
+        let (tmp, _env) = isolated_env("sweepdef");
+        let _lock = super::super::lock::try_lock_exclusive().expect("hold the deploy lock");
+        assert_eq!(sweep_stale(), SweepOutcome::Deferred);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A full sweep under a free lock cleans a stale journal entry and reports
+    /// the removal notice; `ghost_units()` runs against the live user manager
+    /// but may only ever stop units this same binary would create, and the
+    /// real manager has none during the isolated test.
+    #[test]
+    #[allow(unsafe_code)] // test-only env mutation
+    fn sweep_cleans_interrupted_deploy_when_lock_free() {
+        let (tmp, _env) = isolated_env("sweepclean");
+        journal::begin("demo-memos", "https://github.com/usememos/memos");
+        let project = crate::paths::services_dir().join("memos");
+        std::fs::create_dir_all(project.join(".ghost-cache")).unwrap();
+        std::fs::write(project.join("file.txt"), "clone").unwrap();
+
+        let outcome = sweep_stale();
+        let SweepOutcome::Cleaned(msgs) = outcome else {
+            panic!("lock is free in this test, sweep must run, got {outcome:?}");
+        };
+        assert!(!project.exists(), "stale tree must be removed");
+        assert!(journal::entries().is_empty(), "entry settled");
+        assert!(
+            msgs.iter()
+                .any(|m| m.contains("demo-memos") && m.contains("removed")),
+            "notices must report the removal: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

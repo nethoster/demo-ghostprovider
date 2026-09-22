@@ -14,7 +14,10 @@ pub mod workers;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc::{self, Receiver, Sender}};
+use std::sync::{
+    Arc,
+    mpsc::{self, Receiver, Sender},
+};
 use std::time::Duration;
 
 use crossterm::ExecutableCommand;
@@ -298,7 +301,12 @@ fn event_loop(
                 }
                 Msg::DeployLogsCleared => {
                     app.deploy_history.clear();
-                    if let Screen::Logs { deploy_lines, scroll, .. } = &mut app.screen {
+                    if let Screen::Logs {
+                        deploy_lines,
+                        scroll,
+                        ..
+                    } = &mut app.screen
+                    {
                         deploy_lines.clear();
                         deploy_lines.push("Logs cleared.".into());
                         *scroll = 0;
@@ -306,7 +314,12 @@ fn event_loop(
                 }
                 Msg::SoftwareLogsCleared => {
                     app.software_history.clear();
-                    if let Screen::Logs { software_lines, scroll, .. } = &mut app.screen {
+                    if let Screen::Logs {
+                        software_lines,
+                        scroll,
+                        ..
+                    } = &mut app.screen
+                    {
                         software_lines.clear();
                         software_lines.push("Logs cleared.".into());
                         *scroll = 0;
@@ -409,14 +422,29 @@ fn command_char(key: KeyCode) -> Option<char> {
 }
 
 /// Leave the loop after cleaning up anything a still-in-flight deploy left
-/// behind. The deploy worker thread dies with the process, so its journal
-/// entry is reconciled (clean removal) here instead. Safe to call when no
-/// deploy is running — `reconcile_stale` is a no-op then.
+/// behind. A deploy worker runs as a thread in this process, so on a graceful
+/// exit it must be stopped *first*: [`crate::hoster::deploy::quiesce`] kills its
+/// host-side descendants (a running `git clone`/build step) and stops its
+/// `ghost-*` transient build units, then waits for the worker to unwind.
+/// Otherwise the worker could re-create artifacts after the cleanup and leave
+/// permanent junk. Once it has unwound, reconcile with `keep_if_inflight =
+/// false` so the entry is *settled now* — the clone/build tree (the whole
+/// `services/<name>` folder) is wiped and the journal entry removed, rather than
+/// deferred to the next launch. Safe to call when no deploy is running —
+/// `reconcile_stale` is a no-op then.
 fn exit_with_reconcile(app: &mut App) -> anyhow::Result<()> {
-    // keep_if_inflight: if a deploy pipeline is still running in this process
-    // (worker thread), its entry is retained so the next launch re-verifies —
-    // the worker may re-create artifacts in the window before process death.
-    let msgs = crate::hoster::deploy::reconcile_stale(true);
+    // A just-spawned worker may not have set `deploy_in_flight` yet; the Deploy
+    // screen (still `done: None`) is the reliable "a worker exists" signal, and
+    // it is set by the UI thread before any exit key can be read. Asking for an
+    // exit first makes even a worker that starts mid-exit abort before its
+    // first clone (see the race guard in `run_deployment`).
+    let worker_live = crate::hoster::deploy::deploy_in_flight()
+        || matches!(app.screen, Screen::Deploy { done: None, .. });
+    if worker_live {
+        crate::hoster::cancel::request_exit();
+        crate::hoster::deploy::quiesce(std::time::Duration::from_secs(3));
+    }
+    let msgs = crate::hoster::deploy::reconcile_stale(false);
     app.exit_notices.extend(msgs);
     Ok(())
 }
@@ -427,13 +455,17 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
     }
     // Main-menu activation touches app.tx and app.screen at once; decide it
     // before the screen match takes its borrow.
-    if let Screen::Main { selected } = app.screen && matches!(key, KeyCode::Enter | KeyCode::Char(' ')) {
-            return main_menu_activate(app, selected);
-        }
+    if let Screen::Main { selected } = app.screen
+        && matches!(key, KeyCode::Enter | KeyCode::Char(' '))
+    {
+        return main_menu_activate(app, selected);
+    }
     let cmd = command_char(key);
     match &mut app.screen {
         Screen::Main { selected } => match key {
-            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => move_main_selection(selected, key),
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+                move_main_selection(selected, key)
+            }
             KeyCode::Enter | KeyCode::Char(' ') => {}
             KeyCode::Esc => return Flow::Exit,
             _ => match cmd {
@@ -610,7 +642,12 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 None => {}
             }
         }
-        Screen::Logs { view, deploy_lines, software_lines, scroll } => {
+        Screen::Logs {
+            view,
+            deploy_lines,
+            software_lines,
+            scroll,
+        } => {
             let active_lines = match view {
                 LogView::Deploy => deploy_lines.len(),
                 LogView::Software => software_lines.len(),
@@ -645,13 +682,19 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 },
             }
             if let Some(target) = clear_target {
-                app.screen = Screen::ConfirmClear { target, yes_selected: false };
+                app.screen = Screen::ConfirmClear {
+                    target,
+                    yes_selected: false,
+                };
             } else if exit {
                 stop_log_tailers(app);
                 app.screen = Screen::Main { selected: 3 };
             }
         }
-        Screen::ConfirmClear { target, yes_selected } => {
+        Screen::ConfirmClear {
+            target,
+            yes_selected,
+        } => {
             let mut decision: Option<bool> = None;
             match key {
                 KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
@@ -692,7 +735,11 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             // Re-seed deploy_lines from file so deploy view stays coherent
                             let deploy_lines = {
                                 let dl = workers::read_deploy_log();
-                                if dl.is_empty() { vec!["No deploy logs.".into()] } else { dl }
+                                if dl.is_empty() {
+                                    vec!["No deploy logs.".into()]
+                                } else {
+                                    dl
+                                }
                             };
                             app.deploy_history.clone_from(&deploy_lines);
                             app.screen = Screen::Logs {
@@ -708,7 +755,11 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     // back to Logs, preserve buffers
                     let deploy_lines = if app.deploy_history.is_empty() {
                         let dl = workers::read_deploy_log();
-                        if dl.is_empty() { vec!["No deploy logs.".into()] } else { dl }
+                        if dl.is_empty() {
+                            vec!["No deploy logs.".into()]
+                        } else {
+                            dl
+                        }
                     } else {
                         app.deploy_history.clone()
                     };
@@ -772,7 +823,8 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                 if !app.deploy_history.is_empty() {
                     deploy_lines.clone_from(&app.deploy_history);
                 } else {
-                    deploy_lines.push("No deploy logs yet. Start a deployment to see output here.".into());
+                    deploy_lines
+                        .push("No deploy logs yet. Start a deployment to see output here.".into());
                 }
             }
             // Keep the persistent history in sync with the file so switching
@@ -787,7 +839,9 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                 app.software_history.clone()
             };
             if software_lines.is_empty() {
-                software_lines.push("No software logs yet. Deploy a service to see journal output here.".into());
+                software_lines.push(
+                    "No software logs yet. Deploy a service to see journal output here.".into(),
+                );
             }
             app.screen = Screen::Logs {
                 view: LogView::Deploy,
@@ -905,9 +959,8 @@ fn start_log_tailers(app: &mut App) {
                                 }
                                 last.insert(name, cur);
                             } else {
-                                let _ = tx.send(Msg::SoftwareLog(format!(
-                                    "-- {name} log rotated --"
-                                )));
+                                let _ =
+                                    tx.send(Msg::SoftwareLog(format!("-- {name} log rotated --")));
                                 for l in &cur {
                                     let _ = tx.send(Msg::SoftwareLog(l.clone()));
                                 }
@@ -982,10 +1035,18 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Screen::ConfirmDelete { name, yes_selected } => {
             draw_confirm_delete(f, chunks[1], name, *yes_selected);
         }
-        Screen::Logs { view, deploy_lines, software_lines, scroll } => {
+        Screen::Logs {
+            view,
+            deploy_lines,
+            software_lines,
+            scroll,
+        } => {
             draw_logs(f, chunks[1], *view, deploy_lines, software_lines, *scroll);
         }
-        Screen::ConfirmClear { target, yes_selected } => {
+        Screen::ConfirmClear {
+            target,
+            yes_selected,
+        } => {
             draw_confirm_clear(f, chunks[1], *target, *yes_selected);
         }
     }
@@ -1038,7 +1099,12 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
             MAGENTA,
         ),
         ("#", "My Services", "manage deployed units", OK_GREEN),
-        ("≡", "Logs", "deploy + software logs (2 screens)", WARN_YELLOW),
+        (
+            "≡",
+            "Logs",
+            "deploy + software logs (2 screens)",
+            WARN_YELLOW,
+        ),
     ];
     let list = List::new(items.iter().enumerate().map(|(i, (icon, t, d, hue))| {
         let sel = i == selected;
@@ -1439,13 +1505,20 @@ fn draw_confirm_clear(
         LogView::Software => "software logs",
     };
     let note = match target {
-        LogView::Deploy => "This truncates ~/.local/state/demo-ghostprovider/deploy.log and clears the view.",
-        LogView::Software => "This clears the displayed journal view (systemd journal itself is kept).",
+        LogView::Deploy => {
+            "This truncates ~/.local/state/demo-ghostprovider/deploy.log and clears the view."
+        }
+        LogView::Software => {
+            "This clears the displayed journal view (systemd journal itself is kept)."
+        }
     };
     let text = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(" Clear ", Style::default().fg(ERR_RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Clear ",
+                Style::default().fg(ERR_RED).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(label.to_string(), Style::default().fg(Color::White)),
             Span::styled("?", Style::default().fg(ERR_RED)),
         ]),
@@ -1454,7 +1527,10 @@ fn draw_confirm_clear(
         Line::from(choice_spans("[Y]es", " — clear", ERR_RED, yes_selected)),
         Line::from(choice_spans("[N]o", " — keep", OK_GREEN, !yes_selected)),
         Line::from(""),
-        Line::from(Span::styled(" ←→ select · Enter confirm", Style::default().fg(DIM))),
+        Line::from(Span::styled(
+            " ←→ select · Enter confirm",
+            Style::default().fg(DIM),
+        )),
     ];
     f.render_widget(
         Paragraph::new(text)
@@ -1769,17 +1845,33 @@ fn draw_logs(
     };
     let tab_bar = Line::from(vec![
         Span::styled(
-            if tab_deploy_active { " [DEPLOY] " } else { "  DEPLOY  " },
+            if tab_deploy_active {
+                " [DEPLOY] "
+            } else {
+                "  DEPLOY  "
+            },
             ratatui::style::Style::default()
                 .fg(if tab_deploy_active { WARN_YELLOW } else { DIM })
-                .add_modifier(if tab_deploy_active { Modifier::BOLD } else { Modifier::empty() }),
+                .add_modifier(if tab_deploy_active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
         Span::styled(" · ", Style::default().fg(DIM)),
         Span::styled(
-            if !tab_deploy_active { " [SOFTWARE] " } else { "  SOFTWARE  " },
+            if !tab_deploy_active {
+                " [SOFTWARE] "
+            } else {
+                "  SOFTWARE  "
+            },
             Style::default()
                 .fg(if !tab_deploy_active { OK_GREEN } else { DIM })
-                .add_modifier(if !tab_deploy_active { Modifier::BOLD } else { Modifier::empty() }),
+                .add_modifier(if !tab_deploy_active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
         Span::styled("  (Tab to switch)", Style::default().fg(DIM)),
     ]);
@@ -1795,8 +1887,14 @@ fn draw_logs(
             LogView::Software => "No software logs yet. Journal output will appear here.",
         };
         f.render_widget(
-            Paragraph::new(Span::styled(empty_msg, Style::default().fg(DIM)))
-                .block(block(title.trim(), if tab_deploy_active { WARN_YELLOW } else { OK_GREEN })),
+            Paragraph::new(Span::styled(empty_msg, Style::default().fg(DIM))).block(block(
+                title.trim(),
+                if tab_deploy_active {
+                    WARN_YELLOW
+                } else {
+                    OK_GREEN
+                },
+            )),
             inner[1],
         );
         return;
@@ -1820,7 +1918,14 @@ fn draw_logs(
     f.render_widget(
         Paragraph::new(visible)
             .wrap(Wrap { trim: false })
-            .block(block(title.trim(), if tab_deploy_active { WARN_YELLOW } else { OK_GREEN })),
+            .block(block(
+                title.trim(),
+                if tab_deploy_active {
+                    WARN_YELLOW
+                } else {
+                    OK_GREEN
+                },
+            )),
         inner[1],
     );
 }
@@ -2057,6 +2162,9 @@ mod tests {
         // Oldest lines are dropped; the newest remain visible.
         assert!(!lines.iter().any(|l| l == "line 0"));
         let expected_last = format!("line {}", MAX_DEPLOY_LINES * 2 - 1);
-        assert_eq!(lines.last().map(String::as_str), Some(expected_last.as_str()));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(expected_last.as_str())
+        );
     }
 }
