@@ -51,6 +51,12 @@ pub fn deploy_log_file() -> PathBuf {
     state_home().join("demo-ghostprovider/deploy.log")
 }
 
+/// Persistent history of deploy interruptions and full clean removals: the
+/// "Crash" screen in Logs.
+pub fn crash_log_file() -> PathBuf {
+    state_home().join("demo-ghostprovider/crash.log")
+}
+
 /// In-flight deploy journal: records a deploy that started but has not
 /// finished, so an out-of-band interruption (panel exit/kill, reboot) can be
 /// reconciled into a clean removal on the next launch.

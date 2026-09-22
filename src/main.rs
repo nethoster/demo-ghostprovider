@@ -161,7 +161,10 @@ fn arm_deploy_signal_watchdog() {
         // on the next launch.
         demo_ghostprovider::hoster::cancel::request_exit();
         demo_ghostprovider::hoster::deploy::quiesce(std::time::Duration::from_secs(3));
-        for m in demo_ghostprovider::hoster::deploy::reconcile_stale(false) {
+        for m in demo_ghostprovider::hoster::deploy::reconcile_stale_with_basis(
+            false,
+            demo_ghostprovider::hoster::deploy::ReconcileBasis::Exit,
+        ) {
             eprintln!("{m}");
         }
         std::process::exit(128 + sig);

@@ -13,6 +13,7 @@
 
 pub mod analyzer;
 pub mod atomic;
+pub mod crashlog;
 pub mod flags;
 pub mod hoster;
 pub mod netlog;

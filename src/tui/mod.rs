@@ -134,9 +134,11 @@ pub(crate) enum Screen {
         view: LogView,
         deploy_lines: Vec<String>,
         software_lines: Vec<String>,
+        crash_lines: Vec<String>,
         scroll: usize,
     },
-    /// YES/NO gate before clearing logs (deploy file + buffer or software buffer).
+    /// YES/NO gate before clearing logs (deploy file + buffer, software buffer,
+    /// or crash history file).
     ConfirmClear {
         target: LogView,
         yes_selected: bool,
@@ -147,6 +149,7 @@ pub(crate) enum Screen {
 pub(crate) enum LogView {
     Deploy,
     Software,
+    Crash,
 }
 
 pub(crate) enum Msg {
@@ -155,8 +158,10 @@ pub(crate) enum Msg {
     DeployDone(bool),
     SoftwareLog(String),
     TailLog(String),
+    CrashLog(String),
     DeployLogsCleared,
     SoftwareLogsCleared,
+    CrashLogsCleared,
     /// Shutdown requested by a termination signal (SIGTERM/SIGHUP).
     Terminate,
 }
@@ -171,8 +176,10 @@ pub(crate) struct App {
     pub scan_seq: u64,
     pub deploy_history: Vec<String>,
     pub software_history: Vec<String>,
+    pub crash_history: Vec<String>,
     deploy_tail_keep: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     software_tail_keep: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    crash_tail_keep: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Cleanup notices collected on early exit, printed after the terminal is
     /// restored so the user sees what was cleaned up.
     exit_notices: Vec<String>,
@@ -211,8 +218,10 @@ pub fn run() -> anyhow::Result<()> {
         scan_seq: 0,
         deploy_history: Vec::new(),
         software_history: Vec::new(),
+        crash_history: Vec::new(),
         deploy_tail_keep: None,
         software_tail_keep: None,
+        crash_tail_keep: None,
         exit_notices: Vec::new(),
     };
     let res = event_loop(&mut terminal, &mut app);
@@ -322,6 +331,29 @@ fn event_loop(
                     {
                         software_lines.clear();
                         software_lines.push("Logs cleared.".into());
+                        *scroll = 0;
+                    }
+                }
+                Msg::CrashLog(line) => {
+                    for l in line.split('\n') {
+                        push_deploy_line(&mut app.crash_history, l.to_string());
+                    }
+                    if let Screen::Logs { crash_lines, .. } = &mut app.screen {
+                        for l in line.split('\n') {
+                            push_deploy_line(crash_lines, l.to_string());
+                        }
+                    }
+                }
+                Msg::CrashLogsCleared => {
+                    app.crash_history.clear();
+                    if let Screen::Logs {
+                        crash_lines,
+                        scroll,
+                        ..
+                    } = &mut app.screen
+                    {
+                        crash_lines.clear();
+                        crash_lines.push("Logs cleared.".into());
                         *scroll = 0;
                     }
                 }
@@ -444,7 +476,10 @@ fn exit_with_reconcile(app: &mut App) -> anyhow::Result<()> {
         crate::hoster::cancel::request_exit();
         crate::hoster::deploy::quiesce(std::time::Duration::from_secs(3));
     }
-    let msgs = crate::hoster::deploy::reconcile_stale(false);
+    let msgs = crate::hoster::deploy::reconcile_stale_with_basis(
+        false,
+        crate::hoster::deploy::ReconcileBasis::Exit,
+    );
     app.exit_notices.extend(msgs);
     Ok(())
 }
@@ -646,11 +681,13 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             view,
             deploy_lines,
             software_lines,
+            crash_lines,
             scroll,
         } => {
             let active_lines = match view {
                 LogView::Deploy => deploy_lines.len(),
                 LogView::Software => software_lines.len(),
+                LogView::Crash => crash_lines.len(),
             };
             let mut exit = false;
             let mut clear_target: Option<LogView> = None;
@@ -659,7 +696,8 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
                     *view = match view {
                         LogView::Deploy => LogView::Software,
-                        LogView::Software => LogView::Deploy,
+                        LogView::Software => LogView::Crash,
+                        LogView::Crash => LogView::Deploy,
                     };
                     *scroll = 0;
                 }
@@ -710,6 +748,11 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             }
             match decision {
                 Some(true) => {
+                    let crash_seed = if app.crash_history.is_empty() {
+                        crate::crashlog::read()
+                    } else {
+                        app.crash_history.clone()
+                    };
                     match target {
                         LogView::Deploy => {
                             workers::clear_deploy_log();
@@ -719,6 +762,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                                 view: LogView::Deploy,
                                 deploy_lines: vec!["Logs cleared.".into()],
                                 software_lines: std::mem::take(&mut app.software_history),
+                                crash_lines: crash_seed,
                                 scroll: 0,
                             };
                             // restore software_lines if it was taken empty
@@ -746,6 +790,28 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                                 view: LogView::Software,
                                 deploy_lines,
                                 software_lines: vec!["Logs cleared.".into()],
+                                crash_lines: crash_seed,
+                                scroll: 0,
+                            };
+                        }
+                        LogView::Crash => {
+                            crate::crashlog::clear();
+                            app.crash_history.clear();
+                            let _ = app.tx.send(Msg::CrashLogsCleared);
+                            let deploy_lines = {
+                                let dl = workers::read_deploy_log();
+                                if dl.is_empty() {
+                                    vec!["No deploy logs.".into()]
+                                } else {
+                                    dl
+                                }
+                            };
+                            app.deploy_history.clone_from(&deploy_lines);
+                            app.screen = Screen::Logs {
+                                view: LogView::Crash,
+                                deploy_lines,
+                                software_lines: std::mem::take(&mut app.software_history),
+                                crash_lines: vec!["Logs cleared.".into()],
                                 scroll: 0,
                             };
                         }
@@ -768,10 +834,16 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     } else {
                         app.software_history.clone()
                     };
+                    let crash_lines = if app.crash_history.is_empty() {
+                        crate::crashlog::read()
+                    } else {
+                        app.crash_history.clone()
+                    };
                     app.screen = Screen::Logs {
                         view: *target,
                         deploy_lines,
                         software_lines,
+                        crash_lines,
                         scroll: 0,
                     };
                 }
@@ -843,10 +915,21 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                     "No software logs yet. Deploy a service to see journal output here.".into(),
                 );
             }
+            // Crash screen: persistent history of interrupted deploys and full
+            // removals, seeded from the same file the tailer appends to.
+            let mut crash_lines = crate::crashlog::read();
+            app.crash_history.clone_from(&crash_lines);
+            if crash_lines.is_empty() {
+                crash_lines.push(
+                    "No crash events yet. Interrupt a deploy (or remove a service) to see history here."
+                        .into(),
+                );
+            }
             app.screen = Screen::Logs {
                 view: LogView::Deploy,
                 deploy_lines,
                 software_lines,
+                crash_lines,
                 scroll: 0,
             };
             start_log_tailers(app);
@@ -857,62 +940,98 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
 }
 
 fn stop_log_tailers(app: &mut App) {
-    if let Some(k) = app.deploy_tail_keep.take() {
-        k.store(false, Ordering::Relaxed);
-    }
-    if let Some(k) = app.software_tail_keep.take() {
-        k.store(false, Ordering::Relaxed);
+    for keep in [
+        app.deploy_tail_keep.take(),
+        app.software_tail_keep.take(),
+        app.crash_tail_keep.take(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        keep.store(false, Ordering::Relaxed);
     }
 }
 
+/// Tail `path` in a background thread, forwarding appended lines to the event
+/// loop and detecting truncation/removal (a cleared file). Shared by the deploy
+/// log and the crash-history file tailers.
+fn spawn_file_tailer(
+    path: std::path::PathBuf,
+    keep: std::sync::Arc<AtomicBool>,
+    tx: Sender<Msg>,
+    on_line: impl Fn(String) -> Msg + Send + 'static,
+    on_cleared: impl Fn() -> Msg + Send + 'static,
+) {
+    std::thread::spawn(move || {
+        let mut pos = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if !keep.load(Ordering::Relaxed) {
+                break;
+            }
+            let content = match std::fs::read(&path) {
+                Ok(c) => c,
+                Err(_) => {
+                    if pos != 0 {
+                        let _ = tx.send(on_cleared());
+                        pos = 0;
+                    }
+                    continue;
+                }
+            };
+            let len = content.len() as u64;
+            if len < pos {
+                let _ = tx.send(on_cleared());
+                pos = len;
+                continue;
+            }
+            if len > pos {
+                let text = String::from_utf8_lossy(&content[pos as usize..]);
+                for line in text.lines() {
+                    if !keep.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    if !line.is_empty() || text.contains("\n\n") {
+                        let _ = tx.send(on_line(line.to_string()));
+                    }
+                }
+                pos = len;
+            }
+        }
+    });
+}
+
 fn start_log_tailers(app: &mut App) {
-    if app.deploy_tail_keep.is_some() && app.software_tail_keep.is_some() {
+    if app.deploy_tail_keep.is_some()
+        && app.software_tail_keep.is_some()
+        && app.crash_tail_keep.is_some()
+    {
         return;
     }
     // Deploy: tail the shared deploy.log so every window streams the same live deploy.
     if app.deploy_tail_keep.is_none() {
         let keep = Arc::new(AtomicBool::new(true));
         app.deploy_tail_keep = Some(keep.clone());
-        let tx = app.tx.clone();
-        std::thread::spawn(move || {
-            let path = crate::paths::deploy_log_file();
-            let mut pos = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            loop {
-                std::thread::sleep(Duration::from_millis(500));
-                if !keep.load(Ordering::Relaxed) {
-                    break;
-                }
-                let content = match std::fs::read(&path) {
-                    Ok(c) => c,
-                    Err(_) => {
-                        if pos != 0 {
-                            let _ = tx.send(Msg::DeployLogsCleared);
-                            pos = 0;
-                        }
-                        continue;
-                    }
-                };
-                let len = content.len() as u64;
-                if len < pos {
-                    let _ = tx.send(Msg::DeployLogsCleared);
-                    pos = len;
-                    continue;
-                }
-                if len > pos {
-                    let slice = &content[pos as usize..];
-                    let text = String::from_utf8_lossy(slice);
-                    for line in text.lines() {
-                        if !keep.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        if !line.is_empty() || text.contains("\n\n") {
-                            let _ = tx.send(Msg::TailLog(line.to_string()));
-                        }
-                    }
-                    pos = len;
-                }
-            }
-        });
+        spawn_file_tailer(
+            crate::paths::deploy_log_file(),
+            keep,
+            app.tx.clone(),
+            Msg::TailLog,
+            || Msg::DeployLogsCleared,
+        );
+    }
+    // Crash history: tail crash.log the same way, so an interruption/removal
+    // recorded in-process (or by a sweep) shows up live on the screen.
+    if app.crash_tail_keep.is_none() {
+        let keep = Arc::new(AtomicBool::new(true));
+        app.crash_tail_keep = Some(keep.clone());
+        spawn_file_tailer(
+            crate::paths::crash_log_file(),
+            keep,
+            app.tx.clone(),
+            Msg::CrashLog,
+            || Msg::CrashLogsCleared,
+        );
     }
     // Software: poll journalctl per unit; incremental per-unit diff.
     if app.software_tail_keep.is_none() {
@@ -1039,9 +1158,18 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             view,
             deploy_lines,
             software_lines,
+            crash_lines,
             scroll,
         } => {
-            draw_logs(f, chunks[1], *view, deploy_lines, software_lines, *scroll);
+            draw_logs(
+                f,
+                chunks[1],
+                *view,
+                deploy_lines,
+                software_lines,
+                crash_lines,
+                *scroll,
+            );
         }
         Screen::ConfirmClear {
             target,
@@ -1102,7 +1230,7 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
         (
             "≡",
             "Logs",
-            "deploy + software logs (2 screens)",
+            "deploy + software + crash logs (3 screens)",
             WARN_YELLOW,
         ),
     ];
@@ -1503,6 +1631,7 @@ fn draw_confirm_clear(
     let label = match target {
         LogView::Deploy => "deploy logs",
         LogView::Software => "software logs",
+        LogView::Crash => "crash history",
     };
     let note = match target {
         LogView::Deploy => {
@@ -1510,6 +1639,9 @@ fn draw_confirm_clear(
         }
         LogView::Software => {
             "This clears the displayed journal view (systemd journal itself is kept)."
+        }
+        LogView::Crash => {
+            "This clears ~/.local/state/demo-ghostprovider/crash.log (interruption & removal history)."
         }
     };
     let text = vec![
@@ -1831,48 +1963,66 @@ fn draw_services(
 
 // --- logs -------------------------------------------------------------------
 
+/// Style for one log line. Deploy/software lines use the usual verdict
+/// colours; crash-history lines are coloured by their `[kind]` tag
+/// (`interrupted` red, `recovered` yellow, `removed` green, `ghost` dim).
+fn log_line_style(l: &str) -> Style {
+    let s = l.trim_start();
+    if s.contains("[interrupted]") {
+        Style::default().fg(ERR_RED)
+    } else if s.contains("[recovered]") {
+        Style::default().fg(WARN_YELLOW)
+    } else if s.contains("[removed]") {
+        Style::default().fg(OK_GREEN)
+    } else if s.contains("[ghost]") {
+        Style::default().fg(DIM)
+    } else if s.contains("failed") || s.contains("ERROR") || s.starts_with('!') {
+        Style::default().fg(ERR_RED)
+    } else if s.starts_with('✔') {
+        Style::default().fg(OK_GREEN).add_modifier(Modifier::BOLD)
+    } else if s.starts_with("provision:") || s.starts_with("warn:") {
+        Style::default().fg(WARN_YELLOW)
+    } else {
+        Style::default().fg(BODY)
+    }
+}
+
 fn draw_logs(
     f: &mut ratatui::Frame,
     area: ratatui::prelude::Rect,
     view: LogView,
     deploy_lines: &[String],
     software_lines: &[String],
+    crash_lines: &[String],
     scroll: usize,
 ) {
-    let (title, lines, tab_deploy_active) = match view {
-        LogView::Deploy => (" Deploy Logs ", deploy_lines, true),
-        LogView::Software => (" Software Logs ", software_lines, false),
+    let (title, lines, active_color) = match view {
+        LogView::Deploy => (" Deploy Logs ", deploy_lines, WARN_YELLOW),
+        LogView::Software => (" Software Logs ", software_lines, OK_GREEN),
+        LogView::Crash => (" Crash Logs ", crash_lines, VIOLET),
     };
-    let tab_bar = Line::from(vec![
+    let tab_span = |label: &str, active: bool, color: Color| {
         Span::styled(
-            if tab_deploy_active {
-                " [DEPLOY] "
+            if active {
+                format!(" [{label}] ")
             } else {
-                "  DEPLOY  "
+                format!("  {label}  ")
             },
             ratatui::style::Style::default()
-                .fg(if tab_deploy_active { WARN_YELLOW } else { DIM })
-                .add_modifier(if tab_deploy_active {
+                .fg(if active { color } else { DIM })
+                .add_modifier(if active {
                     Modifier::BOLD
                 } else {
                     Modifier::empty()
                 }),
-        ),
+        )
+    };
+    let tab_bar = Line::from(vec![
+        tab_span("DEPLOY", view == LogView::Deploy, WARN_YELLOW),
         Span::styled(" · ", Style::default().fg(DIM)),
-        Span::styled(
-            if !tab_deploy_active {
-                " [SOFTWARE] "
-            } else {
-                "  SOFTWARE  "
-            },
-            Style::default()
-                .fg(if !tab_deploy_active { OK_GREEN } else { DIM })
-                .add_modifier(if !tab_deploy_active {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-        ),
+        tab_span("SOFTWARE", view == LogView::Software, OK_GREEN),
+        Span::styled(" · ", Style::default().fg(DIM)),
+        tab_span("CRASH", view == LogView::Crash, VIOLET),
         Span::styled("  (Tab to switch)", Style::default().fg(DIM)),
     ]);
     let inner = ratatui::layout::Layout::vertical([
@@ -1885,47 +2035,25 @@ fn draw_logs(
         let empty_msg = match view {
             LogView::Deploy => "No deploy logs yet. Start a deployment to see output here.",
             LogView::Software => "No software logs yet. Journal output will appear here.",
+            LogView::Crash => {
+                "No crash events yet. Interrupt a deploy or remove a service to see history here."
+            }
         };
         f.render_widget(
-            Paragraph::new(Span::styled(empty_msg, Style::default().fg(DIM))).block(block(
-                title.trim(),
-                if tab_deploy_active {
-                    WARN_YELLOW
-                } else {
-                    OK_GREEN
-                },
-            )),
+            Paragraph::new(Span::styled(empty_msg, Style::default().fg(DIM)))
+                .block(block(title.trim(), active_color)),
             inner[1],
         );
         return;
     }
     let visible: Vec<Line> = lines[scroll.min(lines.len())..]
         .iter()
-        .map(|l| {
-            let s = l.trim_start();
-            let style = if s.contains("failed") || s.contains("ERROR") || s.starts_with('!') {
-                Style::default().fg(ERR_RED)
-            } else if s.starts_with('✔') {
-                Style::default().fg(OK_GREEN).add_modifier(Modifier::BOLD)
-            } else if s.starts_with("provision:") || s.starts_with("warn:") {
-                Style::default().fg(WARN_YELLOW)
-            } else {
-                Style::default().fg(BODY)
-            };
-            Line::from(Span::styled(l.clone(), style))
-        })
+        .map(|l| Line::from(Span::styled(l.clone(), log_line_style(l))))
         .collect();
     f.render_widget(
         Paragraph::new(visible)
             .wrap(Wrap { trim: false })
-            .block(block(
-                title.trim(),
-                if tab_deploy_active {
-                    WARN_YELLOW
-                } else {
-                    OK_GREEN
-                },
-            )),
+            .block(block(title.trim(), active_color)),
         inner[1],
     );
 }

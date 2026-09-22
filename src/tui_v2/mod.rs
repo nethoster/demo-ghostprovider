@@ -225,6 +225,10 @@ fn event_loop(
                         software_lines.push("Logs cleared.".into());
                     }
                 }
+                // The primary TUI owns the Crash log; the v1 companion UI keeps
+                // this screen out of its selector, so the reload/clear requests
+                // it may still receive are no-ops here.
+                Msg::CrashLog(_) | Msg::CrashLogsCleared => {}
                 Msg::Terminate => {
                     // Termination signal: clean up any in-flight deploy, then
                     // leave (mirrors the primary TUI's early-exit behaviour).

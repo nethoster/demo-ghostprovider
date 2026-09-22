@@ -947,6 +947,9 @@ pub fn remove_unit_and_state(service_name: &str) {
                 wait_port_released(port, std::time::Duration::from_secs(3));
             }
         }
+        // Full-removal history for the Logs → Crash screen.
+        let url = e.urls.first().map(String::as_str).unwrap_or("?");
+        crate::crashlog::removed(service_name, url);
     }
 
     crate::state::unregister(service_name).ok();
@@ -1041,6 +1044,27 @@ fn cleanup_stale(service: &str, url: &str) -> CleanResult {
     report
 }
 
+/// Where a reconciliation runs — it decides how an interrupted deploy is
+/// tagged in the Crash screen's history.
+///
+/// * [`ReconcileBasis::Exit`] — a live in-flight deploy was aborted while this
+///   panel was alive: the user quit or a termination signal arrived, and
+///   [`quiesce`] has already stopped its writers.
+/// * [`ReconcileBasis::Startup`] / [`ReconcileBasis::Sweep`] — leftovers of a
+///   deploy whose process died out-of-band (kill, shutdown, reboot) were found
+///   and removed later.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileBasis {
+    Exit,
+    Startup,
+    Sweep,
+}
+
+/// `reconcile_stale` with the default history tag (a `Startup` pass).
+pub fn reconcile_stale(keep_if_inflight: bool) -> Vec<String> {
+    reconcile_stale_with_basis(keep_if_inflight, ReconcileBasis::Startup)
+}
+
 /// Sweep leftover deploy-journal entries and clean their artifacts with a
 /// full "clean removal" (unit + env file + project tree + registry slot).
 ///
@@ -1053,7 +1077,12 @@ fn cleanup_stale(service: &str, url: &str) -> CleanResult {
 /// launch to re-verify idempotently; the live exit paths always pass `false`
 /// because they have already quiesced. Returns human-readable notice lines for
 /// the deploy log so the panel surfaces what it cleaned.
-pub fn reconcile_stale(keep_if_inflight: bool) -> Vec<String> {
+///
+/// Every entry this pass actually settles is appended to the Crash screen's
+/// history (`crash.log`), tagged by [`basis`](ReconcileBasis): an `Exit` pass
+/// records the deploy as aborted at exit; `Startup`/`Sweep` passes record it
+/// as recovered leftovers.
+pub fn reconcile_stale_with_basis(keep_if_inflight: bool, basis: ReconcileBasis) -> Vec<String> {
     let mut msgs = Vec::new();
     for (service, entry) in journal::entries() {
         if !stale_action(entry.state, crate::state::get(&service).is_some()) {
@@ -1070,7 +1099,8 @@ pub fn reconcile_stale(keep_if_inflight: bool) -> Vec<String> {
         }
         if defer {
             // The worker may still re-create files until the process dies; let
-            // the next launch finish the job (idempotent).
+            // the next launch finish the job (idempotent). Not recorded in the
+            // crash history: nothing is final yet.
             msgs.push(format!(
                 "cleanup: {service}: deploy still winding down here — finalizing on next launch"
             ));
@@ -1087,6 +1117,14 @@ pub fn reconcile_stale(keep_if_inflight: bool) -> Vec<String> {
                 ));
             }
             journal::clear(&service);
+            match basis {
+                ReconcileBasis::Exit => {
+                    crate::crashlog::interrupted(&service, &entry.url);
+                }
+                ReconcileBasis::Startup | ReconcileBasis::Sweep => {
+                    crate::crashlog::recovered(&service, &entry.url, report.did_anything());
+                }
+            }
         }
     }
     for m in &msgs {
@@ -1215,11 +1253,12 @@ pub fn sweep_stale() -> SweepOutcome {
         return SweepOutcome::Deferred;
     };
     let killed = stop_ghost_units();
-    let mut msgs = reconcile_stale(false);
+    let mut msgs = reconcile_stale_with_basis(false, ReconcileBasis::Sweep);
     if killed > 0 {
         let line = format!("cleanup: stopped {killed} orphaned ghost build/probe unit(s)");
         crate::tui::workers::append_deploy_log(&line);
         msgs.insert(0, line);
+        crate::crashlog::ghost_stopped(killed);
     }
     SweepOutcome::Cleaned(msgs)
 }
