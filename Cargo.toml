@@ -1,6 +1,6 @@
 [package]
 name = "demo-ghostprovider"
-version = "0.0.39"
+version = "0.0.40"
 edition = "2024"
 rust-version = "1.88"
 description = "Local-first demo hosting panel: deploy three curated self-hosted services as hardened systemd user services. Rust rewrite of demo-ghostprovider."
