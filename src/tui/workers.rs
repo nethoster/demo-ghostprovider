@@ -8,10 +8,24 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, mpsc::Sender};
+use std::thread::JoinHandle;
 
 use super::Msg;
 use crate::hoster::deploy;
+
+/// The in-flight deploy worker thread (if any), so the exit path can wait out
+/// its final bookkeeping — the trailing `== deploy … done: … ==` line and the
+/// stderr-capture restore — before reconciling. The thread itself runs the
+/// deploy; this is only its `JoinHandle`, cleared once waited on.
+static DEPLOY_WORKER: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
+
+/// True while this process's fd 2 is rerouted into the deploy-log pipe. Text
+/// written to stderr in that window (for example exit notices after a
+/// mid-deploy quit) would otherwise be funneled back into deploy.log a second
+/// time by the capture reader.
+static STDERR_CAPTURED: AtomicBool = AtomicBool::new(false);
 
 /// Port → unit name for every URL registered by our deployments. Purely a
 /// local state.json lookup — no probing involved.
@@ -192,7 +206,7 @@ pub(crate) fn journal_raw_for(unit: &str) -> Vec<String> {
 }
 
 pub(crate) fn start_deployment(tx: Sender<Msg>, url: String) {
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         append_deploy_log(&format!(
             "== deploy {url} started at {} ==",
             crate::netlog::format_utc(std::time::SystemTime::now())
@@ -211,12 +225,22 @@ pub(crate) fn start_deployment(tx: Sender<Msg>, url: String) {
         let capture = StderrCapture::new(tx.clone());
         let ok = deploy::run_deployment(&url, &log) == deploy::DeployOutcome::Deployed;
         capture.restore();
+        if crate::hoster::cancel::is_exiting() {
+            // The exit path is tearing down this deploy and writes the
+            // authoritative terminal marker ("== deploy … done: interrupted ==")
+            // itself, so we do not append a competing "done: failed" line and
+            // every interrupted deploy has exactly one terminal marker.
+            return;
+        }
         append_deploy_log(&format!(
             "== deploy {url} done: {} ==",
             if ok { "ok" } else { "failed" }
         ));
         let _ = tx.send(Msg::DeployDone(ok));
     });
+    if let Ok(mut worker) = DEPLOY_WORKER.lock() {
+        *worker = Some(handle);
+    }
 }
 
 /// Temporarily reroutes the process's stderr (fd 2) into a pipe, forwarding
@@ -256,6 +280,7 @@ impl StderrCapture {
                 let _ = tx.send(Msg::Log(line));
             }
         });
+        STDERR_CAPTURED.store(true, Ordering::SeqCst);
         StderrCapture {
             saved,
             pipe_write: write,
@@ -277,7 +302,43 @@ impl StderrCapture {
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
         }
+        STDERR_CAPTURED.store(false, Ordering::SeqCst);
     }
+}
+
+pub(crate) fn stderr_capture_active() -> bool {
+    STDERR_CAPTURED.load(Ordering::SeqCst)
+}
+
+/// Wait (bounded) for the deploy worker thread to fully unwind — the point
+/// where it has appended its trailing `== deploy … done: … ==` line and
+/// restored fd 2. Returns when the thread has exited, when `timeout` elapses,
+/// or immediately if no deploy worker exists. The exit path calls this after
+/// [`crate::hoster::deploy::quiesce`] so reconcile never races a worker that
+/// is still streaming to deploy.log, and so the final "done" line is never
+/// lost to process shutdown.
+pub(crate) fn wait_deploy_worker(timeout: std::time::Duration) {
+    let handle = {
+        let mut worker = match DEPLOY_WORKER.lock() {
+            Ok(w) => w,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        worker.take()
+    };
+    let Some(handle) = handle else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            // It ran past the bound; drop the handle and let it finish in the
+            // background. EXITING is already set and the deploy lock is held
+            // by this process, so nothing it writes can resurrect artifacts.
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = handle.join();
 }
 
 /// (unit name, status, url) rows for the services screen.

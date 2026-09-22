@@ -1140,6 +1140,15 @@ pub fn deploy_in_flight() -> bool {
     DEPLOY_IN_FLIGHT.load(Ordering::Relaxed)
 }
 
+/// The URL of the live/leftover journaled deploy, if any. The exit path reads
+/// it *before* reconciling so it can write the terminal "done: interrupted"
+/// marker even after the reconcile clears the journal.
+pub fn in_flight_url() -> Option<String> {
+    journal::entries()
+        .first()
+        .map(|(_, entry)| entry.url.clone())
+}
+
 /// True once a graceful exit is in progress. The pipeline polls this between
 /// phases: an exit path owns the final clean removal, so a step that has not
 /// started must not start, and a step that is mid-flight returns without

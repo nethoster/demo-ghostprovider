@@ -229,6 +229,13 @@ pub fn run() -> anyhow::Result<()> {
     disable_raw_mode()?;
     io::stdout().execute(LeaveAlternateScreen)?;
     for m in &app.exit_notices {
+        if crate::tui::workers::stderr_capture_active() {
+            // The deploy worker is still winding down with fd 2 rerouted into
+            // deploy.log; printing now would round-trip these notices back
+            // into the log a second time. They were already written there by
+            // reconcile, so skip them.
+            continue;
+        }
         eprintln!("{m}");
     }
     res
@@ -472,15 +479,33 @@ fn exit_with_reconcile(app: &mut App) -> anyhow::Result<()> {
     // first clone (see the race guard in `run_deployment`).
     let worker_live = crate::hoster::deploy::deploy_in_flight()
         || matches!(app.screen, Screen::Deploy { done: None, .. });
+    // Captured before the reconcile settles the journal, so the terminal
+    // "done: interrupted" marker below still has the URL to print.
+    let in_flight_url = worker_live.then(crate::hoster::deploy::in_flight_url);
     if worker_live {
         crate::hoster::cancel::request_exit();
         crate::hoster::deploy::quiesce(std::time::Duration::from_secs(3));
+        // `quiesce` returns the moment the in-flight flag clears, which is
+        // just before the worker's final bookkeeping. Wait for that too: the
+        // trailing "== deploy … done: failed ===" line lands in the log, and
+        // fd 2 is restored — otherwise the exit notices printed below would be
+        // captured as "still a deploy" lines and every cleanup notice would
+        // appear twice in deploy.log.
+        crate::tui::workers::wait_deploy_worker(std::time::Duration::from_secs(2));
     }
     let msgs = crate::hoster::deploy::reconcile_stale_with_basis(
         false,
         crate::hoster::deploy::ReconcileBasis::Exit,
     );
     app.exit_notices.extend(msgs);
+    if worker_live {
+        // The worker suppresses its own done line when exiting, so this is the
+        // single authoritative terminal marker for an interrupted deploy.
+        let url = in_flight_url
+            .flatten()
+            .unwrap_or_else(|| "(unknown)".into());
+        crate::tui::workers::append_deploy_log(&format!("== deploy {url} done: interrupted =="));
+    }
     Ok(())
 }
 
