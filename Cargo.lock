@@ -324,7 +324,7 @@ checksum = "5729f5117e208430e437df2f4843f5e5952997175992d1414f94c57d61e270b4"
 
 [[package]]
 name = "demo-ghostprovider"
-version = "0.0.38"
+version = "0.0.39"
 dependencies = [
  "anyhow",
  "crossterm 0.28.1",

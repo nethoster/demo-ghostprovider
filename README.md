@@ -71,6 +71,20 @@ announced port — in every scenario:
 - **The system shut down or rebooted mid-deploy** (or the panel was killed with
   `SIGKILL`) — nothing can run while the machine is off, so the deploy is
   recorded in an on-disk journal and fully removed on the next panel start.
+- **The panel is never launched again** — every install ships a
+  `demo-ghostprovider-cleanup` systemd user **timer** that periodically runs
+  `demo-ghostprovider __cleanup`, so leftovers of an interrupted deploy are
+  removed in the background even if the interactive panel never opens again.
+
+A scripted deploy (`demo-ghostprovider __deploy URL`) gets the same treatment:
+the first `SIGINT`/`SIGTERM`/`SIGHUP` triggers the removal path and exits
+`130`, so Ctrl+C cannot leave a half-built clone behind.
+
+The background sweep is never racy with a live deploy: a deploy holds an
+exclusive `flock` (`deploy.lock`) from the moment its journal entry is written
+until it is cleared, so the timer only removes something when it sees a journal
+entry whose deploying process is provably dead (the kernel releases the lock
+automatically on any exit, including `SIGKILL`, shutdown and power loss).
 
 A deploy that *finished* is never touched by this: its service is registered
 and survives reboots (auto-start on login), and removing it is always an
@@ -142,14 +156,16 @@ demo-ghostprovider                                  # launch the interactive pan
 demo-ghostprovider --show-endpoints                 # allowlist + session request counters
 demo-ghostprovider --selftest                       # E2E check against live systemd (loopback only)
 demo-ghostprovider --verify-sandbox                 # audit the build sandbox under strace (needs strace)
+demo-ghostprovider __cleanup                        # manual leftover sweep (runs automatically via a timer)
 demo-ghostprovider --version                        # print version
 ```
 
 ## Uninstall
 
 `install.sh` is the single installer and uninstaller — the same signature verifier
-from above covers `--uninstall`, which fully removes the binary, all demo-*
-systemd user units, the deploy registry/secrets state and installed service data:
+from above covers `--uninstall`, which fully removes the binary, the cleanup
+timer (`demo-ghostprovider-cleanup.timer`/`.service`), all demo-* systemd user
+units, the deploy registry/secrets state and installed service data:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/nethoster/demo-ghostprovider/main/install.sh | sh -s -- --uninstall

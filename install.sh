@@ -193,6 +193,13 @@ if [ "$ACTION" = "uninstall" ]; then
             systemctl --user disable "$unit" 2>/dev/null || true
             rm -f "$unit_dir/$unit" 2>/dev/null || true
         done
+        # The cleanup TIMER never shows up in the service-only listing above
+        # (and the timer starts with `demo-` only once the binary flagged);
+        # stop and remove both cleanup units explicitly so an upgrade never
+        # leaves a stale timer pointing at a removed binary.
+        systemctl --user stop demo-ghostprovider-cleanup.timer 2>/dev/null || true
+        systemctl --user disable demo-ghostprovider-cleanup.timer 2>/dev/null || true
+        rm -f "$unit_dir/demo-ghostprovider-cleanup.timer" "$unit_dir/demo-ghostprovider-cleanup.service" 2>/dev/null || true
         systemctl --user daemon-reload 2>/dev/null || true
         systemctl --user reset-failed 2>/dev/null || true
     fi
@@ -322,6 +329,55 @@ if [ -n "$OLD_VER" ]; then
     fi
 else
     ok "installed: $BIN_PATH"
+fi
+
+# Install the periodic cleanup timer. It runs `demo-ghostprovider __cleanup`:
+# a background sweep that removes leftovers of deploys interrupted out-of-band
+# (panel exit/kill, shutdown/reboot) even if the panel is never launched again.
+# The sweep is safe by construction — it only proceeds while holding the deploy
+# lock, which is only free once no deploy process is running.
+CLEANUP_UNITS=0
+if command -v systemctl >/dev/null 2>&1; then
+    unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    log "installing periodic cleanup timer..."
+    mkdir -p "$unit_dir"
+    cat > "$unit_dir/demo-ghostprovider-cleanup.service" <<EOF
+[Unit]
+Description=Clean up leftover demo-ghostprovider deploy artifacts
+
+[Service]
+Type=oneshot
+ExecStart=$BIN_PATH __cleanup
+# The unit only ever deletes state owned by this user; minimal hardening anyway.
+NoNewPrivileges=true
+PrivateTmp=true
+UMask=0077
+EOF
+    cat > "$unit_dir/demo-ghostprovider-cleanup.timer" <<EOF
+[Unit]
+Description=Periodic demo-ghostprovider deploy-artifact cleanup
+
+[Timer]
+# Hours after boot, plus every 15min while the machine is up, and a catch-up
+# run after resume/reboot via Persistent=true.
+OnBootSec=5min
+OnUnitActiveSec=15min
+RandomizedDelaySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    chmod 644 "$unit_dir/demo-ghostprovider-cleanup.service" "$unit_dir/demo-ghostprovider-cleanup.timer"
+    systemctl --user daemon-reload 2>/dev/null
+    if systemctl --user enable --now demo-ghostprovider-cleanup.timer 2>/dev/null; then
+        CLEANUP_UNITS=1
+        ok "cleanup timer enabled: demo-ghostprovider-cleanup.timer"
+    else
+        warn "could not enable the cleanup timer (is a user systemd manager running?); leftover cleanup will run on next launch instead"
+    fi
+else
+    warn "systemctl not found — no background cleanup timer; leftover cleanup runs on next launch"
 fi
 
 case ":$PATH:" in
