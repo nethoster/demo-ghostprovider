@@ -57,7 +57,9 @@ fn compress_done(lines: &mut Vec<String>) {
 // ── screens ──────────────────────────────────────────────────────────────────
 
 pub(crate) enum Screen {
-    Main { selected: usize },
+    Main {
+        selected: usize,
+    },
     Scan {
         report: Option<String>,
         running: bool,
@@ -151,7 +153,11 @@ fn event_loop(
         while let Ok(msg) = app.rx.try_recv() {
             match msg {
                 Msg::ScanDone(seq, report) => {
-                    if let Screen::Scan { report: r, running, seq: cur } = &mut app.screen
+                    if let Screen::Scan {
+                        report: r,
+                        running,
+                        seq: cur,
+                    } = &mut app.screen
                         && *cur == seq
                     {
                         *r = Some(report);
@@ -185,10 +191,10 @@ fn event_loop(
                         compress_done(lines);
                         *done = Some(ok);
                     }
-                    if let Screen::Logs { deploy_lines, .. } = &mut app.screen {
-                        if !ok {
-                            push_deploy_line(deploy_lines, "deployment failed".into());
-                        }
+                    if let Screen::Logs { deploy_lines, .. } = &mut app.screen
+                        && !ok
+                    {
+                        push_deploy_line(deploy_lines, "deployment failed".into());
                     }
                 }
                 Msg::SoftwareLog(line) => {
@@ -276,11 +282,32 @@ enum Flow {
 // ── keyboard ─────────────────────────────────────────────────────────────────
 
 const LAYOUT_MAP: &[(char, char)] = &[
-    ('й', 'q'), ('ц', 'w'), ('у', 'e'), ('к', 'r'), ('е', 't'),
-    ('н', 'y'), ('г', 'u'), ('ш', 'i'), ('щ', 'o'), ('з', 'p'),
-    ('ф', 'a'), ('ы', 's'), ('в', 'd'), ('а', 'f'), ('п', 'g'),
-    ('р', 'h'), ('о', 'j'), ('л', 'k'), ('д', 'l'), ('я', 'z'),
-    ('ч', 'x'), ('с', 'c'), ('м', 'v'), ('и', 'b'), ('т', 'n'), ('ь', 'm'),
+    ('й', 'q'),
+    ('ц', 'w'),
+    ('у', 'e'),
+    ('к', 'r'),
+    ('е', 't'),
+    ('н', 'y'),
+    ('г', 'u'),
+    ('ш', 'i'),
+    ('щ', 'o'),
+    ('з', 'p'),
+    ('ф', 'a'),
+    ('ы', 's'),
+    ('в', 'd'),
+    ('а', 'f'),
+    ('п', 'g'),
+    ('р', 'h'),
+    ('о', 'j'),
+    ('л', 'k'),
+    ('д', 'l'),
+    ('я', 'z'),
+    ('ч', 'x'),
+    ('с', 'c'),
+    ('м', 'v'),
+    ('и', 'b'),
+    ('т', 'n'),
+    ('ь', 'm'),
 ];
 
 fn command_char(key: KeyCode) -> Option<char> {
@@ -326,25 +353,39 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 app.screen = Screen::Main { selected: 0 };
             }
         }
-        Screen::UrlInput { buffer, error, busy } => {
-            if *busy { return Flow::Continue; }
+        Screen::UrlInput {
+            buffer,
+            error,
+            busy,
+        } => {
+            if *busy {
+                return Flow::Continue;
+            }
             match key {
                 KeyCode::Esc => app.screen = Screen::Main { selected: 1 },
-                KeyCode::Backspace => { buffer.pop(); }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                }
                 KeyCode::Enter => {
                     if buffer.trim().is_empty() {
                         *error = Some("enter a GitHub URL".into());
                     } else {
                         let url = buffer.trim().to_string();
                         let service_label = confirm_label(&url);
-                        app.screen = Screen::Confirm { url, service_label, yes_selected: true };
+                        app.screen = Screen::Confirm {
+                            url,
+                            service_label,
+                            yes_selected: true,
+                        };
                     }
                 }
                 KeyCode::Char(c) => buffer.push(c),
                 _ => {}
             }
         }
-        Screen::Confirm { url, yes_selected, .. } => {
+        Screen::Confirm {
+            url, yes_selected, ..
+        } => {
             let mut decision: Option<bool> = None;
             match key {
                 KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
@@ -382,7 +423,11 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 app.screen = Screen::Main { selected: 1 };
             }
         }
-        Screen::Services { rows, selected, message } => {
+        Screen::Services {
+            rows,
+            selected,
+            message,
+        } => {
             let _ = message;
             let count = rows.len();
             match key {
@@ -442,16 +487,29 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 Some(true) => {
                     let msg = crate::tui::workers::service_action(name, "delete");
                     let rows = crate::tui::workers::service_rows();
-                    app.screen = Screen::Services { rows, selected: 0, message: Some(msg) };
+                    app.screen = Screen::Services {
+                        rows,
+                        selected: 0,
+                        message: Some(msg),
+                    };
                 }
                 Some(false) => {
                     let rows = crate::tui::workers::service_rows();
-                    app.screen = Screen::Services { rows, selected: 0, message: None };
+                    app.screen = Screen::Services {
+                        rows,
+                        selected: 0,
+                        message: None,
+                    };
                 }
                 None => {}
             }
         }
-        Screen::Logs { view, deploy_lines, software_lines, scroll } => {
+        Screen::Logs {
+            view,
+            deploy_lines,
+            software_lines,
+            scroll,
+        } => {
             let active_lines = match view {
                 LogView::Deploy => deploy_lines.len(),
                 LogView::Software => software_lines.len(),
@@ -514,7 +572,11 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
         }
         2 => {
             let rows = crate::tui::workers::service_rows();
-            app.screen = Screen::Services { rows, selected: 0, message: None };
+            app.screen = Screen::Services {
+                rows,
+                selected: 0,
+                message: None,
+            };
         }
         3 => {
             let deploy_lines = app.deploy_history.clone();
@@ -526,7 +588,9 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                     software_lines.clone_from(&fetched);
                     app.software_history = fetched;
                 } else {
-                    software_lines.push("No software logs yet. Deploy a service to see journal output here.".into());
+                    software_lines.push(
+                        "No software logs yet. Deploy a service to see journal output here.".into(),
+                    );
                 }
             }
             app.screen = Screen::Logs {
@@ -587,25 +651,44 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
     match &app.screen {
         Screen::Main { selected } => draw_main_menu(f, chunks[1], *selected),
-        Screen::Scan { report, running, .. } => {
+        Screen::Scan {
+            report, running, ..
+        } => {
             draw_scan(f, chunks[1], report.as_deref(), *running, app.tick);
         }
-        Screen::UrlInput { buffer, error, busy } => {
+        Screen::UrlInput {
+            buffer,
+            error,
+            busy,
+        } => {
             draw_url_input(f, chunks[1], buffer, error.as_deref(), *busy, app.tick);
         }
-        Screen::Confirm { url, service_label, yes_selected } => {
+        Screen::Confirm {
+            url,
+            service_label,
+            yes_selected,
+        } => {
             draw_confirm(f, chunks[1], url, service_label, *yes_selected);
         }
         Screen::Deploy { lines, done } => {
             draw_deploy(f, chunks[1], lines, *done);
         }
-        Screen::Services { rows, selected, message } => {
+        Screen::Services {
+            rows,
+            selected,
+            message,
+        } => {
             draw_services(f, chunks[1], rows, *selected, message.as_deref());
         }
         Screen::ConfirmDelete { name, yes_selected } => {
             draw_confirm_delete(f, chunks[1], name, *yes_selected);
         }
-        Screen::Logs { view, deploy_lines, software_lines, scroll } => {
+        Screen::Logs {
+            view,
+            deploy_lines,
+            software_lines,
+            scroll,
+        } => {
             draw_logs(f, chunks[1], *view, deploy_lines, software_lines, *scroll);
         }
     }
@@ -739,9 +822,11 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: Rect, selected: usize) {
         let label_fg = if sel { RED } else { RED };
         let label_line = Paragraph::new(Line::from(Span::styled(
             label.to_string(),
-            Style::default()
-                .fg(label_fg)
-                .add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
+            Style::default().fg(label_fg).add_modifier(if sel {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }),
         )))
         .alignment(ratatui::layout::Alignment::Center);
         f.render_widget(label_line, inner[0]);
@@ -752,7 +837,12 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: Rect, selected: usize) {
         let box_h: u16 = 5;
         let bx = inner[1].x + inner[1].width.saturating_sub(box_w) / 2;
         let by = inner[1].y;
-        let box_area = Rect { x: bx, y: by, width: box_w, height: box_h };
+        let box_area = Rect {
+            x: bx,
+            y: by,
+            width: box_w,
+            height: box_h,
+        };
 
         // Screenshot boxes are all identical red dashed — selected gets brighter + bold border
         let bcol = if sel { RED } else { DIM_RED };
@@ -777,13 +867,7 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: Rect, selected: usize) {
 
 // ── system scan ──────────────────────────────────────────────────────────────
 
-fn draw_scan(
-    f: &mut ratatui::Frame,
-    area: Rect,
-    report: Option<&str>,
-    running: bool,
-    tick: u64,
-) {
+fn draw_scan(f: &mut ratatui::Frame, area: Rect, report: Option<&str>, running: bool, tick: u64) {
     let mut lines: Vec<Line> = Vec::new();
     match (report, running) {
         (Some(r), _) => lines.extend(colorize_scan(r)),
@@ -814,7 +898,10 @@ fn draw_url_input(
     tick: u64,
 ) {
     let mut text = vec![
-        Line::from(Span::styled(" Supported demo services:", Style::default().fg(DIM))),
+        Line::from(Span::styled(
+            " Supported demo services:",
+            Style::default().fg(DIM),
+        )),
         Line::from(vec![
             Span::raw("  "),
             Span::styled("VERT-sh/VERT", Style::default().fg(RED)),
@@ -874,9 +961,20 @@ fn confirm_label(url: &str) -> String {
 fn choice_spans(marker: &str, label: &str, hue: Color, selected: bool) -> Vec<Span<'static>> {
     let mut spans = vec![Span::raw("   ")];
     if selected {
-        spans.push(Span::styled("» ".to_string(), Style::default().fg(hue).add_modifier(Modifier::BOLD)));
-        spans.push(Span::styled(marker.to_string(), Style::default().fg(hue).add_modifier(Modifier::BOLD | Modifier::REVERSED)));
-        spans.push(Span::styled(label.to_string(), Style::default().fg(RED).add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(
+            "» ".to_string(),
+            Style::default().fg(hue).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            marker.to_string(),
+            Style::default()
+                .fg(hue)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED),
+        ));
+        spans.push(Span::styled(
+            label.to_string(),
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        ));
     } else {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(marker.to_string(), Style::default().fg(DIM)));
@@ -885,11 +983,20 @@ fn choice_spans(marker: &str, label: &str, hue: Color, selected: bool) -> Vec<Sp
     spans
 }
 
-fn draw_confirm(f: &mut ratatui::Frame, area: Rect, url: &str, service_label: &str, yes_selected: bool) {
+fn draw_confirm(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    url: &str,
+    service_label: &str,
+    yes_selected: bool,
+) {
     let text = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(" Host ", Style::default().fg(DIM).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Host ",
+                Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(service_label.to_string(), Style::default().fg(RED)),
             Span::styled(" on this machine?", Style::default().fg(BODY)),
         ]),
@@ -901,10 +1008,15 @@ fn draw_confirm(f: &mut ratatui::Frame, area: Rect, url: &str, service_label: &s
         Line::from(choice_spans("[Y]es", " — deploy", RED, yes_selected)),
         Line::from(choice_spans("[N]o", " — cancel", DIM_RED, !yes_selected)),
         Line::from(""),
-        Line::from(Span::styled(" ←→ select · Enter confirm", Style::default().fg(DIM))),
+        Line::from(Span::styled(
+            " ←→ select · Enter confirm",
+            Style::default().fg(DIM),
+        )),
     ];
     f.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(block("Confirm Deployment", RED)),
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block("Confirm Deployment", RED)),
         area,
     );
 }
@@ -913,7 +1025,10 @@ fn draw_confirm_delete(f: &mut ratatui::Frame, area: Rect, name: &str, yes_selec
     let text = vec![
         Line::from(""),
         Line::from(vec![
-            Span::styled(" Remove ", Style::default().fg(BRIGHT_RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " Remove ",
+                Style::default().fg(BRIGHT_RED).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(name.to_string(), Style::default().fg(RED)),
             Span::styled("?", Style::default().fg(BRIGHT_RED)),
         ]),
@@ -925,10 +1040,15 @@ fn draw_confirm_delete(f: &mut ratatui::Frame, area: Rect, name: &str, yes_selec
         Line::from(choice_spans("[Y]es", " — remove", BRIGHT_RED, yes_selected)),
         Line::from(choice_spans("[N]o", " — keep", RED, !yes_selected)),
         Line::from(""),
-        Line::from(Span::styled(" ←→ select · Enter confirm", Style::default().fg(DIM))),
+        Line::from(Span::styled(
+            " ←→ select · Enter confirm",
+            Style::default().fg(DIM),
+        )),
     ];
     f.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(block("Confirm Removal", RED)),
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block("Confirm Removal", RED)),
         area,
     );
 }
@@ -952,7 +1072,10 @@ fn draw_deploy(f: &mut ratatui::Frame, area: Rect, lines: &[String], done: Optio
             }
             spans.push(Line::from(vec![
                 Span::styled(" ──", Style::default().fg(DIM)),
-                Span::styled(" TOOL DOCTOR ", Style::default().fg(DIM_RED).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    " TOOL DOCTOR ",
+                    Style::default().fg(DIM_RED).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("────────────────", Style::default().fg(DIM)),
             ]));
         }
@@ -960,7 +1083,9 @@ fn draw_deploy(f: &mut ratatui::Frame, area: Rect, lines: &[String], done: Optio
         prev_doctor = is_doctor;
     }
     f.render_widget(
-        Paragraph::new(spans).wrap(Wrap { trim: false }).block(block("Deployment", RED)),
+        Paragraph::new(spans)
+            .wrap(Wrap { trim: false })
+            .block(block("Deployment", RED)),
         inner[0],
     );
     if let Some(ok) = done {
@@ -987,26 +1112,38 @@ fn log_lines(line: &str) -> Vec<Line<'static>> {
             return doctor_lines(body).unwrap_or_default();
         }
         return vec![Line::from(vec![
-            Span::styled(" ✖ ".to_string(), Style::default().fg(BRIGHT_RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ✖ ".to_string(),
+                Style::default().fg(BRIGHT_RED).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(body.to_string(), Style::default().fg(BRIGHT_RED)),
         ])];
     }
     if let Some(body) = s.strip_prefix("warn: ") {
         return vec![Line::from(vec![
-            Span::styled(" ! ".to_string(), Style::default().fg(DIM_RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ! ".to_string(),
+                Style::default().fg(DIM_RED).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(body.to_string(), Style::default().fg(DIM_RED)),
         ])];
     }
     if let Some(body) = s.strip_prefix("provision: ") {
         return vec![Line::from(vec![
-            Span::styled(" ● ".to_string(), Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ● ".to_string(),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(body.to_string(), Style::default().fg(RED)),
         ])];
     }
     if let Some(url) = s.strip_prefix("listening on ") {
         return vec![Line::from(vec![
             Span::styled(" ✔ listening on ", Style::default().fg(RED)),
-            Span::styled(url.to_string(), Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                url.to_string(),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
         ])];
     }
     let style = if s.contains("failed") || s.contains("ERROR") {
@@ -1029,12 +1166,18 @@ fn doctor_lines(body: &str) -> Option<Vec<Line<'static>>> {
     let (problem, cmd, note) = crate::hoster::toolcheck::split_issue(body)?;
     let mut out = vec![
         Line::from(vec![
-            Span::styled(" ! ".to_string(), Style::default().fg(DIM_RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ! ".to_string(),
+                Style::default().fg(DIM_RED).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(problem.to_string(), Style::default().fg(BRIGHT_RED)),
         ]),
         Line::from(vec![
             Span::styled("   fix » ".to_string(), Style::default().fg(DIM)),
-            Span::styled(cmd.to_string(), Style::default().fg(RED).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                cmd.to_string(),
+                Style::default().fg(RED).add_modifier(Modifier::BOLD),
+            ),
         ]),
     ];
     if let Some(n) = note {
@@ -1072,20 +1215,31 @@ fn draw_services(
         Span::styled("]efresh", Style::default().fg(DIM)),
     ]);
     if let Some(m) = message {
-        title.push_span(Span::styled(format!("  — {m}"), Style::default().fg(DIM_RED)));
+        title.push_span(Span::styled(
+            format!("  — {m}"),
+            Style::default().fg(DIM_RED),
+        ));
     }
 
     if rows.is_empty() {
         f.render_widget(
             Paragraph::new(vec![
-                Line::from(Span::styled(" No services deployed yet.", Style::default().fg(DIM))),
+                Line::from(Span::styled(
+                    " No services deployed yet.",
+                    Style::default().fg(DIM),
+                )),
                 Line::from(""),
                 Line::from(Span::styled(
                     " Use \"Deploy Service\" from the menu.",
                     Style::default().fg(DIM_RED),
                 )),
             ])
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(RED)).title(title)),
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(RED))
+                    .title(title),
+            ),
             area,
         );
         return;
@@ -1105,11 +1259,19 @@ fn draw_services(
             ListItem::new(Line::from(vec![
                 Span::styled(
                     if sel { " » " } else { "   " },
-                    Style::default().fg(RED).add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
+                    Style::default().fg(RED).add_modifier(if sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
                 ),
                 Span::styled(
                     format!("{name:<16}"),
-                    Style::default().fg(name_fg).add_modifier(if sel { Modifier::BOLD } else { Modifier::empty() }),
+                    Style::default().fg(name_fg).add_modifier(if sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
                 ),
                 format!("{:<12}", "").into(),
                 Span::styled("● ", Style::default().fg(status_color)),
@@ -1119,7 +1281,12 @@ fn draw_services(
         })
         .collect();
     f.render_widget(
-        List::new(items).block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(RED)).title(title)),
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(RED))
+                .title(title),
+        ),
         area,
     );
 }
@@ -1142,26 +1309,38 @@ fn draw_logs(
     // Tab bar
     let tab_bar = Line::from(vec![
         Span::styled(
-            if tab_deploy_active { " [DEPLOY] " } else { "  DEPLOY  " },
+            if tab_deploy_active {
+                " [DEPLOY] "
+            } else {
+                "  DEPLOY  "
+            },
             Style::default()
                 .fg(if tab_deploy_active { RED } else { DIM })
-                .add_modifier(if tab_deploy_active { Modifier::BOLD } else { Modifier::empty() }),
+                .add_modifier(if tab_deploy_active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
         Span::styled(" · ", Style::default().fg(DIM)),
         Span::styled(
-            if !tab_deploy_active { " [SOFTWARE] " } else { "  SOFTWARE  " },
+            if !tab_deploy_active {
+                " [SOFTWARE] "
+            } else {
+                "  SOFTWARE  "
+            },
             Style::default()
                 .fg(if !tab_deploy_active { RED } else { DIM })
-                .add_modifier(if !tab_deploy_active { Modifier::BOLD } else { Modifier::empty() }),
+                .add_modifier(if !tab_deploy_active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                }),
         ),
         Span::styled("  (Tab to switch)", Style::default().fg(DIM)),
     ]);
 
-    let inner = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-    ])
-    .split(area);
+    let inner = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
 
     f.render_widget(Paragraph::new(tab_bar), inner[0]);
 
@@ -1223,17 +1402,28 @@ fn colorize_scan(report: &str) -> Vec<Line<'static>> {
                 Style::default().fg(RED).add_modifier(Modifier::BOLD),
             )));
         } else if trimmed.starts_with("PORT ") {
-            out.push(Line::from(Span::styled(line.to_string(), Style::default().fg(DIM))));
+            out.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(DIM),
+            )));
         } else if in_ports && !trimmed.is_empty() {
             if trimmed == "(none)" {
-                out.push(Line::from(Span::styled(format!(" {line}"), Style::default().fg(DIM))));
+                out.push(Line::from(Span::styled(
+                    format!(" {line}"),
+                    Style::default().fg(DIM),
+                )));
                 continue;
             }
             let deployed = trimmed.contains("(deployed)");
             let hue = if deployed { RED } else { DIM_RED };
             let mut spans = vec![Span::raw(" ")];
-            let (port, rest) = trimmed.split_once(char::is_whitespace).unwrap_or((trimmed, ""));
-            spans.push(Span::styled(port.to_string(), Style::default().fg(hue).add_modifier(Modifier::BOLD)));
+            let (port, rest) = trimmed
+                .split_once(char::is_whitespace)
+                .unwrap_or((trimmed, ""));
+            spans.push(Span::styled(
+                port.to_string(),
+                Style::default().fg(hue).add_modifier(Modifier::BOLD),
+            ));
             if !rest.is_empty() {
                 spans.push(Span::styled(format!(" {rest}"), Style::default().fg(hue)));
             }
@@ -1260,7 +1450,10 @@ fn colorize_scan(report: &str) -> Vec<Line<'static>> {
                 spans.push(Span::styled(rest, Style::default().fg(DIM)));
             }
             if !status.is_empty() {
-                spans.push(Span::styled(format!(" {status}"), Style::default().fg(status_color)));
+                spans.push(Span::styled(
+                    format!(" {status}"),
+                    Style::default().fg(status_color),
+                ));
             }
             out.push(Line::from(spans));
         } else if trimmed.starts_with("[x]") || trimmed.starts_with("[ ]") {
@@ -1272,18 +1465,33 @@ fn colorize_scan(report: &str) -> Vec<Line<'static>> {
             };
             out.push(Line::from(vec![
                 Span::raw(" "),
-                Span::styled(mark.to_string(), Style::default().fg(mark_color).add_modifier(Modifier::BOLD)),
-                Span::styled(format!(" {}", &trimmed[3..]), Style::default().fg(rest_color)),
+                Span::styled(
+                    mark.to_string(),
+                    Style::default().fg(mark_color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", &trimmed[3..]),
+                    Style::default().fg(rest_color),
+                ),
             ]));
         } else if trimmed.starts_with("!") {
             out.push(Line::from(Span::styled(
                 line.to_string(),
                 Style::default().fg(BRIGHT_RED).add_modifier(Modifier::BOLD),
             )));
-        } else if trimmed.contains("MISSING") || trimmed.contains("not installed") || trimmed.contains("offline") {
-            out.push(Line::from(Span::styled(line.to_string(), Style::default().fg(BRIGHT_RED))));
+        } else if trimmed.contains("MISSING")
+            || trimmed.contains("not installed")
+            || trimmed.contains("offline")
+        {
+            out.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(BRIGHT_RED),
+            )));
         } else {
-            out.push(Line::from(Span::styled(line.to_string(), Style::default().fg(BODY))));
+            out.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(BODY),
+            )));
         }
     }
     out
@@ -1341,7 +1549,10 @@ fn hint_line(screen: &Screen) -> Line<'static> {
         if i > 0 {
             spans.push(Span::styled(" · ", Style::default().fg(DIM)));
         }
-        spans.push(Span::styled(format!(" {text}"), Style::default().fg(*color)));
+        spans.push(Span::styled(
+            format!(" {text}"),
+            Style::default().fg(*color),
+        ));
     }
     Line::from(spans)
 }

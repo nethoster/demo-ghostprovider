@@ -1268,19 +1268,17 @@ pub fn sweep_stale() -> SweepOutcome {
 /// by journald for the unit).
 pub fn cleanup_cmd() -> anyhow::Result<()> {
     use std::io::Write;
+    let mut out = std::io::stdout();
     match sweep_stale() {
         SweepOutcome::Deferred => {
-            let _ = write!(
-                std::io::stdout(),
-                "cleanup: deferred — a deployment is in progress\n"
-            );
+            writeln!(out, "cleanup: deferred — a deployment is in progress")?;
         }
         SweepOutcome::Cleaned(msgs) => {
             if msgs.is_empty() {
-                let _ = write!(std::io::stdout(), "cleanup: nothing to remove\n");
+                writeln!(out, "cleanup: nothing to remove")?;
             } else {
                 for m in &msgs {
-                    let _ = write!(std::io::stdout(), "{m}\n");
+                    writeln!(out, "{m}")?;
                 }
             }
         }

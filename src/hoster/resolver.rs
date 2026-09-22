@@ -30,9 +30,9 @@ use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use rustls::pki_types::ServerName;
 use rustls::ClientConnection;
 use rustls::StreamOwned;
+use rustls::pki_types::ServerName;
 use ureq::config::Config;
 use ureq::http::Uri;
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
@@ -131,7 +131,9 @@ impl SmartResolver {
         {
             let mut cd = self.cooldown.lock().unwrap();
             let now = Instant::now();
-            if let Some(&last) = cd.get(host) && now.duration_since(last) < COOLDOWN {
+            if let Some(&last) = cd.get(host)
+                && now.duration_since(last) < COOLDOWN
+            {
                 return None;
             }
             cd.insert(host.to_string(), now);
@@ -179,7 +181,10 @@ impl SmartResolver {
             return None;
         }
         if !result.is_empty() {
-            self.cache.lock().unwrap().insert(host.to_string(), (Instant::now(), result.clone()));
+            self.cache
+                .lock()
+                .unwrap()
+                .insert(host.to_string(), (Instant::now(), result.clone()));
         }
         Some(result)
     }
@@ -189,11 +194,8 @@ impl SmartResolver {
 fn doh_query(ip: IpAddr, host: &str, typ: u16, deadline: Instant) -> anyhow::Result<Vec<IpAddr>> {
     let left = deadline.saturating_duration_since(Instant::now());
     let connect_ms = left.min(CONNECT_TIMEOUT);
-    let sock = TcpStream::connect_timeout(
-        &SocketAddr::new(ip, 443),
-        connect_ms,
-    )
-    .map_err(|e| anyhow::anyhow!("tls connect {ip}: {e}"))?;
+    let sock = TcpStream::connect_timeout(&SocketAddr::new(ip, 443), connect_ms)
+        .map_err(|e| anyhow::anyhow!("tls connect {ip}: {e}"))?;
     sock.set_read_timeout(Some(left.min(IO_BUDGET)))
         .map_err(|e| anyhow::anyhow!("set read timeout: {e}"))?;
     sock.set_write_timeout(Some(left.min(IO_BUDGET)))
@@ -203,8 +205,8 @@ fn doh_query(ip: IpAddr, host: &str, typ: u16, deadline: Instant) -> anyhow::Res
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let server = ServerName::try_from(DOH_HOST.to_owned())
-        .map_err(|e| anyhow::anyhow!("bad sni: {e}"))?;
+    let server =
+        ServerName::try_from(DOH_HOST.to_owned()).map_err(|e| anyhow::anyhow!("bad sni: {e}"))?;
     let conn = ClientConnection::new(std::sync::Arc::new(config), server)
         .map_err(|e| anyhow::anyhow!("tls handshake: {e}"))?;
     let mut stream = StreamOwned::new(conn, sock);
@@ -249,9 +251,7 @@ fn percent_encode(host: &str) -> String {
     let mut out = String::with_capacity(host.len());
     for b in host.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' => {
-                out.push(b as char)
-            }
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' => out.push(b as char),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -260,19 +260,22 @@ fn percent_encode(host: &str) -> String {
 
 /// Parse Cloudflare's `application/dns-json` reply.
 fn parse_doh_json(body: &str, typ: u16) -> anyhow::Result<Vec<IpAddr>> {
-    let v: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| anyhow::anyhow!("doh json: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| anyhow::anyhow!("doh json: {e}"))?;
     let mut out = Vec::new();
     if let Some(arr) = v.get("Answer").and_then(serde_json::Value::as_array) {
         for a in arr {
-            let qtype = a.get("type").and_then(serde_json::Value::as_u64).unwrap_or(0) as u16;
+            let qtype = a
+                .get("type")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u16;
             if qtype != typ {
                 continue;
             }
-            if let Some(data) = a.get("data").and_then(serde_json::Value::as_str) {
-                if let Ok(ip) = data.parse::<IpAddr>() {
-                    out.push(ip);
-                }
+            if let Some(data) = a.get("data").and_then(serde_json::Value::as_str)
+                && let Ok(ip) = data.parse::<IpAddr>()
+            {
+                out.push(ip);
             }
         }
     }
@@ -352,11 +355,12 @@ mod tests {
             deadline,
         )
         .unwrap();
-        assert!(!ips.is_empty(), "expected at least one A record for github.com");
+        assert!(
+            !ips.is_empty(),
+            "expected at least one A record for github.com"
+        );
         let r = SmartResolver::new();
-        let a = r
-            .doh_resolve("proxy.golang.org", 443)
-            .unwrap_or_default();
+        let a = r.doh_resolve("proxy.golang.org", 443).unwrap_or_default();
         assert!(!a.is_empty(), "proxy.golang.org must resolve through DoH");
         let _ = r;
     }

@@ -136,15 +136,14 @@ pub(crate) fn append_deploy_log(line: &str) {
     }
     if let Ok(md) = std::fs::metadata(&path)
         && md.len() > MAX_DEPLOY_LOG_BYTES
+        && let Ok(content) = std::fs::read(&path)
     {
-        if let Ok(content) = std::fs::read(&path) {
-            let keep = content.len().saturating_sub(DEPLOY_LOG_KEEP_BYTES);
-            let mut slice = &content[keep..];
-            if let Some(pos) = slice.iter().position(|&b| b == b'\n') {
-                slice = &slice[pos + 1..];
-            }
-            let _ = std::fs::write(&path, slice);
+        let keep = content.len().saturating_sub(DEPLOY_LOG_KEEP_BYTES);
+        let mut slice = &content[keep..];
+        if let Some(pos) = slice.iter().position(|&b| b == b'\n') {
+            slice = &slice[pos + 1..];
         }
+        let _ = std::fs::write(&path, slice);
     }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()

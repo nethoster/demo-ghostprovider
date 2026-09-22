@@ -766,11 +766,11 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                                 scroll: 0,
                             };
                             // restore software_lines if it was taken empty
-                            if let Screen::Logs { software_lines, .. } = &mut app.screen {
-                                if software_lines.is_empty() {
-                                    *software_lines = workers::fetch_software_logs();
-                                    app.software_history.clone_from(software_lines);
-                                }
+                            if let Screen::Logs { software_lines, .. } = &mut app.screen
+                                && software_lines.is_empty()
+                            {
+                                *software_lines = workers::fetch_software_logs();
+                                app.software_history.clone_from(software_lines);
                             }
                         }
                         LogView::Software => {

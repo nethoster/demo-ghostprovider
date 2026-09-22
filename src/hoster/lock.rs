@@ -51,6 +51,7 @@ fn open_lock() -> std::io::Result<File> {
         .read(true)
         .write(true)
         .create(true)
+        .truncate(false)
         .mode(0o600)
         .open(path)
 }
@@ -99,7 +100,7 @@ mod tests {
 
         // flock is per open-file-description, so two opens in this process
         // contend exactly like a second process would.
-        assert!(is_locked() == false, "fresh state dir has no lock");
+        assert!(!is_locked(), "fresh state dir has no lock");
         let guard = try_lock_exclusive().expect("first acquirer gets the lock");
         assert!(
             try_lock_exclusive().is_none(),
@@ -109,7 +110,7 @@ mod tests {
         assert!(crate::paths::deploy_lock_file().is_file());
 
         drop(guard);
-        assert!(is_locked() == false, "lock released on guard drop");
+        assert!(!is_locked(), "lock released on guard drop");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
