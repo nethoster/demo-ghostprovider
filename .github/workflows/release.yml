@@ -138,12 +138,39 @@ jobs:
           fi
           echo "::warning::release-notes source=$SRC tag=$TAG taghits=$(git tag -l "$TAG" 2>/dev/null | wc -l | tr -d ' ') body_bytes=$(wc -c < /tmp/release_body.md | tr -d ' ')"
 
+      - name: Resolve release token
+        id: reltok
+        env:
+          # Used only by the liveness probe below; never echoed.
+          SECRET_TOKEN: ${{ secrets.GH_RELEASE_TOKEN }}
+        run: |
+          set -eu
+          # Prefer the maintainer PAT so releases publish under the
+          # maintainer identity, but only after proving it authenticates: a
+          # stale GH_RELEASE_TOKEN used to reach this point with every
+          # verification already green and then fail the whole run with
+          # "Bad credentials", stranding the release. Fall back to the
+          # workflow's built-in token (permissions: contents: write) so a
+          # dead secret can never block publishing again.
+          if [ -n "${SECRET_TOKEN}" ]; then
+            code="$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer ${SECRET_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              https://api.github.com/user)"
+            if [ "${code}" = "200" ]; then
+              echo "kind=secret" >> "${GITHUB_OUTPUT}"
+              exit 0
+            fi
+          fi
+          echo "kind=builtin" >> "${GITHUB_OUTPUT}"
+
       - name: Attach to release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
-          # Publish under the maintainer identity instead of
-          # github-actions[bot]; Contents RW on this repo is sufficient.
-          token: ${{ secrets.GH_RELEASE_TOKEN }}
+          # Maintainer PAT when it is valid, otherwise the built-in token
+          # (this job already has permissions: contents: write) — publishing
+          # as github-actions[bot] beats never publishing at all.
+          token: ${{ steps.reltok.outputs.kind == 'secret' && secrets.GH_RELEASE_TOKEN || github.token }}
           # Explicit body from the annotated tag message / commit history,
           # never GitHub's PR-based auto-notes (empty for direct-commit repos).
           body_path: /tmp/release_body.md
