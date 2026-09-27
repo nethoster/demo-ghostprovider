@@ -17,7 +17,7 @@
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -369,13 +369,52 @@ fn cache_env(project_dir: Option<&Path>) -> BTreeMap<&'static str, String> {
     ])
 }
 
+/// Keys of [`cache_env`] whose values are directory paths. Every other entry
+/// is a scalar setting (`pnpm_config_pm_on_fail=ignore`,
+/// `pnpm_config_minimum_release_age=0`) and must never be mkdir'd.
+const PATH_ENV_KEYS: &[&str] = &[
+    "XDG_CACHE_HOME",
+    "npm_config_cache",
+    "YARN_CACHE_FOLDER",
+    "BUN_INSTALL_CACHE_DIR",
+    "CARGO_HOME",
+    "GOCACHE",
+    "GOMODCACHE",
+    "GOPATH",
+    "GOTMPDIR",
+    "npm_config_store_dir",
+    "PNPM_HOME",
+    "TMPDIR",
+    "HOME",
+    "XDG_RUNTIME_DIR",
+];
+
+/// Directory a precreate pass must ensure exists for one `cache_env` entry;
+/// `None` when the value is not a path. A relative path value is resolved
+/// against the project — never against the process cwd, which is wherever the
+/// panel happened to be launched from (that is how `0/` and `ignore/` once
+/// showed up in `$HOME`).
+fn precreate_target(project_dir: &Path, key: &str, value: &str) -> Option<PathBuf> {
+    if !PATH_ENV_KEYS.contains(&key) {
+        return None;
+    }
+    let path = Path::new(value);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_dir.join(path)
+    })
+}
+
 pub(crate) fn precreate_cache_dirs(project_dir: &Path, env: &BTreeMap<&'static str, String>) {
     if env.is_empty() {
         return;
     }
     let _ = std::fs::create_dir_all(project_dir.join(".ghost-cache"));
-    for p in env.values() {
-        let _ = std::fs::create_dir_all(p);
+    for (key, value) in env {
+        if let Some(target) = precreate_target(project_dir, key, value) {
+            let _ = std::fs::create_dir_all(target);
+        }
     }
 }
 
@@ -756,6 +795,46 @@ mod tests {
                 .map(String::as_str),
             Some("0")
         );
+    }
+
+    #[test]
+    fn precreate_creates_only_project_paths_never_cwd_rel_paths() {
+        let proj = Path::new("/proj");
+        let env = cache_env(Some(proj));
+        // The two scalar pnpm settings are not paths: precreating every value
+        // blindly used to mkdir "ignore" and "0" relative to the process cwd,
+        // scattering empty dirs through whatever directory the panel was
+        // started in.
+        assert!(precreate_target(proj, "pnpm_config_pm_on_fail", "ignore").is_none());
+        assert!(precreate_target(proj, "pnpm_config_minimum_release_age", "0").is_none());
+        // A relative *path* value still lands inside the project, never in cwd.
+        assert_eq!(
+            precreate_target(proj, "TMPDIR", "tmp"),
+            Some(PathBuf::from("/proj/tmp"))
+        );
+        for (key, value) in &env {
+            match precreate_target(proj, key, value) {
+                Some(target) => {
+                    assert!(
+                        PATH_ENV_KEYS.contains(key),
+                        "{key} must be a known path key"
+                    );
+                    assert!(
+                        target.is_absolute(),
+                        "{key} must resolve to an absolute path"
+                    );
+                    assert!(
+                        target.starts_with(proj),
+                        "{key} must stay under the project, got {}",
+                        target.display()
+                    );
+                }
+                None => assert!(
+                    !PATH_ENV_KEYS.contains(key),
+                    "{key} is a path key but was skipped"
+                ),
+            }
+        }
     }
 
     #[test]
