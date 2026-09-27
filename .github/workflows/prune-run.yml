@@ -1,0 +1,32 @@
+# One-off maintenance tool: delete a single workflow run by id.
+#
+# The maintainer's fine-grained PAT has no `actions: write`, so a red run
+# can only be removed through the built-in GITHUB_TOKEN with an explicit
+# permissions block. This workflow is added, dispatched once, and removed
+# again — the repository is left with no standing capability to erase its
+# own CI history.
+name: prune-run
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Numeric workflow run id to delete
+        required: true
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete workflow run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.run_id }}
+        run: |
+          set -eu
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}"
+          echo "deleted run ${RUN_ID}"
