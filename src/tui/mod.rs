@@ -620,7 +620,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             selected,
             message,
         } => {
-            let _ = message; // status messages surface via refresh below
+            let _ = message; // status messages surface via the actions below
             let count = rows.len();
             match key {
                 KeyCode::Esc => app.screen = Screen::Main { selected: 2 },
@@ -630,6 +630,16 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     Some('q') => app.screen = Screen::Main { selected: 2 },
                     Some('k') if count > 0 => *selected = selected.saturating_sub(1),
                     Some('j') if count > 0 => *selected = (*selected + 1).min(count - 1),
+                    Some('r') if count > 0 => {
+                        // [r] restarts the selected service and re-reads the
+                        // rows so the status shown reflects the restart.
+                        if let Some((name, _, _)) = rows.get(*selected) {
+                            let name = name.clone();
+                            let msg = workers::service_action(&name, "restart");
+                            *rows = workers::service_rows();
+                            *message = Some(msg);
+                        }
+                    }
                     Some('r') => {
                         *rows = workers::service_rows();
                         *message = Some("refreshed".into());
@@ -2121,7 +2131,7 @@ fn hint_line(screen: &Screen) -> Line<'static> {
         }
         Screen::Services { .. } => vec![
             ("↑↓ select", BLUE),
-            ("[s]top star[t] [d]elete [r]efresh", BLUE),
+            ("[s]top star[t] [d]elete [r]estart", BLUE),
             ("Esc back", BLUE),
         ],
         Screen::Logs { .. } => vec![
@@ -2226,7 +2236,7 @@ mod tests {
             ('Л', "k"), // up (vim-style)
             ('о', "j"),
             ('О', "j"), // down (vim-style)
-            ('к', "r"), // refresh
+            ('к', "r"), // restart
             ('ы', "s"), // stop
             ('е', "t"), // start
             ('в', "d"), // delete

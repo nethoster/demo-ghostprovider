@@ -361,6 +361,9 @@ pub(crate) fn service_action(name: &str, action: &str) -> String {
     let res = match action {
         "stop" => systemctl(&["--user", "stop", name]),
         "start" => start_service(name),
+        // `restart` also starts a stopped/failed unit and clears its failed
+        // state, which is what a user reaching for [r] expects.
+        "restart" => systemctl(&["--user", "restart", name]),
         "delete" => {
             deploy::remove_unit_and_state(name);
             return format!("{name}: deleted");
