@@ -1,25 +1,18 @@
-## 📜 License — read this before you fork
+## 📜 Лицензия — прочитай перед форком
 
-GhostProvider is **source-available**, not OSI open-source software. The full
-terms are in [LICENSE](LICENSE). What they mean for you:
+GhostProvider — **source-available**, а не OSI open-source. Полный текст — в [LICENSE](LICENSE). Что это значит:
 
-- **You may** read and study the source code, and use, modify, and run the
-  program for **personal, non-commercial** purposes.
-- **You may NOT** fork, modify, publish, or redistribute the project, and
-  **may NOT** use it commercially (selling it, offering it as a service,
-  bundling it into a product) — **without prior written permission** from the
-  author.
-- Any permitted modification must retain the copyright notice and this license
-  as-is.
+- **Можно**: читать и изучать исходники, использовать, изменять и запускать программу в **личных некоммерческих** целях.
+- **Кнопка Fork на GitHub**: нажать Fork и создать копию внутри GitHub — можно, это право даёт сам GitHub для любого публичного репозитория (Terms of Service, раздел D). Но это не даёт дополнительных прав.
+- **Нельзя без письменного разрешения автора**: публиковать свой форк, распространять исходники или сборки, делать pull request с изменениями, использовать в коммерческих целях (продажа, сервис, встраивание в платный продукт).
+- Любое разрешённое изменение должно сохранять копирайт и текст лицензии.
 
-In short: forking for a personal experiment is fine per the license; publishing
-your fork, redistributing it, or using it commercially requires asking first.
-To request permission, open an issue
+Коротко: форкнуть себе — можно, опубликовать форк или заработать на нём — только спросив. Запрос — через issue
 ([github.com/nethoster/demo-ghostprovider/issues](https://github.com/nethoster/demo-ghostprovider/issues)).
 
 <h1 align="center">Automated self-hosting platform</h1>
 
-> <p align="center">GhostProvider is an open-source platform that simplifies self-hosting</p>
+> <p align="center">GhostProvider — source-available платформа, упрощающая self-hosting</p>
 
 ![GHOST PROVIDER Panel](assets/GHOSTPROVIDER%20PANEL.JPEG)
 
