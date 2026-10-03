@@ -1,13 +1,13 @@
-## 📜 Лицензия — прочитай перед форком
+## 📜 License — read this before you fork
 
-GhostProvider — **source-available**, а не OSI open-source. Полный текст — в [LICENSE](LICENSE). Что это значит:
+GhostProvider is **source-available**, not OSI open-source software. The full text is in [LICENSE](LICENSE). What this means:
 
-- **Можно**: читать и изучать исходники, использовать, изменять и запускать программу в **личных некоммерческих** целях.
-- **Что по форкам?**: создать форк можно, благодаря правилам GitHub, но дополнительных прав это правило не даёт.
-- **Нельзя без письменного разрешения автора**: распространять исходники или сборки, делать pull request с изменениями, использовать в коммерческих целях (продажа, сервис, встраивание в платный продукт).
-- Любое разрешённое изменение должно сохранять копирайт и текст лицензии.
+- **Allowed**: reading and studying the source, using, modifying, and running the program for **personal non-commercial** purposes.
+- **What about forks?**: you can create a fork thanks to GitHub rules, but this rule grants no additional rights.
+- **Not allowed without the author's written permission**: redistributing the source or builds, opening a pull request with changes, using it commercially (selling, offering as a service, bundling into a paid product).
+- Any permitted modification must retain the copyright notice and the license text.
 
-Коротко: форкнуть себе — можно, прислать pull request или заработать на нём — только спросив. Запрос — через issue
+In short: forking for yourself is fine; opening a pull request or making money with it requires asking first. To request permission, open an issue
 ([github.com/nethoster/demo-ghostprovider/issues](https://github.com/nethoster/demo-ghostprovider/issues)).
 
 <h1 align="center">Automated self-hosting platform</h1>
