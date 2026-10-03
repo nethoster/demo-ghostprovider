@@ -24,5 +24,9 @@ allow = [
     "Unicode-3.0",
     "Zlib",
     "CDLA-Permissive-2.0",
+    # Own crate: custom source-available text in LICENSE (see license-file in
+    # Cargo.toml). Declared as LicenseRef-Proprietary so `cargo deny check
+    # licenses` can match it instead of flagging the crate as unlicensed.
+    "LicenseRef-Proprietary",
 ]
 confidence-threshold = 0.8
