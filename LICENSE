@@ -1,37 +1,37 @@
-Лицензия с открытым исходным кодом (Source-Available)
+Source-Available License
 
 Copyright (c) 2026 nethoster
 
-1. Просмотр исходного кода
-   Исходный код открыт для чтения и изучения.
+1. Viewing the Source Code
+   The source code is open for reading and study.
 
-2. Права GitHub
-   Создать форк можно, благодаря правилам GitHub, но дополнительных
-   прав это правило не даёт.
+2. GitHub Rights
+   You can create a fork thanks to GitHub rules, but this rule
+   grants no additional rights.
 
-3. Личное использование
-   Разрешается использовать, изменять и запускать программу
-   в личных некоммерческих целях.
+3. Personal Use
+   You may use, modify, and run the program
+   for personal non-commercial purposes.
 
-4. Форки и изменения
-   Создать копию через Fork на GitHub — разрешено. Но изменять код
-   для публичного распространения, делать pull request с изменениями —
-   только с письменного разрешения автора.
+4. Forks and Changes
+   Creating a copy via Fork on GitHub is allowed. But modifying
+   the code for public distribution, or opening a pull request
+   with changes, requires written permission from the author.
 
-5. Коммерческое использование
-   Любое коммерческое использование, включая продажу, предоставление
-   как сервиса, встраивание в платный продукт, — требует письменного
-   разрешения автора.
+5. Commercial Use
+   Any commercial use, including selling, offering as a service,
+   or embedding into a paid product, requires written permission
+   from the author.
 
-6. Распространение
-   Распространение исходного кода или скомпилированных версий запрещено
-   без письменного разрешения автора. Локальные копии для личного
-   использования разрешены.
+6. Redistribution
+   Redistribution of the source code or compiled versions is
+   prohibited without written permission from the author. Local
+   copies for personal use are allowed.
 
-7. Уведомление об авторских правах
-   Любое разрешённое изменение обязано сохранять уведомление об авторских
-   правах и текст настоящей лицензии.
+7. Copyright Notice
+   Any permitted modification must retain the copyright notice
+   and the text of this license.
 
-8. Отказ от гарантий
-   Программа предоставляется «как есть», без каких-либо гарантий.
-   Автор не несёт ответственности за последствия использования.
+8. Disclaimer
+   The program is provided "as is", without any warranties.
+   The author is not liable for the consequences of use.
