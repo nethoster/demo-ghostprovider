@@ -570,8 +570,8 @@ mod tests {
         let fm_url = "https://cdn.jsdelivr.net/npm/@inlang/plugin-m-function-matcher@2/dist/index.js";
         let mf = crate::hoster::httpclient::get_bytes(mf_url).unwrap();
         let fm = crate::hoster::httpclient::get_bytes(fm_url).unwrap();
-        let mf_pin = "b22cf60eb28b3c8c3ce1fb6300611a0552f12d0d995d37c4dd2c96e3ad80c645";
-        let fm_pin = "85862f6305793b56bfd9afe5368b096e63fb2aeab38b7799c051517be3499c0b";
+        let mf_pin = "765b487bbe95a20c7f83a940a3fba81bacef18bce0bbe916df6807f7ddd512ca";
+        let fm_pin = "a7e6c41307afc64b3f34116f220e925f0ad3aca47231e849f080051a2fb459a8";
         assert_eq!(sha256_hex(&mf), mf_pin, "plugin-message-format bytes changed");
         assert_eq!(sha256_hex(&fm), fm_pin, "plugin-m-function-matcher bytes changed");
     }

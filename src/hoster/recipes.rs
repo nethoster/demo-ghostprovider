@@ -85,11 +85,11 @@ pub const DEMO_SERVICES: &[DemoRecipe] = &[
         plugins: &[
             (
                 "https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format@4/dist/index.js",
-                "b22cf60eb28b3c8c3ce1fb6300611a0552f12d0d995d37c4dd2c96e3ad80c645",
+                "765b487bbe95a20c7f83a940a3fba81bacef18bce0bbe916df6807f7ddd512ca",
             ),
             (
                 "https://cdn.jsdelivr.net/npm/@inlang/plugin-m-function-matcher@2/dist/index.js",
-                "85862f6305793b56bfd9afe5368b096e63fb2aeab38b7799c051517be3499c0b",
+                "a7e6c41307afc64b3f34116f220e925f0ad3aca47231e849f080051a2fb459a8",
             ),
         ],
         // PrivateNetwork is enforced: deps come ONLY from the host prefetch
