@@ -46,19 +46,32 @@ fn emit(line: &str) {
     let _ = writeln!(std::io::stderr(), "{line}");
 }
 
+/// Pure emission decision, extracted for unit-testing without stderr capture.
+///
+/// `first` is true on the 0→down transition (`since` was `None`),
+/// `due` is true when no report was ever written or `HEARTBEAT` elapsed.
+/// In all reachable states `first` implies `due` (both are set/cleared
+/// together), so this is equivalent to just `due` — `first` is kept as
+/// documentation of intent. The old third disjunct
+/// (`fresh_host && down.len() == 1`) was removed: a fresh host bringing the
+/// set 0→1 implies an empty set before, which implies `since == None`,
+/// i.e. it is already covered by `first`.
+fn should_emit(first: bool, due: bool) -> bool {
+    first || due
+}
+
 /// A fetch attempt for `host` failed. Prints the one-shot "network looks
-/// down" transition if this is a new host or a fresh state, then throttles.
-pub fn note_down(host: &str) {
+/// down" transition on a fresh state, then throttles by [`HEARTBEAT`].
+/// Returns `true` when a line was emitted (lets tests count messages
+/// without capturing stderr).
+pub fn note_down(host: &str) -> bool {
     let mut g = STATE.lock().unwrap();
     let st = g.get_or_insert_with(|| State {
         down: HashSet::new(),
         since: None,
         last_report: None,
     });
-    let fresh_host = st.down.insert(host.to_string());
-    if st.down.is_empty() {
-        return;
-    }
+    st.down.insert(host.to_string());
     let now = Instant::now();
     let first = st.since.is_none();
     if first {
@@ -68,7 +81,7 @@ pub fn note_down(host: &str) {
         .last_report
         .map(|l| now.duration_since(l) >= HEARTBEAT)
         .unwrap_or(true);
-    if first || due || fresh_host && st.down.len() == 1 {
+    if should_emit(first, due) {
         st.last_report = Some(now);
         let n = st.down.len();
         let since = st.since.unwrap_or(now);
@@ -76,6 +89,9 @@ pub fn note_down(host: &str) {
             "net: {n} host(s) unreachable — permanent retry, next probe is automatic (since {})",
             fmt_since(since),
         ));
+        true
+    } else {
+        false
     }
 }
 
@@ -137,25 +153,36 @@ mod tests {
     }
 
     #[test]
+    fn emission_decision_table() {
+        // first implies due in reachable states, but both spellings emit.
+        assert!(should_emit(true, true));
+        assert!(should_emit(true, false));
+        assert!(should_emit(false, true));
+        assert!(!should_emit(false, false));
+    }
+
+    #[test]
     fn first_failure_reports_and_second_is_silent() {
         *STATE.lock().unwrap() = None;
-        let lines: Vec<String> = Vec::new();
-        let written: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(lines);
-        // redirect emit via a shim is not wired; test the state transitions:
-        note_down("github.com");
+        assert!(
+            note_down("github.com"),
+            "first failure must emit one line"
+        );
         let s1 = summary().expect("down after first failure");
         assert_eq!(s1.down_hosts, 1);
-        note_down("github.com");
+        assert!(
+            !note_down("github.com"),
+            "repeat of the same host must be silent (heartbeat not due)"
+        );
         let s2 = summary().unwrap();
         assert_eq!(s2.down_hosts, 1, "same host must not be counted twice");
-        let _ = written;
     }
 
     #[test]
     fn recovery_clears() {
         *STATE.lock().unwrap() = None;
-        note_down("github.com");
-        note_down("dl.google.com");
+        let _ = note_down("github.com");
+        let _ = note_down("dl.google.com");
         assert_eq!(summary().unwrap().down_hosts, 2);
         note_up("github.com");
         assert_eq!(summary().unwrap().down_hosts, 1);
