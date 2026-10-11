@@ -10,7 +10,7 @@ use anyhow::Context;
 use super::gitclone;
 use super::journal::{self, DeployState};
 use super::models::{HostResult, RepoAnalysis};
-use super::port::find_free_port;
+use super::port::{find_free_port, wait_until_port_open};
 use super::recipes::DemoRecipe;
 use super::sandbox::run_build_cmd;
 use super::secrets::write_env_file;
@@ -743,7 +743,30 @@ pub fn deploy_service(
     }
 
     match wait_until_active(recipe.service_name) {
-        StartOutcome::Active => {}
+        StartOutcome::Active => {
+            // `is-active` alone can catch a crash-looping unit (Restart=always)
+            // inside a brief active window between restarts. Only report the
+            // service as up when its port really accepts connections, so
+            // `done: ok` / `listening on` never print for a dead port.
+            if !wait_until_port_open(port, super::units::START_BUDGET) {
+                let logs = service_logs(recipe.service_name, 20);
+                report_err(
+                    &mut result,
+                    format!(
+                        "Service became active but never accepted connections on 127.0.0.1:{port} (crash-loop? recent logs):\n{}",
+                        short(&logs)
+                    ),
+                );
+                rollback_failed(
+                    &mut result,
+                    recipe.service_name,
+                    &project_dir,
+                    Some(port),
+                    &emit,
+                );
+                return result;
+            }
+        }
         StartOutcome::Failed => {
             let logs = service_logs(recipe.service_name, 20);
             report_err(

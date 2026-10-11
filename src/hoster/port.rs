@@ -52,6 +52,32 @@ pub(crate) fn bind_ok(port: u16) -> bool {
     TcpListener::bind(addr).is_ok()
 }
 
+/// Poll until something accepts TCP on 127.0.0.1:`port` or `budget` expires.
+///
+/// `is-active` alone can catch a crash-looping unit (`Restart=always`) in a
+/// brief active window between restarts and report success for a service
+/// that never serves (seen live: searxng crash-looped on a stale
+/// `SEARXNG_SETTINGS_PATH` drop-in while the deploy printed `done: ok`).
+/// The deploy flow calls this after `wait_until_active`, so `done: ok` /
+/// `listening on` only print when the port really answers.
+pub fn wait_until_port_open(port: u16, budget: std::time::Duration) -> bool {
+    use std::net::{IpAddr, SocketAddr, TcpStream};
+    let addr = SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        port,
+    );
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -77,5 +103,30 @@ mod tests {
         // Two consecutive draws are equal only with probability 2^-64; if
         // urandom is broken/unavailable the fallback still returns in-range.
         assert_ne!(random_seed(), random_seed());
+    }
+
+    #[test]
+    fn port_open_poll_sees_a_listener() {
+        let listener =
+            TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(wait_until_port_open(
+            port,
+            std::time::Duration::from_secs(5)
+        ));
+    }
+
+    #[test]
+    fn port_open_poll_times_out_on_a_closed_port() {
+        // Bind-then-drop to obtain a port that is very likely closed.
+        let port = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        assert!(!wait_until_port_open(
+            port,
+            std::time::Duration::from_millis(600)
+        ));
     }
 }

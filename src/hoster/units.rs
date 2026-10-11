@@ -168,6 +168,16 @@ pub fn create_unit(spec: &UnitSpec) -> anyhow::Result<()> {
     let unit_dir = crate::paths::user_unit_dir();
     std::fs::create_dir_all(&unit_dir)?;
 
+    // Stale drop-ins (e.g. an old SEARXNG_SETTINGS_PATH override pointing at
+    // a file the current recipe never creates) otherwise survive redeploys:
+    // systemd merges them over the fresh unit and the service crash-loops
+    // while the deploy reports success. Current units carry all env inline,
+    // so any leftover drop-in is by definition stale.
+    let dropin_dir = unit_dir.join(format!("{service_name}.service.d"));
+    if dropin_dir.is_dir() {
+        let _ = std::fs::remove_dir_all(&dropin_dir);
+    }
+
     let content = render_unit(spec)?;
 
     // Pre-create the project-scoped cache/home/runtime dirs the unit's env
@@ -462,6 +472,10 @@ pub fn remove_unit(service: &str) {
     let _ = systemctl(&["disable", service]);
     let unit = crate::paths::user_unit_dir().join(format!("{service}.service"));
     let _ = std::fs::remove_file(unit);
+    let dropin = crate::paths::user_unit_dir().join(format!("{service}.service.d"));
+    if dropin.is_dir() {
+        let _ = std::fs::remove_dir_all(dropin);
+    }
     let _ = systemctl(&["daemon-reload"]);
 }
 
