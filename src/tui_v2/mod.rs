@@ -3,7 +3,7 @@
 
 use std::io::{self, Stdout};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -122,11 +122,45 @@ pub(crate) struct App {
 
 // ── entry point ──────────────────────────────────────────────────────────────
 
+/// Minimum gap between expensive full repaints while the window is being
+/// resized (same rationale as the primary TUI: the 80ms draw loop already
+/// picks up the new size via autoresize).
+const RESIZE_REPAINT_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Window below which the layout cannot breathe: render a short notice.
+const MIN_TERM_WIDTH: u16 = 30;
+const MIN_TERM_HEIGHT: u16 = 8;
+
+/// Full 26-row globe header needs room for content below it; below this
+/// window height fall back to the compact 3-row title.
+const TALL_HEADER_MIN_HEIGHT: u16 = 38;
+const TALL_HEADER_HEIGHT: u16 = 26;
+const COMPACT_HEADER_HEIGHT: u16 = 3;
+
+/// Best-effort full repaint. `Terminal::clear()` issues a cursor-position
+/// (DSR) query over stdin; during resize storms the reply is routinely eaten
+/// by the concurrent event reader and crossterm times out with "The cursor
+/// position could not be read within a normal duration". That failure is
+/// transient — the next repaint retries — so it must never kill the panel.
+fn clear_screen(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+    let _ = terminal.clear();
+}
+
+/// True when a resize-driven full repaint is due: no repaint yet this run,
+/// or the last one is older than the debounce window.
+fn resize_repaint_due(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= RESIZE_REPAINT_DEBOUNCE,
+    }
+}
+
 pub fn run() -> anyhow::Result<()> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    terminal.clear()?;
+    // Best-effort: the first draw repaints everything anyway.
+    clear_screen(&mut terminal);
 
     let (tx, rx) = mpsc::channel();
     let mut app = App {
@@ -149,6 +183,8 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
 ) -> anyhow::Result<()> {
+    // Last full repaint time (None = none yet this run).
+    let mut last_repaint: Option<Instant> = None;
     loop {
         while let Ok(msg) = app.rx.try_recv() {
             match msg {
@@ -245,7 +281,8 @@ fn event_loop(
         }
 
         if app.tick.is_multiple_of(25) {
-            terminal.clear()?;
+            clear_screen(terminal);
+            last_repaint = Some(Instant::now());
         }
         terminal.draw(|f| draw(f, app))?;
         app.tick = app.tick.wrapping_add(1);
@@ -263,11 +300,16 @@ fn event_loop(
                             }
                         }
                         if std::mem::discriminant(&app.screen) != before {
-                            terminal.clear()?;
+                            clear_screen(terminal);
+                            last_repaint = Some(Instant::now());
                         }
                     }
                 }
-                Event::Resize(_, _) => terminal.clear()?,
+                Event::Resize(_, _) if resize_repaint_due(last_repaint, Instant::now()) => {
+                    // Debounced: the draw loop already picks up the new size.
+                    clear_screen(terminal);
+                    last_repaint = Some(Instant::now());
+                }
                 _ => {}
             }
         }
@@ -617,6 +659,24 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
     let area = f.area();
+    // Adaptive floor: below this the layout cannot breathe — say so
+    // instead of squeezing header/body/hint into nothing.
+    if area.width < MIN_TERM_WIDTH || area.height < MIN_TERM_HEIGHT {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "GHOST PROVIDER",
+                    Style::default().fg(RED).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "window too small — enlarge to continue",
+                    Style::default().fg(DIM),
+                )),
+            ]),
+            area,
+        );
+        return;
+    }
     // Pure black background for whole screen — exact screenshot
     {
         let buf = f.buffer_mut();
@@ -628,15 +688,26 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             }
         }
     }
-    // Header: globe + title = 26, body = menu/screens, hint = 1
+    // Adaptive header: the full 26-row globe only fits tall windows; short
+    // ones get a compact 3-row title so the body keeps usable space.
+    let tall = area.height >= TALL_HEADER_MIN_HEIGHT;
+    let header_h: u16 = if tall {
+        TALL_HEADER_HEIGHT
+    } else {
+        COMPACT_HEADER_HEIGHT
+    };
     let chunks = Layout::vertical([
-        Constraint::Length(26),
+        Constraint::Length(header_h),
         Constraint::Min(1),
         Constraint::Length(1),
     ])
     .split(area);
 
-    draw_header(f, chunks[0]);
+    if tall {
+        draw_header(f, chunks[0]);
+    } else {
+        draw_compact_header(f, chunks[0]);
+    }
 
     {
         let buf = f.buffer_mut();
@@ -766,6 +837,37 @@ fn draw_header(f: &mut ratatui::Frame, area: Rect) {
         Style::default().fg(RED),
     )));
     let para = Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center);
+    f.render_widget(para, area);
+}
+
+/// Compact 3-row title for short windows: same identity as the globe
+/// header, but leaves the body usable instead of eating 26 rows.
+fn draw_compact_header(f: &mut ratatui::Frame, area: Rect) {
+    let buf = f.buffer_mut();
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_style(Style::default().bg(BG).fg(RED));
+            }
+        }
+    }
+    let lines = vec![
+        Line::from(Span::styled(
+            "GHOST PROVIDER".to_string(),
+            Style::default().fg(RED).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "self-hosting · local-only".to_string(),
+            Style::default().fg(DIM),
+        )),
+    ];
+    let para = Paragraph::new(lines)
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(DIM_RED)),
+        );
     f.render_widget(para, area);
 }
 
@@ -1589,4 +1691,23 @@ fn block(title: &str, color: Color) -> Block<'_> {
             format!(" {title} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Resize-storm debounce: first resize repaints, then repaints are
+    /// rate-limited so an edge-drag doesn't spam cursor-position round-trips.
+    #[test]
+    fn resize_repaint_debounce_windows_repaints() {
+        let now = Instant::now();
+        assert!(resize_repaint_due(None, now));
+        assert!(!resize_repaint_due(Some(now), now));
+        assert!(resize_repaint_due(Some(now - Duration::from_secs(1)), now));
+        assert!(!resize_repaint_due(
+            Some(now - Duration::from_millis(10)),
+            now
+        ));
+    }
 }

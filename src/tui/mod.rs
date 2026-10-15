@@ -18,7 +18,7 @@ use std::sync::{
     Arc,
     mpsc::{self, Receiver, Sender},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
@@ -190,7 +190,9 @@ pub fn run() -> anyhow::Result<()> {
     enable_raw_mode()?;
     io::stdout().execute(EnterAlternateScreen)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    terminal.clear()?;
+    // Best-effort: the first draw repaints everything anyway, so a slow
+    // terminal answering the clear's cursor query late must not abort startup.
+    clear_screen(&mut terminal);
 
     let (tx, rx) = mpsc::channel();
     // Termination signals (kill, terminal closed) are routed through the event
@@ -241,10 +243,41 @@ pub fn run() -> anyhow::Result<()> {
     res
 }
 
+/// Minimum gap between expensive full repaints while the window is being
+/// resized. Dragging an edge emits dozens of Resize events per second; the
+/// 80ms draw loop already picks up the new size via autoresize, so one full
+/// repaint per window is enough to drop stale glyphs.
+const RESIZE_REPAINT_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Window below which the header/body/hint layout cannot breathe: render a
+/// short notice instead of squeezing widgets into nothing.
+const MIN_TERM_WIDTH: u16 = 30;
+const MIN_TERM_HEIGHT: u16 = 8;
+
+/// Best-effort full repaint. `Terminal::clear()` issues a cursor-position
+/// (DSR) query over stdin; during resize storms the reply is routinely eaten
+/// by the concurrent event reader and crossterm times out with "The cursor
+/// position could not be read within a normal duration". That failure is
+/// transient — the next repaint retries — so it must never kill the panel.
+fn clear_screen(terminal: &mut Terminal<CrosstermBackend<Stdout>>) {
+    let _ = terminal.clear();
+}
+
+/// True when a resize-driven full repaint is due: no repaint yet this run,
+/// or the last one is older than the debounce window.
+fn resize_repaint_due(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some(t) => now.duration_since(t) >= RESIZE_REPAINT_DEBOUNCE,
+    }
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
 ) -> anyhow::Result<()> {
+    // Last full repaint time (None = none yet this run).
+    let mut last_repaint: Option<Instant> = None;
     loop {
         while let Ok(msg) = app.rx.try_recv() {
             match msg {
@@ -374,8 +407,10 @@ fn event_loop(
         // Self-heal: any stray glyph left by terminal desync (resize races,
         // tmux quirks, font-width lies) must not outlive ~2s — force a full
         // repaint periodically instead of trusting cell-diff forever.
+        // Best-effort: a failed repaint is retried on the next pass.
         if app.tick.is_multiple_of(25) {
-            terminal.clear()?;
+            clear_screen(terminal);
+            last_repaint = Some(Instant::now());
         }
         terminal.draw(|f| draw(f, app))?;
         app.tick = app.tick.wrapping_add(1);
@@ -392,11 +427,15 @@ fn event_loop(
                         // Screen switched: ratatui's cell-diff would keep glyphs
                         // from the longer previous screen — force a full repaint.
                         if std::mem::discriminant(&app.screen) != before {
-                            terminal.clear()?;
+                            clear_screen(terminal);
+                            last_repaint = Some(Instant::now());
                         }
                     }
                 }
-                Event::Resize(_, _) => terminal.clear()?,
+                Event::Resize(_, _) if resize_repaint_due(last_repaint, Instant::now()) => {
+                    clear_screen(terminal);
+                    last_repaint = Some(Instant::now());
+                }
                 _ => {}
             }
         }
@@ -1130,6 +1169,24 @@ fn start_log_tailers(app: &mut App) {
 
 fn draw(f: &mut ratatui::Frame, app: &App) {
     let area = f.area();
+    // Adaptive floor: below this the 3-pane layout cannot breathe — say so
+    // instead of squeezing header/body/hint into nothing.
+    if area.width < MIN_TERM_WIDTH || area.height < MIN_TERM_HEIGHT {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "GHOSTPROVIDER",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "window too small — enlarge to continue",
+                    Style::default().fg(DIM),
+                )),
+            ]),
+            area,
+        );
+        return;
+    }
     let chunks = Layout::vertical([
         Constraint::Length(4),
         Constraint::Min(1),
@@ -2335,5 +2392,19 @@ mod tests {
             lines.last().map(String::as_str),
             Some(expected_last.as_str())
         );
+    }
+
+    /// Resize-storm debounce: first resize repaints, then repaints are
+    /// rate-limited so an edge-drag doesn't spam cursor-position round-trips.
+    #[test]
+    fn resize_repaint_debounce_windows_repaints() {
+        let now = Instant::now();
+        assert!(resize_repaint_due(None, now));
+        assert!(!resize_repaint_due(Some(now), now));
+        assert!(resize_repaint_due(Some(now - Duration::from_secs(1)), now));
+        assert!(!resize_repaint_due(
+            Some(now - Duration::from_millis(10)),
+            now
+        ));
     }
 }
