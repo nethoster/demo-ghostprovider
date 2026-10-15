@@ -12,6 +12,8 @@
 //!                        no outbound connects, no code-loading exec's
 //!   __serve-static DIR PORT   internal: static server used by deployed units
 //!   __egress-probe       internal: probe beat for runtime egress checks
+//!   __check-manifest PATH   validate a service.yaml and print the plan
+//!   __deploy URL | --manifest PATH   scripted deploy (URL or manifest file)
 
 #![deny(unsafe_code)]
 

@@ -1,4 +1,4 @@
-//! Deployment engine: curated recipes → hardened systemd user services.
+//! Deployment engine: service manifests → hardened systemd user services.
 
 pub mod cancel;
 pub mod deploy;

@@ -1,4 +1,4 @@
-//! Deploy sequence for the curated demo services.
+//! Deploy sequence for service manifests (built-in catalog + user files).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -234,7 +234,7 @@ fn toolbox_needs(
 }
 
 /// Shared entry point used by both the TUI and the `__deploy` subcommand:
-/// validate the URL against the curated recipes, preflight the build tools,
+/// validate the URL against the built-in manifest catalog, preflight the build tools,
 /// then run the full deploy pipeline. Progress goes through `log`.
 pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
     let screen = |line: String| {
@@ -279,8 +279,9 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
     // pipeline below is unchanged; the manifest is converted into the
     // engine's recipe shape so every security gate stays identical.
     let Some(manifest) = super::manifest::find_builtin(&owner, &name) else {
-        screen("! this demo only supports three services:".into());
+        screen("! this URL is not in the built-in catalog:".into());
         screen("! VERT-sh/VERT · searxng/searxng · usememos/memos".into());
+        screen("! anything else needs a service.yaml (see docs/MANIFEST.md)".into());
         return DeployOutcome::Rejected("not-curated");
     };
     let recipe = super::manifest::to_leaked_recipe(&manifest);
@@ -504,7 +505,7 @@ pub fn run_manifest_file(path: &Path, log: &dyn Fn(String)) -> DeployOutcome {
     }
 }
 
-/// Build, install, and start one curated demo service.
+/// Build, install, and start one service from a validated manifest/recipe.
 pub fn deploy_service(
     analysis: &RepoAnalysis,
     recipe: &DemoRecipe,

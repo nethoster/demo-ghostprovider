@@ -8,6 +8,7 @@
 #![allow(unsafe_code)]
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, mpsc::Sender};
 use std::thread::JoinHandle;
@@ -205,10 +206,107 @@ pub(crate) fn journal_raw_for(unit: &str) -> Vec<String> {
     }
 }
 
-pub(crate) fn start_deployment(tx: Sender<Msg>, url: String) {
+/// What the user confirmed to deploy: a GitHub URL (resolved against the
+/// built-in manifest catalog) or a local `service.yaml` file. Shared by both
+/// panels so URL and manifest deploys behave identically.
+#[derive(Clone, Debug)]
+pub enum DeployTarget {
+    Url {
+        url: String,
+        service_label: String,
+    },
+    Manifest {
+        path: PathBuf,
+        service_id: String,
+        plan: Vec<String>,
+    },
+}
+
+impl DeployTarget {
+    /// One-line header for the Deploy screen and `== deploy … ==` log markers.
+    pub fn describe(&self) -> String {
+        match self {
+            DeployTarget::Url { url, .. } => url.clone(),
+            DeployTarget::Manifest { path, .. } => {
+                format!("manifest {}", path.display())
+            }
+        }
+    }
+
+    /// Short service name for confirmations and log lines.
+    pub fn short_name(&self) -> String {
+        match self {
+            DeployTarget::Url { service_label, .. } if !service_label.is_empty() => {
+                service_label.clone()
+            }
+            DeployTarget::Url { url, .. } => url.clone(),
+            DeployTarget::Manifest { service_id, .. } => service_id.clone(),
+        }
+    }
+
+    /// Deploy input back into the input field when the user cancels confirm.
+    pub fn back_to_input(&self) -> String {
+        match self {
+            DeployTarget::Url { url, .. } => url.clone(),
+            DeployTarget::Manifest { path, .. } => path.display().to_string(),
+        }
+    }
+}
+
+/// Classify raw deploy-field input: a manifest file path (loaded +
+/// validated now, so Confirm shows the plan or the input shows the error)
+/// or a GitHub URL (labelled for Confirm, validated by the engine later).
+pub fn classify_deploy_input(input: &str) -> Result<DeployTarget, String> {
+    use crate::hoster::manifest;
+    let text = input.trim().to_string();
+    if manifest::looks_like_manifest_path(&text) {
+        let path = manifest::expand_manifest_path(&text);
+        match manifest::ServiceManifest::load_from_file(&path) {
+            Ok(m) => Ok(DeployTarget::Manifest {
+                path,
+                service_id: m.service.id.clone(),
+                plan: m.plan_text().lines().map(str::to_string).collect(),
+            }),
+            Err(e) => Err(short_error(&e)),
+        }
+    } else {
+        let service_label = crate::hoster::github::parse_github_url(&text)
+            .and_then(|(o, n)| crate::hoster::manifest::find_builtin(&o, &n))
+            .map(|m| {
+                if m.service.name.is_empty() {
+                    m.service.id
+                } else {
+                    m.service.name
+                }
+            })
+            .unwrap_or_else(|| text.clone());
+        Ok(DeployTarget::Url {
+            url: text,
+            service_label,
+        })
+    }
+}
+
+/// First line of an anyhow error, capped for the one-line input error slot.
+fn short_error(e: &anyhow::Error) -> String {
+    let first = format!("{e:#}")
+        .lines()
+        .next()
+        .unwrap_or("invalid manifest")
+        .to_string();
+    let short: String = first.chars().take(120).collect();
+    if short.len() < first.len() {
+        format!("{short}…")
+    } else {
+        short
+    }
+}
+
+pub(crate) fn start_target_deployment(tx: Sender<Msg>, target: DeployTarget) {
     let handle = std::thread::spawn(move || {
+        let name = target.describe();
         append_deploy_log(&format!(
-            "== deploy {url} started at {} ==",
+            "== deploy {name} started at {} ==",
             crate::netlog::format_utc(std::time::SystemTime::now())
         ));
         let log_tx = tx.clone();
@@ -223,7 +321,14 @@ pub(crate) fn start_deployment(tx: Sender<Msg>, url: String) {
         // pipe for the duration of the deploy and forward the captured lines
         // into the deploy log instead.
         let capture = StderrCapture::new(tx.clone());
-        let ok = deploy::run_deployment(&url, &log) == deploy::DeployOutcome::Deployed;
+        let ok = match &target {
+            DeployTarget::Url { url, .. } => {
+                deploy::run_deployment(url, &log) == deploy::DeployOutcome::Deployed
+            }
+            DeployTarget::Manifest { path, .. } => {
+                deploy::run_manifest_file(path, &log) == deploy::DeployOutcome::Deployed
+            }
+        };
         capture.restore();
         if crate::hoster::cancel::is_exiting() {
             // The exit path is tearing down this deploy and writes the
@@ -233,7 +338,7 @@ pub(crate) fn start_deployment(tx: Sender<Msg>, url: String) {
             return;
         }
         append_deploy_log(&format!(
-            "== deploy {url} done: {} ==",
+            "== deploy {name} done: {} ==",
             if ok { "ok" } else { "failed" }
         ));
         let _ = tx.send(Msg::DeployDone(ok));
@@ -508,5 +613,34 @@ mod tests {
 
         // Nothing listening → empty table.
         assert!(port_rows_from(&[], &map).is_empty());
+    }
+
+    /// Deploy input routing: built-in URLs are labelled, unknown URLs pass
+    /// through with the raw URL as label, manifest paths load + validate.
+    #[test]
+    fn classify_deploy_input_routes_urls_and_manifests() {
+        match classify_deploy_input("https://github.com/usememos/memos").unwrap() {
+            DeployTarget::Url { url, service_label } => {
+                assert_eq!(url, "https://github.com/usememos/memos");
+                assert_eq!(service_label, "Memos");
+            }
+            other => panic!("expected Url, got {other:?}"),
+        }
+        match classify_deploy_input("https://github.com/foo/bar").unwrap() {
+            DeployTarget::Url { service_label, .. } => {
+                assert_eq!(service_label, "https://github.com/foo/bar");
+            }
+            other => panic!("expected Url, got {other:?}"),
+        }
+        match classify_deploy_input("src/hoster/manifests/vert.yaml").unwrap() {
+            DeployTarget::Manifest {
+                service_id, plan, ..
+            } => {
+                assert_eq!(service_id, "demo-vert");
+                assert!(!plan.is_empty());
+            }
+            other => panic!("expected Manifest, got {other:?}"),
+        }
+        assert!(classify_deploy_input("/tmp/does-not-exist-xyz.yaml").is_err());
     }
 }

@@ -71,8 +71,7 @@ pub(crate) enum Screen {
         busy: bool,
     },
     Confirm {
-        url: String,
-        service_label: String,
+        target: crate::tui::workers::DeployTarget,
         yes_selected: bool,
     },
     Deploy {
@@ -410,15 +409,17 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 }
                 KeyCode::Enter => {
                     if buffer.trim().is_empty() {
-                        *error = Some("enter a GitHub URL".into());
+                        *error = Some("enter a GitHub URL or a path to service.yaml".into());
                     } else {
-                        let url = buffer.trim().to_string();
-                        let service_label = confirm_label(&url);
-                        app.screen = Screen::Confirm {
-                            url,
-                            service_label,
-                            yes_selected: true,
-                        };
+                        match crate::tui::workers::classify_deploy_input(buffer.trim()) {
+                            Ok(target) => {
+                                app.screen = Screen::Confirm {
+                                    target,
+                                    yes_selected: true,
+                                };
+                            }
+                            Err(e) => *error = Some(e),
+                        }
                     }
                 }
                 KeyCode::Char(c) => buffer.push(c),
@@ -426,7 +427,9 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             }
         }
         Screen::Confirm {
-            url, yes_selected, ..
+            target,
+            yes_selected,
+            ..
         } => {
             let mut decision: Option<bool> = None;
             match key {
@@ -443,15 +446,16 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             }
             match decision {
                 Some(true) => {
-                    crate::tui::workers::start_deployment(app.tx.clone(), url.clone());
+                    let label = target.describe();
+                    crate::tui::workers::start_target_deployment(app.tx.clone(), target.clone());
                     app.screen = Screen::Deploy {
-                        lines: vec![format!("deploying {}...", url)],
+                        lines: vec![format!("deploying {label}...")],
                         done: None,
                     };
                 }
                 Some(false) => {
                     app.screen = Screen::UrlInput {
-                        buffer: url.clone(),
+                        buffer: target.back_to_input(),
                         error: None,
                         busy: false,
                     }
@@ -735,11 +739,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             draw_url_input(f, chunks[1], buffer, error.as_deref(), *busy, app.tick);
         }
         Screen::Confirm {
-            url,
-            service_label,
+            target,
             yes_selected,
         } => {
-            draw_confirm(f, chunks[1], url, service_label, *yes_selected);
+            draw_confirm(f, chunks[1], target, *yes_selected);
         }
         Screen::Deploy { lines, done } => {
             draw_deploy(f, chunks[1], lines, *done);
@@ -1001,7 +1004,7 @@ fn draw_url_input(
 ) {
     let mut text = vec![
         Line::from(Span::styled(
-            " Supported demo services:",
+            " Built-in services (or paste a path to service.yaml):",
             Style::default().fg(DIM),
         )),
         Line::from(vec![
@@ -1014,7 +1017,7 @@ fn draw_url_input(
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" GitHub URL: ", Style::default().fg(DIM)),
+            Span::styled(" GitHub URL or manifest path: ", Style::default().fg(DIM)),
             Span::styled(buffer.to_string(), Style::default().fg(RED)),
             cursor_span(tick),
         ]),
@@ -1025,11 +1028,17 @@ fn draw_url_input(
             Style::default().fg(BRIGHT_RED),
         )));
     } else if !buffer.trim().is_empty() {
-        let ok = buffer.trim().starts_with("https://");
-        let (mark, msg, color) = if ok {
+        let trimmed = buffer.trim();
+        let (mark, msg, color) = if trimmed.starts_with("https://") {
             ("+", " looks like a GitHub URL", RED)
+        } else if crate::hoster::manifest::looks_like_manifest_path(trimmed) {
+            ("+", " looks like a service.yaml path", RED)
         } else {
-            ("△", " expected https://github.com/<owner>/<repo>", DIM_RED)
+            (
+                "△",
+                " expected https://github.com/<owner>/<repo> or a path to service.yaml",
+                DIM_RED,
+            )
         };
         text.push(Line::from(Span::styled(
             format!(" {mark}{msg}"),
@@ -1051,20 +1060,6 @@ fn draw_url_input(
 }
 
 // ── confirm ──────────────────────────────────────────────────────────────────
-
-fn confirm_label(url: &str) -> String {
-    crate::hoster::github::parse_github_url(url)
-        .and_then(|(owner, name)| {
-            crate::hoster::manifest::find_builtin(&owner, &name).map(|m| {
-                if m.service.name.is_empty() {
-                    m.service.id
-                } else {
-                    m.service.name
-                }
-            })
-        })
-        .unwrap_or_else(|| url.to_string())
-}
 
 fn choice_spans(marker: &str, label: &str, hue: Color, selected: bool) -> Vec<Span<'static>> {
     let mut spans = vec![Span::raw("   ")];
@@ -1094,24 +1089,55 @@ fn choice_spans(marker: &str, label: &str, hue: Color, selected: bool) -> Vec<Sp
 fn draw_confirm(
     f: &mut ratatui::Frame,
     area: Rect,
-    url: &str,
-    service_label: &str,
+    target: &crate::tui::workers::DeployTarget,
     yes_selected: bool,
 ) {
-    let text = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                " Host ",
-                Style::default().fg(DIM).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(service_label.to_string(), Style::default().fg(RED)),
-            Span::styled(" on this machine?", Style::default().fg(BODY)),
-        ]),
-        Line::from(vec![
-            Span::styled(" URL: ", Style::default().fg(DIM)),
-            Span::styled(url.to_string(), Style::default().fg(RED)),
-        ]),
+    use crate::tui::workers::DeployTarget as Target;
+    let mut text = vec![Line::from("")];
+    match target {
+        Target::Url { url, service_label } => {
+            text.push(Line::from(vec![
+                Span::styled(
+                    " Host ",
+                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(service_label.to_string(), Style::default().fg(RED)),
+                Span::styled(" on this machine?", Style::default().fg(BODY)),
+            ]));
+            text.push(Line::from(vec![
+                Span::styled(" URL: ", Style::default().fg(DIM)),
+                Span::styled(url.to_string(), Style::default().fg(RED)),
+            ]));
+        }
+        Target::Manifest {
+            path,
+            service_id,
+            plan,
+        } => {
+            text.push(Line::from(vec![
+                Span::styled(
+                    " Host ",
+                    Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(service_id.to_string(), Style::default().fg(RED)),
+                Span::styled(
+                    " (service.yaml) on this machine?",
+                    Style::default().fg(BODY),
+                ),
+            ]));
+            text.push(Line::from(vec![
+                Span::styled(" File: ", Style::default().fg(DIM)),
+                Span::styled(path.display().to_string(), Style::default().fg(RED)),
+            ]));
+            for line in plan.iter().take(6) {
+                text.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+    }
+    text.extend([
         Line::from(""),
         Line::from(choice_spans("[Y]es", " — deploy", RED, yes_selected)),
         Line::from(choice_spans("[N]o", " — cancel", DIM_RED, !yes_selected)),
@@ -1120,11 +1146,12 @@ fn draw_confirm(
             " ←→ select · Enter confirm",
             Style::default().fg(DIM),
         )),
-    ];
+    ]);
+    let block_title = "Confirm Deployment";
     f.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
-            .block(block("Confirm Deployment", RED)),
+            .block(block(block_title, RED)),
         area,
     );
 }

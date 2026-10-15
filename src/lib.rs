@@ -1,8 +1,9 @@
 //! demo-ghostprovider — local-first demo hosting panel (Rust rewrite).
 //!
-//! Deploys three curated services (VERT, SearXNG, Memos) as hardened
-//! systemd user services. No telemetry: every outbound network contact is
-//! allowlisted at compile time and logged locally (see [`netlog`]).
+//! Deploys `service.yaml` manifests (three built-ins included: VERT, SearXNG,
+//! Memos) as hardened systemd user services. No telemetry: every outbound
+//! network contact is allowlisted at compile time and logged locally (see
+//! [`netlog`]).
 //!
 //! Unsafe code is forbidden crate-wide by default. The handful of modules
 //! that must issue raw syscalls (libc resource limits, PDEATHSIG process

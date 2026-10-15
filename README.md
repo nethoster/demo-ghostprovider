@@ -18,7 +18,7 @@ In short: forking for yourself is fine; opening a pull request or making money w
 
 ## One-Click Deploy
 
-Paste a GitHub URL — deploy one of the three supported services as a systemd service.
+Paste a GitHub URL or a path to `service.yaml` — deploy it as a systemd service.
 Private, local, no third parties.
 
 ![Experience with GhostProvider](assets/user-experience.webp)

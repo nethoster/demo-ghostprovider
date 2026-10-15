@@ -1,6 +1,6 @@
 //! Shared data types for the deploy pipeline.
 
-/// Result of resolving a GitHub URL against the curated catalog.
+/// Result of resolving a GitHub URL against the built-in manifest catalog.
 #[derive(Debug, Default, Clone)]
 pub struct RepoAnalysis {
     pub url: String,

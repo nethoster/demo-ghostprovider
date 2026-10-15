@@ -109,9 +109,10 @@ pub(crate) enum Screen {
         busy: bool,
     },
     /// YES/NO gate before hosting a service (see README "Security model").
+    /// The target is either a GitHub URL (built-in catalog) or a local
+    /// `service.yaml` manifest the user pointed at.
     Confirm {
-        url: String,
-        service_label: String,
+        target: workers::DeployTarget,
         /// Which button the arrow keys currently highlight.
         yes_selected: bool,
     },
@@ -594,15 +595,17 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 }
                 KeyCode::Enter => {
                     if buffer.trim().is_empty() {
-                        *error = Some("enter a GitHub URL".into());
+                        *error = Some("enter a GitHub URL or a path to service.yaml".into());
                     } else {
-                        let url = buffer.trim().to_string();
-                        let service_label = confirm_label(&url);
-                        app.screen = Screen::Confirm {
-                            url,
-                            service_label,
-                            yes_selected: true,
-                        };
+                        match workers::classify_deploy_input(buffer.trim()) {
+                            Ok(target) => {
+                                app.screen = Screen::Confirm {
+                                    target,
+                                    yes_selected: true,
+                                };
+                            }
+                            Err(e) => *error = Some(e),
+                        }
                     }
                 }
                 // Raw char: URLs must be typed verbatim on any layout.
@@ -611,7 +614,9 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             }
         }
         Screen::Confirm {
-            url, yes_selected, ..
+            target,
+            yes_selected,
+            ..
         } => {
             let mut decision: Option<bool> = None;
             match key {
@@ -631,16 +636,17 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             }
             match decision {
                 Some(true) => {
-                    workers::start_deployment(app.tx.clone(), url.clone());
+                    let label = target.describe();
+                    workers::start_target_deployment(app.tx.clone(), target.clone());
                     app.screen = Screen::Deploy {
-                        lines: vec![format!("deploying {}...", url)],
+                        lines: vec![format!("deploying {label}...")],
                         done: None,
                     };
                 }
-                // Back to the input with the URL preserved.
+                // Back to the input with the URL/path preserved.
                 Some(false) => {
                     app.screen = Screen::UrlInput {
-                        buffer: url.clone(),
+                        buffer: target.back_to_input(),
                         error: None,
                         busy: false,
                     }
@@ -1227,11 +1233,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             draw_url_input(f, chunks[1], buffer, error.as_deref(), *busy, app.tick);
         }
         Screen::Confirm {
-            url,
-            service_label,
+            target,
             yes_selected,
         } => {
-            draw_confirm(f, chunks[1], url, service_label, *yes_selected);
+            draw_confirm(f, chunks[1], target, *yes_selected);
         }
         Screen::Deploy { lines, done } => {
             draw_deploy(f, chunks[1], lines, *done, crate::netstatus::summary());
@@ -1315,7 +1320,7 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
         (
             "^",
             "Deploy Service",
-            "deploy one of the three curated services",
+            "deploy via GitHub URL or service.yaml",
             MAGENTA,
         ),
         ("#", "My Services", "manage deployed units", OK_GREEN),
@@ -1535,7 +1540,7 @@ fn draw_url_input(
 ) {
     let mut text = vec![
         Line::from(Span::styled(
-            " Supported demo services:",
+            " Built-in services (or paste a path to service.yaml):",
             Style::default().fg(DIM),
         )),
         Line::from(vec![
@@ -1548,7 +1553,10 @@ fn draw_url_input(
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled(" GitHub URL: ", Style::default().fg(WARN_YELLOW)),
+            Span::styled(
+                " GitHub URL or manifest path: ",
+                Style::default().fg(WARN_YELLOW),
+            ),
             Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
             cursor_span(tick),
         ]),
@@ -1560,13 +1568,15 @@ fn draw_url_input(
             Style::default().fg(ERR_RED),
         )));
     } else if !buffer.trim().is_empty() {
-        let ok = buffer.trim().starts_with("https://");
-        let (mark, msg, color) = if ok {
+        let trimmed = buffer.trim();
+        let (mark, msg, color) = if trimmed.starts_with("https://") {
             ("+", " looks like a GitHub URL", OK_GREEN)
+        } else if crate::hoster::manifest::looks_like_manifest_path(trimmed) {
+            ("+", " looks like a service.yaml path", OK_GREEN)
         } else {
             (
                 "△",
-                " expected https://github.com/<owner>/<repo>",
+                " expected https://github.com/<owner>/<repo> or a path to service.yaml",
                 WARN_YELLOW,
             )
         };
@@ -1590,22 +1600,6 @@ fn draw_url_input(
 }
 
 // --- confirmation gates ------------------------------------------------------
-
-/// Human-readable service label for the deploy confirmation screen; falls
-/// back to the raw URL when it does not match a curated recipe.
-fn confirm_label(url: &str) -> String {
-    crate::hoster::github::parse_github_url(url)
-        .and_then(|(owner, name)| {
-            crate::hoster::manifest::find_builtin(&owner, &name).map(|m| {
-                if m.service.name.is_empty() {
-                    m.service.id
-                } else {
-                    m.service.name
-                }
-            })
-        })
-        .unwrap_or_else(|| url.to_string())
-}
 
 /// One selectable YES/NO button; the arrow keys move the highlight.
 fn choice_spans(marker: &str, label: &str, hue: Color, selected: bool) -> Vec<Span<'static>> {
@@ -1641,26 +1635,61 @@ fn choice_spans(marker: &str, label: &str, hue: Color, selected: bool) -> Vec<Sp
 fn draw_confirm(
     f: &mut ratatui::Frame,
     area: ratatui::prelude::Rect,
-    url: &str,
-    service_label: &str,
+    target: &workers::DeployTarget,
     yes_selected: bool,
 ) {
-    let text = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(
-                " Host ",
-                Style::default()
-                    .fg(WARN_YELLOW)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(service_label.to_string(), Style::default().fg(Color::White)),
-            Span::styled(" on this machine?", Style::default().fg(BODY)),
-        ]),
-        Line::from(vec![
-            Span::styled(" URL: ", Style::default().fg(DIM)),
-            Span::styled(url.to_string(), Style::default().fg(ACCENT)),
-        ]),
+    use workers::DeployTarget as Target;
+    // Header rows differ by source; the YES/NO gate below is identical.
+    let mut text = vec![Line::from("")];
+    match target {
+        Target::Url { url, service_label } => {
+            text.push(Line::from(vec![
+                Span::styled(
+                    " Host ",
+                    Style::default()
+                        .fg(WARN_YELLOW)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(service_label.to_string(), Style::default().fg(Color::White)),
+                Span::styled(" on this machine?", Style::default().fg(BODY)),
+            ]));
+            text.push(Line::from(vec![
+                Span::styled(" URL: ", Style::default().fg(DIM)),
+                Span::styled(url.to_string(), Style::default().fg(ACCENT)),
+            ]));
+        }
+        Target::Manifest {
+            path,
+            service_id,
+            plan,
+        } => {
+            text.push(Line::from(vec![
+                Span::styled(
+                    " Host ",
+                    Style::default()
+                        .fg(WARN_YELLOW)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(service_id.to_string(), Style::default().fg(Color::White)),
+                Span::styled(
+                    " (service.yaml) on this machine?",
+                    Style::default().fg(BODY),
+                ),
+            ]));
+            text.push(Line::from(vec![
+                Span::styled(" File: ", Style::default().fg(DIM)),
+                Span::styled(path.display().to_string(), Style::default().fg(ACCENT)),
+            ]));
+            // Validated plan excerpt: source, commit, profile, run, port.
+            for line in plan.iter().take(6) {
+                text.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+    }
+    text.extend([
         Line::from(""),
         Line::from(choice_spans("[Y]es", " — deploy", OK_GREEN, yes_selected)),
         Line::from(choice_spans(
@@ -1674,7 +1703,7 @@ fn draw_confirm(
             " ←→ select · Enter confirm",
             Style::default().fg(DIM),
         )),
-    ];
+    ]);
     f.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
@@ -2324,25 +2353,6 @@ mod tests {
         assert_eq!(command_char(KeyCode::Char('ю')), None);
         assert_eq!(command_char(KeyCode::Char('ж')), None);
         assert_eq!(command_char(KeyCode::Char('ё')), None);
-    }
-
-    #[test]
-    fn confirm_label_maps_curated_repos_to_display_names() {
-        assert_eq!(confirm_label("https://github.com/usememos/memos"), "Memos");
-        assert_eq!(confirm_label("https://github.com/VERT-sh/VERT"), "VERT");
-        assert_eq!(
-            confirm_label("https://github.com/searxng/searxng"),
-            "SearXNG"
-        );
-    }
-
-    #[test]
-    fn confirm_label_falls_back_to_raw_url() {
-        assert_eq!(
-            confirm_label("https://github.com/foo/bar"),
-            "https://github.com/foo/bar"
-        );
-        assert_eq!(confirm_label("not a url"), "not a url");
     }
 
     #[test]

@@ -530,6 +530,31 @@ fn validate_prefetch_step(step: &Step) -> Result<(), String> {
     }
 }
 
+/// True when deploy input names a local manifest file rather than a URL:
+/// an absolute/unexpanded-home/relative path, or anything ending in
+/// `.yaml`/`.yml`. The file is still validated on load — this is only the
+/// routing heuristic for the input field.
+pub fn looks_like_manifest_path(input: &str) -> bool {
+    let t = input.trim();
+    t.starts_with('/')
+        || t.starts_with("~/")
+        || t.starts_with("./")
+        || t.starts_with("../")
+        || t.ends_with(".yaml")
+        || t.ends_with(".yml")
+}
+
+/// Resolve a manifest path typed into the deploy field: `~/` expands to
+/// `$HOME`, everything else passes through as-is.
+pub fn expand_manifest_path(input: &str) -> std::path::PathBuf {
+    let t = input.trim();
+    if let Some(rest) = t.strip_prefix("~/") {
+        crate::paths::home().join(rest)
+    } else {
+        std::path::PathBuf::from(t)
+    }
+}
+
 // ── built-in manifests (1:1 with the former hardcoded recipes) ──
 
 pub const MANIFEST_VERT: &str = include_str!("manifests/vert.yaml");
@@ -718,6 +743,38 @@ mod tests {
     fn argv_steps_are_shell_quoted() {
         let s = Step::Argv(vec!["bun".into(), "install;rm -rf /".into()]);
         assert_eq!(s.to_shell(), "bun 'install;rm -rf /'");
+    }
+
+    #[test]
+    fn manifest_path_routing_heuristic() {
+        for p in [
+            "/tmp/svc.yaml",
+            "~/svc/service.yml",
+            "./service.yaml",
+            "../x.yaml",
+            "relative.yaml",
+            "  /tmp/svc.yaml  ",
+        ] {
+            assert!(looks_like_manifest_path(p), "{p}");
+        }
+        for u in [
+            "https://github.com/usememos/memos",
+            "https://github.com/VERT-sh/VERT.git",
+            "notaurl",
+        ] {
+            assert!(!looks_like_manifest_path(u), "{u}");
+        }
+    }
+
+    #[test]
+    fn manifest_path_tilde_expands_to_home() {
+        let p = expand_manifest_path("~/svc/service.yaml");
+        assert!(p.ends_with("svc/service.yaml"));
+        assert!(p.is_absolute());
+        assert_eq!(
+            expand_manifest_path("/tmp/x.yaml"),
+            std::path::PathBuf::from("/tmp/x.yaml")
+        );
     }
 
     #[test]

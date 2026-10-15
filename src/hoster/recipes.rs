@@ -1,12 +1,14 @@
-//! Curated demo catalog — a small set of supported services.
+//! Validated engine shape for one deployable service.
 //!
-//! demo_ghostprovider does not host arbitrary repositories. Each entry is a
-//! hardcoded deploy recipe for one specific public service. `tools` lists the
-//! executables the recipe's build steps require; preflight refuses to start
-//! a deployment when any of them is missing (lesson from the audit: the old
-//! preflight was green while `bun install` would fail with ENOENT).
+//! Built-in services are authored as `service.yaml` manifests
+//! (`manifests/*.yaml`) and converted into this shape before the pipeline
+//! runs, so user manifests and built-ins share every security gate below.
+//! `tools` lists the executables the recipe's build steps require; preflight
+//! refuses to start a deployment when any of them is missing (lesson from
+//! the audit: the old preflight was green while `bun install` would fail
+//! with ENOENT).
 
-/// A hardcoded deploy recipe for a single supported demo service.
+/// A validated deploy recipe for a single service.
 #[derive(Debug, Clone)]
 pub struct DemoRecipe {
     pub owner: &'static str,

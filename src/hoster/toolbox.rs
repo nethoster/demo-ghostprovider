@@ -1,6 +1,6 @@
 //! Auto-provisioning of build tools (bun, pnpm, Go) into the project cache.
 //!
-//! Deploying a curated service must not require the operator to pre-install
+//! Deploying a service must not require the operator to pre-install
 //! every build tool. For the three tools whose official release mechanics are
 //! pure downloads — bun (zip), pnpm (standalone tarball) and the Go toolchain
 //! (tarball) — this module provisions a *pinned*, SHA-256-verified binary into

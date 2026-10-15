@@ -36,7 +36,7 @@ use super::httpclient;
 /// Per-flow chunk for large blobs — far below the observed transfer cap.
 const SEGMENT: u64 = 4 * 1024 * 1024;
 const WORKERS: usize = 6;
-/// Defensive sanity caps; the curated catalog is far smaller. Hitting these
+/// Defensive sanity caps; built-in services are far smaller. Hitting these
 /// must fail loudly, never silently truncate the tree.
 const MAX_FILES: usize = 30_000;
 const MAX_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
