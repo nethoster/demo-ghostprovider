@@ -84,6 +84,22 @@ fn main() -> anyhow::Result<()> {
         Some("__cleanup") => {
             demo_ghostprovider::hoster::deploy::cleanup_cmd()?;
         }
+        Some("__check-manifest") => {
+            let path = args.get(1).context("usage: __check-manifest PATH")?;
+            match demo_ghostprovider::hoster::manifest::ServiceManifest::load_from_file(
+                std::path::Path::new(path),
+            ) {
+                Ok(m) => {
+                    println!("manifest OK: {}", m.service.id);
+                    println!();
+                    print!("{}", m.plan_text());
+                }
+                Err(e) => {
+                    eprintln!("! invalid manifest {path}: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("__deploy") => {
             reconcile_on_startup();
             // A scripted deploy gets the same clean-removal guarantee as the
@@ -95,6 +111,31 @@ fn main() -> anyhow::Result<()> {
             // watchdog has no concurrent live deploy to race.
             arm_deploy_signal_watchdog();
             use std::cell::RefCell;
+            // v0.0.44: `__deploy --manifest PATH` deploys one user manifest;
+            // `__deploy URL` keeps the built-in catalog path.
+            if args.get(1).map(String::as_str) == Some("--manifest") {
+                let path = args.get(2).context("usage: __deploy --manifest PATH")?;
+                let painter = RefCell::new(demo_ghostprovider::output::Painter::new());
+                println!();
+                println!("{}", painter.borrow().header(path));
+                let outcome = demo_ghostprovider::hoster::deploy::run_manifest_file(
+                    std::path::Path::new(path),
+                    &|line| {
+                        for out in painter.borrow_mut().render(&line) {
+                            println!("{out}");
+                        }
+                    },
+                );
+                match outcome {
+                    demo_ghostprovider::hoster::deploy::DeployOutcome::Deployed => {}
+                    other => {
+                        eprintln!("{}", painter.borrow().summary(false));
+                        eprintln!("  reason: {other:?}");
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
             let url = args.get(1).context("usage: __deploy GITHUB_URL")?;
             let painter = RefCell::new(demo_ghostprovider::output::Painter::new());
             println!();
@@ -173,14 +214,16 @@ fn arm_deploy_signal_watchdog() {
 
 fn print_help() {
     println!(
-        "demo-ghostprovider {} — deploy three curated services as hardened systemd user units\n\
+        "demo-ghostprovider {} — deploy service.yaml manifests as hardened systemd user units\n\
          \n\
          Usage:\n\
          \x20 demo-ghostprovider              launch the interactive panel\n\
          \x20 demo-ghostprovider --show-endpoints   transparency: allowlist + session counters\n\
          \x20 demo-ghostprovider --selftest           verify systemd integration on this machine\n\
          \x20 demo-ghostprovider --verify-sandbox       audit the build sandbox (needs strace)\n\
-         \x20 demo-ghostprovider --version          version",
+         \x20 demo-ghostprovider --version          version\n\
+         \x20 demo-ghostprovider __check-manifest PATH   validate a service.yaml and print the plan\n\
+         \x20 demo-ghostprovider __deploy --manifest PATH  deploy one service.yaml",
         env!("CARGO_PKG_VERSION")
     );
 }

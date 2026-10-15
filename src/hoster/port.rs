@@ -62,10 +62,7 @@ pub(crate) fn bind_ok(port: u16) -> bool {
 /// `listening on` only print when the port really answers.
 pub fn wait_until_port_open(port: u16, budget: std::time::Duration) -> bool {
     use std::net::{IpAddr, SocketAddr, TcpStream};
-    let addr = SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port,
-    );
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let deadline = std::time::Instant::now() + budget;
     loop {
         if TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(200)).is_ok() {
@@ -107,8 +104,7 @@ mod tests {
 
     #[test]
     fn port_open_poll_sees_a_listener() {
-        let listener =
-            TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         assert!(wait_until_port_open(
             port,

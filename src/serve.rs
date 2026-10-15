@@ -343,8 +343,7 @@ mod tests {
 
         fn roundtrip(canon: &std::path::Path, raw: &[u8]) -> String {
             use std::io::{Read as _, Write as _};
-            let listener =
-                TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let listener = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap();
             let mut sock = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
             let (server, _peer) = listener.accept().unwrap();
             let canon = canon.to_path_buf();
@@ -366,7 +365,10 @@ mod tests {
         assert!(resp.contains("Content-Length: 5"));
         assert!(!resp.contains("hello"), "HEAD must not send a body");
 
-        let resp = roundtrip(&canon, b"POST /a.txt HTTP/1.0\r\nContent-Length: 4\r\n\r\nx=1");
+        let resp = roundtrip(
+            &canon,
+            b"POST /a.txt HTTP/1.0\r\nContent-Length: 4\r\n\r\nx=1",
+        );
         assert!(
             resp.starts_with("HTTP/1.0 405 Method Not Allowed"),
             "POST resp: {resp:?}"

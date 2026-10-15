@@ -368,7 +368,11 @@ mod tests {
                 r.plugins.len()
             );
             if r.service_name != "demo-vert" {
-                assert!(r.plugins.is_empty(), "{}: non-VERT plugin pins", r.service_name);
+                assert!(
+                    r.plugins.is_empty(),
+                    "{}: non-VERT plugin pins",
+                    r.service_name
+                );
             }
             for (url, sha) in r.plugins {
                 assert!(

@@ -735,10 +735,19 @@ mod tests {
     #[test]
     fn scrub_removes_ambient_session_endpoints() {
         let mut env: BTreeMap<String, String> = BTreeMap::from([
-            ("SSH_AUTH_SOCK".into(), "/run/user/1000/ssh-agent.sock".into()),
+            (
+                "SSH_AUTH_SOCK".into(),
+                "/run/user/1000/ssh-agent.sock".into(),
+            ),
             ("SSH_ASKPASS".into(), "/usr/bin/ssh-askpass".into()),
-            ("GPG_AGENT_INFO".into(), "/run/user/1000/gnupg/S.gpg-agent:1:1".into()),
-            ("DBUS_SESSION_BUS_ADDRESS".into(), "unix:path=/run/user/1000/bus".into()),
+            (
+                "GPG_AGENT_INFO".into(),
+                "/run/user/1000/gnupg/S.gpg-agent:1:1".into(),
+            ),
+            (
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                "unix:path=/run/user/1000/bus".into(),
+            ),
             ("DISPLAY".into(), ":0".into()),
             ("WAYLAND_DISPLAY".into(), "wayland-0".into()),
             ("XAUTHORITY".into(), "/run/user/1000/xauth".into()),
@@ -756,7 +765,10 @@ mod tests {
             "XAUTHORITY",
             "XDG_RUNTIME_DIR",
         ] {
-            assert!(!env.contains_key(k), "{k} must be scrubbed from a build/prefetch env");
+            assert!(
+                !env.contains_key(k),
+                "{k} must be scrubbed from a build/prefetch env"
+            );
         }
         assert_eq!(env.get("HOSTVAR"), Some(&"kept".to_string()));
     }
@@ -848,7 +860,10 @@ mod tests {
             .map(|p| p.split('=').next().unwrap_or(""))
             .collect();
         for expect in ["MemoryHigh", "MemoryMax", "TasksMax", "CPUQuota"] {
-            assert!(names.contains(&expect), "{expect} must be capped on build units");
+            assert!(
+                names.contains(&expect),
+                "{expect} must be capped on build units"
+            );
         }
     }
 
@@ -864,11 +879,17 @@ mod tests {
             .collect();
         assert_eq!(scf.len(), 1, "exactly one SystemCallFilter expected");
         let line = scf[0];
-        assert!(line.starts_with("SystemCallFilter=~"), "must be a deny-list");
+        assert!(
+            line.starts_with("SystemCallFilter=~"),
+            "must be a deny-list"
+        );
         for group in ["@mount", "@swap", "@reboot", "@clock", "@raw-io"] {
             assert!(line.contains(group), "missing {group} in {line}");
         }
-        assert!(!line.contains("@debug"), "@debug would break --verify-sandbox strace");
+        assert!(
+            !line.contains("@debug"),
+            "@debug would break --verify-sandbox strace"
+        );
     }
 
     #[test]
@@ -892,11 +913,7 @@ mod tests {
         assert_ne!(SandboxGrade::Full.label(), SandboxGrade::Almost.label());
         assert_ne!(SandboxGrade::Almost.label(), SandboxGrade::None.label());
         assert_ne!(SandboxGrade::Full.label(), SandboxGrade::None.label());
-        for grade in [
-            SandboxGrade::Full,
-            SandboxGrade::Almost,
-            SandboxGrade::None,
-        ] {
+        for grade in [SandboxGrade::Full, SandboxGrade::Almost, SandboxGrade::None] {
             assert!(grade.label().starts_with("sandbox: "));
         }
         assert!(SandboxGrade::Full.is_full());
@@ -944,12 +961,17 @@ mod tests {
         // Bus locators are restored from the ambient process env for the
         // launcher only, when the ambient process has them.
         if let Ok(xrd) = std::env::var("XDG_RUNTIME_DIR") {
-            assert_eq!(launch.get("XDG_RUNTIME_DIR").map(String::as_str), Some(xrd.as_str()));
-            assert!(!launch
-                .get("XDG_RUNTIME_DIR")
-                .map(String::as_str)
-                .unwrap_or("")
-                .starts_with("/proj/"));
+            assert_eq!(
+                launch.get("XDG_RUNTIME_DIR").map(String::as_str),
+                Some(xrd.as_str())
+            );
+            assert!(
+                !launch
+                    .get("XDG_RUNTIME_DIR")
+                    .map(String::as_str)
+                    .unwrap_or("")
+                    .starts_with("/proj/")
+            );
         }
         if let Ok(db) = std::env::var("DBUS_SESSION_BUS_ADDRESS") {
             assert_eq!(

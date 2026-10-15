@@ -334,7 +334,11 @@ pub fn remote_len(url: &str) -> anyhow::Result<u64> {
     // `content-range` carries the real total — so it must win. storage loops
     // additionally expose the canonical size via x-goog-stored-content-length;
     // a plain 200 (Range ignored) is served with an honest content-length.
-    for key in ["content-range", "x-goog-stored-content-length", "content-length"] {
+    for key in [
+        "content-range",
+        "x-goog-stored-content-length",
+        "content-length",
+    ] {
         let Some(v) = hdrs.get(key) else {
             continue;
         };
@@ -343,11 +347,14 @@ pub fn remote_len(url: &str) -> anyhow::Result<u64> {
         };
         let parsed = if key == "content-range" {
             // "bytes 0-0/TOTAL"
-            s.rsplit_once('/').and_then(|(_, total)| total.trim().parse::<u64>().ok())
+            s.rsplit_once('/')
+                .and_then(|(_, total)| total.trim().parse::<u64>().ok())
         } else {
             s.trim().parse::<u64>().ok()
         };
-        if let Some(n) = parsed && n > 0 {
+        if let Some(n) = parsed
+            && n > 0
+        {
             return Ok(n);
         }
     }
@@ -367,7 +374,10 @@ fn is_dns_error(msg: &str) -> bool {
 
 fn backoff_delay(attempt: u32) -> Duration {
     // 1s, 2s, 4s, 8s, 16s, 32s, 64s, 120s, 120s, ...
-    let secs = 1u64.checked_shl(attempt).unwrap_or(u64::MAX).min(MAX_BACKOFF.as_secs());
+    let secs = 1u64
+        .checked_shl(attempt)
+        .unwrap_or(u64::MAX)
+        .min(MAX_BACKOFF.as_secs());
     Duration::from_secs(secs)
 }
 
@@ -389,9 +399,8 @@ fn fetch(
     ensure_allowed(url)?;
     let accept_encoding = identity_encoding.then_some(ureq::config::AutoHeaderValue::None);
     let proxied = agent_with_proxy(global, recv_body, accept_encoding.clone(), true);
-    let direct = ambient_proxy_for(url).map(|_| {
-        agent_with_proxy(global, recv_body, accept_encoding, false)
-    });
+    let direct =
+        ambient_proxy_for(url).map(|_| agent_with_proxy(global, recv_body, accept_encoding, false));
 
     let mut attempt_no: u32 = 0;
     let mut last_err: Option<anyhow::Error> = None;
@@ -427,7 +436,10 @@ fn fetch(
                 Err(e @ ureq::Error::StatusCode(_)) => {
                     // ureq status wrapper — extract code if possible.
                     let s = e.to_string();
-                    let is_5xx = s.contains(" 500") || s.contains(" 502") || s.contains(" 503") || s.contains(" 504");
+                    let is_5xx = s.contains(" 500")
+                        || s.contains(" 502")
+                        || s.contains(" 503")
+                        || s.contains(" 504");
                     let is_403 = s.contains(" 403");
                     if is_403 || is_5xx {
                         last_err = Some(anyhow!("{e}"));
@@ -441,7 +453,11 @@ fn fetch(
                     let host = host_of(url).unwrap_or_default();
                     // Record every transient failure so the user can see
                     // we are waiting, not stuck.
-                    crate::netlog::record(&host, &path_of(url), Err(format!("retry #{attempt_no}: {msg}")));
+                    crate::netlog::record(
+                        &host,
+                        &path_of(url),
+                        Err(format!("retry #{attempt_no}: {msg}")),
+                    );
                     let _ = dns;
                     last_err = Some(anyhow!("{e}"));
                 }
@@ -535,7 +551,13 @@ fn fetch_slow_bytes(
 ) -> anyhow::Result<Vec<u8>> {
     fetch_slow_bytes_with(
         |url, ranged| {
-            let res = fetch(url, SLOW_TIMEOUT, Some(SLOW_BODY_IDLE), ranged.is_some(), ranged)?;
+            let res = fetch(
+                url,
+                SLOW_TIMEOUT,
+                Some(SLOW_BODY_IDLE),
+                ranged.is_some(),
+                ranged,
+            )?;
             let status = res.status().as_u16();
             let body = res.into_body().read_to_vec().context(body_ctx)?;
             Ok(FetchOut { status, body })
@@ -577,8 +599,7 @@ pub fn get_bytes_range(url: &str, start: u64, end: u64) -> anyhow::Result<Vec<u8
 pub fn head_ok(url: &str) -> bool {
     ensure_allowed(url).is_ok_and(|_| {
         let proxied = build_agent(TIMEOUT, None);
-        let direct = ambient_proxy_for(url)
-            .map(|_| agent_with_proxy(TIMEOUT, None, None, false));
+        let direct = ambient_proxy_for(url).map(|_| agent_with_proxy(TIMEOUT, None, None, false));
         std::iter::once(&proxied)
             .chain(direct.iter())
             .any(|agent| probe_head(agent, url))
@@ -869,9 +890,14 @@ mod tests {
             |_url, _ranged| {
                 attempts += 1;
                 if attempts <= 2 {
-                    Err(anyhow!("downloading f seg 11: reading ranged body: timeout: receive body"))
+                    Err(anyhow!(
+                        "downloading f seg 11: reading ranged body: timeout: receive body"
+                    ))
                 } else {
-                    Ok(FetchOut { status: 200, body: b"ok".to_vec() })
+                    Ok(FetchOut {
+                        status: 200,
+                        body: b"ok".to_vec(),
+                    })
                 }
             },
             url,
@@ -889,7 +915,9 @@ mod tests {
         let err = fetch_slow_bytes_with(
             |_url, _ranged| {
                 attempts += 1;
-                Err(anyhow!("downloading f seg 11: reading ranged body: timeout: receive body"))
+                Err(anyhow!(
+                    "downloading f seg 11: reading ranged body: timeout: receive body"
+                ))
             },
             url,
             None,
@@ -907,9 +935,15 @@ mod tests {
             |_url, _ranged| {
                 attempts += 1;
                 if attempts == 1 {
-                    Ok(FetchOut { status: 502, body: vec![] })
+                    Ok(FetchOut {
+                        status: 502,
+                        body: vec![],
+                    })
                 } else {
-                    Ok(FetchOut { status: 200, body: b"ok".to_vec() })
+                    Ok(FetchOut {
+                        status: 200,
+                        body: b"ok".to_vec(),
+                    })
                 }
             },
             url,

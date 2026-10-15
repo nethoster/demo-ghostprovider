@@ -118,11 +118,15 @@ Full dashboard for all deployed services. Start, stop, restart, or remove — on
 
 ## Service support
 
-This is a restricted demo version of GhostProvider that only supports deploying the following services:
+This demo ships three built-in `service.yaml` manifests (`docs/MANIFEST.md`):
 
 - **VERT** - https://github.com/VERT-sh/VERT
 - **SearXNG** - https://github.com/searxng/searxng
 - **Memos** - https://github.com/usememos/memos
+
+Custom services use the same format: `demo-ghostprovider __check-manifest service.yaml`
+validates and prints the deploy plan, `demo-ghostprovider __deploy --manifest service.yaml`
+deploys it through the identical sandbox + loopback + cleanup pipeline.
 
 ## Install
 

@@ -1,0 +1,32 @@
+# Built-in manifest: Memos (mirrors the former hardcoded recipe 1:1).
+manifest_version: 1
+service:
+  id: demo-memos
+  name: Memos
+  description: "Memos \u2014 self-hosted, open-source knowledge base (Go)"
+source:
+  git: https://github.com/usememos/memos.git
+  commit: "245e5e3a3e95cd3648fd66a696e0970e5eef1254"
+pre_build: []
+prefetch:
+  - ["pnpm", "--dir", "web", "fetch", "--store-dir", "{project}/.ghost-cache/pnpm"]
+build:
+  profile: go
+  steps:
+    - "pnpm --dir web install --offline --store-dir {project}/.ghost-cache/pnpm"
+    - "pnpm --dir web release"
+    - "go build -o ghost-server ./cmd/memos"
+run:
+  command: ["{bin}", "--addr", "127.0.0.1", "--port", "{port}"]
+  port: 0
+resources:
+  memory_high: "512M"
+  memory_max: "1024M"
+  tasks_max: "512"
+  cpu_quota: "100%"
+  limit_nofile: 65536
+  oom_score_adjust: 0
+healthcheck:
+  type: http
+  path: /
+tools: ["pnpm", "go"]

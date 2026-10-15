@@ -1,0 +1,36 @@
+# Built-in manifest: VERT (mirrors the former hardcoded recipe 1:1).
+manifest_version: 1
+service:
+  id: demo-vert
+  name: VERT
+  description: "VERT \u2014 next-generation file converter (Svelte)"
+source:
+  git: https://github.com/VERT-sh/VERT.git
+  commit: "cc7b5a54d5e9c797b377db47b9bdfbb561707783"
+pre_build:
+  - "if [ -f .env.example ] && [ ! -f .env ]; then cp .env.example .env; fi"
+prefetch:
+  - ["bun", "install", "--frozen-lockfile", "--ignore-scripts"]
+plugins:
+  - url: "https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format@4/dist/index.js"
+    sha256: "765b487bbe95a20c7f83a940a3fba81bacef18bce0bbe916df6807f7ddd512ca"
+  - url: "https://cdn.jsdelivr.net/npm/@inlang/plugin-m-function-matcher@2/dist/index.js"
+    sha256: "a7e6c41307afc64b3f34116f220e925f0ad3aca47231e849f080051a2fb459a8"
+build:
+  profile: bun
+  steps:
+    - ["bun", "run", "build"]
+run:
+  command: ["{self}", "__serve-static", "{project}/build", "{port}"]
+  port: 0
+resources:
+  memory_high: "256M"
+  memory_max: "384M"
+  tasks_max: "300"
+  cpu_quota: "100%"
+  limit_nofile: 65536
+  oom_score_adjust: 0
+healthcheck:
+  type: http
+  path: /
+tools: ["bun"]

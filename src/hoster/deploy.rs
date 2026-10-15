@@ -274,11 +274,16 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
         screen("! invalid GitHub URL format".into());
         return DeployOutcome::Rejected("bad-url");
     };
-    let Some(recipe) = super::recipes::find_recipe(&owner, &name) else {
+    // v0.0.44: the curated catalog is now three built-in `service.yaml`
+    // manifests (1:1 with the former hardcoded recipes). The deploy
+    // pipeline below is unchanged; the manifest is converted into the
+    // engine's recipe shape so every security gate stays identical.
+    let Some(manifest) = super::manifest::find_builtin(&owner, &name) else {
         screen("! this demo only supports three services:".into());
         screen("! VERT-sh/VERT · searxng/searxng · usememos/memos".into());
         return DeployOutcome::Rejected("not-curated");
     };
+    let recipe = super::manifest::to_leaked_recipe(&manifest);
 
     // Preflight including per-recipe build tools (audit lesson).
     let issues = super::preflight::preflight_check(recipe.tools);
@@ -336,7 +341,7 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
 
     let result = deploy_service(
         &analysis,
-        recipe,
+        &recipe,
         None,
         DeployHooks {
             on_status: Some(&|line| screen(line.to_string())),
@@ -367,6 +372,135 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
         DeployOutcome::Deployed
     } else {
         DeployOutcome::Failed
+    }
+}
+
+/// Deploy one validated user manifest (`service.yaml`).
+///
+/// Same pipeline as [`run_deployment`]: sandbox FULL gate, preflight,
+/// deploy lock + journal, [`deploy_service`], journal settle. The only
+/// difference is the recipe source — a user file instead of the built-in
+/// catalog. The manifest MUST already be validated
+/// (`ServiceManifest::load_from_file` does that); this reuses the audited
+/// pipeline verbatim via [`super::manifest::to_leaked_recipe`].
+pub fn run_manifest_deployment(
+    manifest: &super::manifest::ServiceManifest,
+    log: &dyn Fn(String),
+) -> DeployOutcome {
+    let screen = |line: String| {
+        if screen_line(&line) {
+            log(line);
+        }
+    };
+    match super::sandbox::sandbox_grade() {
+        super::sandbox::SandboxGrade::Full => {
+            screen("sandbox: FULL".into());
+        }
+        super::sandbox::SandboxGrade::Almost => {
+            screen(
+                "! sandbox: ALMOST — GHOSTPROVIDER_BUILD_USER set but unusable; refusing to \
+                 deploy without full isolation"
+                    .into(),
+            );
+            return DeployOutcome::Rejected("sandbox-unavailable");
+        }
+        super::sandbox::SandboxGrade::None => {
+            screen(
+                "! sandbox: NO — refusing to build without isolation (the sandbox is mandatory)"
+                    .into(),
+            );
+            return DeployOutcome::Rejected("sandbox-unavailable");
+        }
+    }
+    if crate::netlog::logging_disabled() {
+        screen(
+            "warn: GHOSTPROVIDER_NO_NETLOG — outbound requests are not written to net.log".into(),
+        );
+    }
+    let recipe = super::manifest::to_leaked_recipe(manifest);
+    let url = manifest.source.git.clone();
+    let (owner, name) = manifest
+        .owner_name()
+        .unwrap_or_else(|| ("user".to_string(), manifest.service.id.clone()));
+
+    let issues = super::preflight::preflight_check(recipe.tools);
+    if !issues.is_empty() {
+        for i in issues {
+            screen(format!("! {i}"));
+        }
+        screen("! pre-flight failed, aborting".into());
+        return DeployOutcome::Rejected("preflight");
+    }
+
+    let language: String = recipe.language.into();
+    let analysis = RepoAnalysis {
+        url: url.clone(),
+        owner,
+        name,
+        language,
+        exists: true,
+        clone_path: None,
+        errors: vec![],
+    };
+    DEPLOY_IN_FLIGHT.store(true, Ordering::Relaxed);
+    let Some(_lock) = super::lock::try_lock_exclusive() else {
+        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
+        screen(
+            "! another deployment is already running (deploy.lock held) — refusing to \
+              start a second one"
+                .into(),
+        );
+        return DeployOutcome::Rejected("deploy-locked");
+    };
+    journal::begin(recipe.service_name, &url);
+    if super::cancel::is_exiting() {
+        journal::clear(recipe.service_name);
+        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
+        return DeployOutcome::Rejected("exiting");
+    }
+
+    let result = deploy_service(
+        &analysis,
+        &recipe,
+        None,
+        DeployHooks {
+            on_status: Some(&|line| screen(line.to_string())),
+        },
+    );
+
+    for u in &result.urls {
+        screen(format!("listening on {u}"));
+    }
+    if super::cancel::is_exiting() {
+        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
+    } else {
+        journal::clear(recipe.service_name);
+        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
+    }
+    if !result.service_names.is_empty() && result.errors.is_empty() {
+        DeployOutcome::Deployed
+    } else {
+        DeployOutcome::Failed
+    }
+}
+
+/// Load `service.yaml` from disk and deploy it (used by `__deploy --manifest`).
+pub fn run_manifest_file(path: &Path, log: &dyn Fn(String)) -> DeployOutcome {
+    match super::manifest::ServiceManifest::load_from_file(path) {
+        Ok(m) => {
+            log(format!("manifest: {} ({})", m.service.id, path.display()));
+            for line in m.plan_text().lines() {
+                log(line.to_string());
+            }
+            run_manifest_deployment(&m, log)
+        }
+        Err(e) => {
+            let msg = format!("! invalid manifest {}: {e:#}", path.display());
+            // Emit through the screen filter path manually: callers of
+            // run_manifest_file already forward everything, so push directly.
+            log(msg);
+            DeployOutcome::Rejected("bad-manifest")
+        }
     }
 }
 

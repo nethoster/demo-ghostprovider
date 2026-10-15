@@ -150,21 +150,18 @@ pub fn run() -> anyhow::Result<()> {
 
 /// Ask the sandbox itself what `$HOME` resolves to inside a hardened unit.
 fn probe_home() -> anyhow::Result<String> {
-    let work = std::env::temp_dir().join(format!(
-        "gp-sandbox-home-{}",
-        crate::atomic::random_hex(6)?
-    ));
+    let work =
+        std::env::temp_dir().join(format!("gp-sandbox-home-{}", crate::atomic::random_hex(6)?));
     std::fs::create_dir_all(&work)?;
-    let argv: Vec<String> = vec![
-        "/bin/sh".into(),
-        "-c".into(),
-        "printf %s \"$HOME\"".into(),
-    ];
+    let argv: Vec<String> = vec!["/bin/sh".into(), "-c".into(), "printf %s \"$HOME\"".into()];
     let result = run_sandboxed(&argv, &work, std::time::Duration::from_secs(60), &[]);
     let _ = cleanup(&work);
     match result {
         Ok(c) if c.success => Ok(c.stdout.trim().to_string()),
-        Ok(c) => bail!("sandbox HOME probe failed (exit non-zero): {}", c.stderr.trim()),
+        Ok(c) => bail!(
+            "sandbox HOME probe failed (exit non-zero): {}",
+            c.stderr.trim()
+        ),
         Err(e) => Err(e),
     }
 }
@@ -326,7 +323,10 @@ mod tests {
     #[test]
     fn flags_forbidden_exec() {
         let work = PathBuf::from("/tmp/gp-sandbox-verify-abc");
-        assert!(forbidden_prefix("/tmp/gp-sandbox-verify-abc/payload", &work));
+        assert!(forbidden_prefix(
+            "/tmp/gp-sandbox-verify-abc/payload",
+            &work
+        ));
         assert!(forbidden_prefix("/home/u/proj/.ghost-cache/x", &work));
         assert!(!forbidden_prefix("/usr/bin/true", &work));
     }

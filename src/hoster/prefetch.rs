@@ -113,17 +113,13 @@ fn verify_pin(bytes: &[u8], pinned: &str) -> Result<(), String> {
 /// partial or drifted seed is therefore never presented to the offline
 /// build — the same fail-closed contract as the old `curl` shell step it
 /// replaces.
-pub fn seed_paraglide_plugins(
-    project_dir: &Path,
-    spec: &[(&str, &str)],
-) -> anyhow::Result<()> {
+pub fn seed_paraglide_plugins(project_dir: &Path, spec: &[(&str, &str)]) -> anyhow::Result<()> {
     let plugins_dir = project_dir
         .join("project.inlang")
         .join("cache")
         .join("plugins");
-    std::fs::create_dir_all(&plugins_dir).with_context(|| {
-        format!("prefetch: create plugin cache {}", plugins_dir.display())
-    })?;
+    std::fs::create_dir_all(&plugins_dir)
+        .with_context(|| format!("prefetch: create plugin cache {}", plugins_dir.display()))?;
     seed_pinned_plugins(&plugins_dir, spec, &crate::hoster::httpclient::get_bytes)
 }
 
@@ -148,9 +144,8 @@ fn seed_pinned_plugins(
         staged.push((stage, plugins_dir.join(cache_name)));
     }
     for (stage, final_path) in staged {
-        std::fs::rename(&stage, &final_path).with_context(|| {
-            format!("prefetch: place plugin {}", final_path.display())
-        })?;
+        std::fs::rename(&stage, &final_path)
+            .with_context(|| format!("prefetch: place plugin {}", final_path.display()))?;
     }
     Ok(())
 }
@@ -195,7 +190,10 @@ fn prepend_path_if_any(env: &mut BTreeMap<String, String>, path_prefix: &[PathBu
     if path_prefix.is_empty() {
         return;
     }
-    env.insert("PATH".to_string(), super::toolbox::join_path_with_ambient(path_prefix));
+    env.insert(
+        "PATH".to_string(),
+        super::toolbox::join_path_with_ambient(path_prefix),
+    );
 }
 
 /// Run one host-phase dependency prefetch command. The command is a
@@ -323,7 +321,10 @@ fn run_host_step_timed(
     let out_tail = out_thread.join().unwrap_or_default();
     let err_tail = err_thread.join().unwrap_or_default();
     if timed_out {
-        anyhow::bail!("prefetch step timed out after {}s: {cmd}", timeout.as_secs());
+        anyhow::bail!(
+            "prefetch step timed out after {}s: {cmd}",
+            timeout.as_secs()
+        );
     }
     let ok = exit.map(|s| s.success()).unwrap_or(false);
     if ok {
@@ -335,7 +336,8 @@ fn run_host_step_timed(
     }
     anyhow::bail!(
         "prefetch step failed (exit {}): {cmd}\n{detail}",
-        exit.map(|s| s.to_string()).unwrap_or_else(|| "?".to_string())
+        exit.map(|s| s.to_string())
+            .unwrap_or_else(|| "?".to_string())
     );
 }
 
@@ -517,7 +519,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gp-prefetch-hang-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let start = std::time::Instant::now();
-        let err = run_host_step_timed("exec sleep 300", &dir, &[], &|_| {}, Duration::from_millis(700)).unwrap_err();
+        let err = run_host_step_timed(
+            "exec sleep 300",
+            &dir,
+            &[],
+            &|_| {},
+            Duration::from_millis(700),
+        )
+        .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("timed out"), "{msg}");
         assert!(
@@ -567,13 +576,22 @@ mod tests {
     #[ignore = "network — run manually to re-pin after a recipe change"]
     fn live_pins_match_what_the_client_actually_fetches() {
         let mf_url = "https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format@4/dist/index.js";
-        let fm_url = "https://cdn.jsdelivr.net/npm/@inlang/plugin-m-function-matcher@2/dist/index.js";
+        let fm_url =
+            "https://cdn.jsdelivr.net/npm/@inlang/plugin-m-function-matcher@2/dist/index.js";
         let mf = crate::hoster::httpclient::get_bytes(mf_url).unwrap();
         let fm = crate::hoster::httpclient::get_bytes(fm_url).unwrap();
         let mf_pin = "765b487bbe95a20c7f83a940a3fba81bacef18bce0bbe916df6807f7ddd512ca";
         let fm_pin = "a7e6c41307afc64b3f34116f220e925f0ad3aca47231e849f080051a2fb459a8";
-        assert_eq!(sha256_hex(&mf), mf_pin, "plugin-message-format bytes changed");
-        assert_eq!(sha256_hex(&fm), fm_pin, "plugin-m-function-matcher bytes changed");
+        assert_eq!(
+            sha256_hex(&mf),
+            mf_pin,
+            "plugin-message-format bytes changed"
+        );
+        assert_eq!(
+            sha256_hex(&fm),
+            fm_pin,
+            "plugin-m-function-matcher bytes changed"
+        );
     }
 
     #[test]
@@ -591,7 +609,13 @@ mod tests {
         let bytes = b"plugin-bytes";
         let good = sha256_hex(bytes);
         assert!(verify_pin(bytes, &good).is_ok());
-        assert!(verify_pin(bytes, "0000000000000000000000000000000000000000000000000000000000000000").is_err());
+        assert!(
+            verify_pin(
+                bytes,
+                "0000000000000000000000000000000000000000000000000000000000000000"
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -605,16 +629,27 @@ mod tests {
         let a_sha = sha256_hex(a);
         let b_sha = sha256_hex(b);
         let a_url = "https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format@4/dist/index.js";
-        let b_url = "https://cdn.jsdelivr.net/npm/@inlang/plugin-m-function-matcher@2/dist/index.js";
+        let b_url =
+            "https://cdn.jsdelivr.net/npm/@inlang/plugin-m-function-matcher@2/dist/index.js";
 
         let spec: Vec<(&str, &str)> = vec![(a_url, &a_sha), (b_url, &b_sha)];
         let fake_fetch = |url: &str| -> anyhow::Result<Vec<u8>> {
-            if url == a_url { Ok(a.to_vec()) } else { Ok(b.to_vec()) }
+            if url == a_url {
+                Ok(a.to_vec())
+            } else {
+                Ok(b.to_vec())
+            }
         };
         seed_pinned_plugins(&plugins, &spec, &fake_fetch).unwrap();
 
-        assert_eq!(std::fs::read(plugins.join(paraglide_cache_name(a_url))).unwrap(), a);
-        assert_eq!(std::fs::read(plugins.join(paraglide_cache_name(b_url))).unwrap(), b);
+        assert_eq!(
+            std::fs::read(plugins.join(paraglide_cache_name(a_url))).unwrap(),
+            a
+        );
+        assert_eq!(
+            std::fs::read(plugins.join(paraglide_cache_name(b_url))).unwrap(),
+            b
+        );
         // No staging dotfiles remain after a successful seed.
         assert!(
             plugins.read_dir().unwrap().all(|e| {
@@ -635,12 +670,23 @@ mod tests {
         let a = b"plugin-a";
         let a_sha = sha256_hex(a);
         let a_url = "https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format@4/dist/index.js";
-        let b_url = "https://cdn.jsdelivr.net/npm/@inlang/plugin-m-function-matcher@2/dist/index.js";
+        let b_url =
+            "https://cdn.jsdelivr.net/npm/@inlang/plugin-m-function-matcher@2/dist/index.js";
 
         // First URL correct, second URL wrong pin.
-        let spec: Vec<(&str, &str)> = vec![(a_url, &a_sha), (b_url, "0000000000000000000000000000000000000000000000000000000000000000")];
+        let spec: Vec<(&str, &str)> = vec![
+            (a_url, &a_sha),
+            (
+                b_url,
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+        ];
         let fake_fetch = |url: &str| -> anyhow::Result<Vec<u8>> {
-            if url == a_url { Ok(a.to_vec()) } else { Ok(b"wrong-plugin".to_vec()) }
+            if url == a_url {
+                Ok(a.to_vec())
+            } else {
+                Ok(b"wrong-plugin".to_vec())
+            }
         };
         let err = seed_pinned_plugins(&plugins, &spec, &fake_fetch).unwrap_err();
         let report = format!("{err:#}");
@@ -650,7 +696,11 @@ mod tests {
         assert!(!plugins.join(paraglide_cache_name(b_url)).exists());
         // Staged dotfile for the first plugin exists (verify happened, then rename phase
         // never ran) — this is safe; the loader does not serve dotfiles.
-        assert!(plugins.join(format!(".seed-{}", paraglide_cache_name(a_url))).exists());
+        assert!(
+            plugins
+                .join(format!(".seed-{}", paraglide_cache_name(a_url)))
+                .exists()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

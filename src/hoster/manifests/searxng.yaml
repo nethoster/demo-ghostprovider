@@ -1,0 +1,33 @@
+# Built-in manifest: SearXNG (mirrors the former hardcoded recipe 1:1).
+manifest_version: 1
+service:
+  id: demo-searxng
+  name: SearXNG
+  description: "SearXNG \u2014 privacy-friendly metasearch engine (Python)"
+source:
+  git: https://github.com/searxng/searxng.git
+  commit: "18af21159bd7b84880cd7265b184825493322232"
+pre_build: []
+prefetch:
+  - ["python3", "-m", "pip", "download", "-r", "requirements.txt", "-d", ".ghost-cache/pip-wheelhouse", "--only-binary=:all:"]
+  - "touch .ghost-cache/pip-wheelhouse/.done"
+build:
+  profile: python-searxng
+  steps:
+    - "python3 -m venv --clear .venv"
+    - ".venv/bin/pip install --no-cache-dir -r requirements.txt"
+run:
+  command: ["{venv}", "-m", "searx.webapp"]
+  port: 8888
+resources:
+  memory_high: "768M"
+  memory_max: "1536M"
+  tasks_max: "512"
+  cpu_quota: "100%"
+  limit_nofile: 65536
+  oom_score_adjust: -100
+healthcheck:
+  type: http
+  path: /
+searxng: true
+tools: ["python3"]

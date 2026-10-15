@@ -9,6 +9,7 @@ pub mod goenv;
 pub mod httpclient;
 pub mod journal;
 pub mod lock;
+pub mod manifest;
 pub mod models;
 pub mod port;
 pub mod prefetch;

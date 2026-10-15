@@ -953,7 +953,13 @@ fn draw_url_input(
 fn confirm_label(url: &str) -> String {
     crate::hoster::github::parse_github_url(url)
         .and_then(|(owner, name)| {
-            crate::hoster::recipes::find_recipe(&owner, &name).map(|r| r.display_name.to_string())
+            crate::hoster::manifest::find_builtin(&owner, &name).map(|m| {
+                if m.service.name.is_empty() {
+                    m.service.id
+                } else {
+                    m.service.name
+                }
+            })
         })
         .unwrap_or_else(|| url.to_string())
 }

@@ -25,9 +25,9 @@
 //! (its signed-URL redirect), both gated per hop by `ALLOWED_ENDPOINTS` and
 //! net.log-recorded like every other request (see `netlog.rs`).
 
-use anyhow::Context;
 use crate::hoster::httpclient;
 use crate::hoster::toolcheck;
+use anyhow::Context;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -72,8 +72,8 @@ pub fn go_toolchain_env(
     }
 
     let os = go_env_key("GOOS", path_prefix).unwrap_or_else(|| "linux".to_string());
-    let arch = go_env_key("GOARCH", path_prefix)
-        .unwrap_or_else(|| std::env::consts::ARCH.to_string());
+    let arch =
+        go_env_key("GOARCH", path_prefix).unwrap_or_else(|| std::env::consts::ARCH.to_string());
     let tag = toolchain_tag(&toolcheck::v_str(need), &os, &arch);
 
     let base = project_dir.join(".ghost-cache").join("go-fileproxy");
@@ -89,13 +89,17 @@ pub fn go_toolchain_env(
     for ext in [".info", ".mod"] {
         let p = vdir.join(format!("{tag}{ext}"));
         if p.metadata().map(|m| m.len()).unwrap_or(0) == 0 {
-            let text = httpclient::get_text(&format!("https://proxy.golang.org/{module_esc}{ext}"))?;
+            let text =
+                httpclient::get_text(&format!("https://proxy.golang.org/{module_esc}{ext}"))?;
             write_bytes(&p, text.as_bytes())?;
         }
     }
 
     Ok(vec![
-        ("GOPROXY".to_string(), format!("file://{proxy}", proxy = base.display())),
+        (
+            "GOPROXY".to_string(),
+            format!("file://{proxy}", proxy = base.display()),
+        ),
         ("GOTOOLCHAIN".to_string(), "auto".to_string()),
         // The toolchain module is the one thing NOT pinned in the project's
         // go.sum, so a fresh `go build` would verify it against sum.golang.org
@@ -113,7 +117,10 @@ fn go_mod_requirement_at(project_dir: &Path) -> anyhow::Result<Option<toolcheck:
     let text = match std::fs::read_to_string(project_dir.join("go.mod")) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", project_dir.join("go.mod").display())),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("reading {}", project_dir.join("go.mod").display()));
+        }
     };
     Ok(toolcheck::go_mod_requirement(&text))
 }
@@ -124,7 +131,10 @@ fn go_env_key(key: &str, path_prefix: &[std::path::PathBuf]) -> Option<String> {
     let mut cmd = std::process::Command::new("go");
     cmd.args(["env", key]);
     if !path_prefix.is_empty() {
-        cmd.env("PATH", crate::hoster::toolbox::join_path_with_ambient(path_prefix));
+        cmd.env(
+            "PATH",
+            crate::hoster::toolbox::join_path_with_ambient(path_prefix),
+        );
     }
     let out = cmd.output().ok()?;
     if !out.status.success() {
@@ -237,11 +247,14 @@ pub fn seed_go_modules(project_dir: &Path) -> anyhow::Result<SeedResult> {
     let sum_text = match std::fs::read_to_string(project_dir.join("go.sum")) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(SeedResult { ready: 0, failed: Vec::new(), total: 0 })
+            return Ok(SeedResult {
+                ready: 0,
+                failed: Vec::new(),
+                total: 0,
+            });
         }
         Err(e) => {
-            return Err(e)
-                .with_context(|| format!("reading go.sum in {}", project_dir.display()))
+            return Err(e).with_context(|| format!("reading go.sum in {}", project_dir.display()));
         }
     };
     let cache = go_download_cache(project_dir);
@@ -257,7 +270,11 @@ pub fn seed_go_modules(project_dir: &Path) -> anyhow::Result<SeedResult> {
     }
     let total = jobs.len();
     if total == 0 {
-        return Ok(SeedResult { ready: seeded, failed: Vec::new(), total: 0 });
+        return Ok(SeedResult {
+            ready: seeded,
+            failed: Vec::new(),
+            total: 0,
+        });
     }
 
     let next = Arc::new(Mutex::new(0usize));
@@ -319,7 +336,11 @@ pub fn seed_go_modules(project_dir: &Path) -> anyhow::Result<SeedResult> {
         let _ = h.join();
     }
     let errors = errors.lock().unwrap().clone();
-    Ok(SeedResult { ready: seeded + (total - errors.len()), failed: errors, total })
+    Ok(SeedResult {
+        ready: seeded + (total - errors.len()),
+        failed: errors,
+        total,
+    })
 }
 
 /// Fetch one module (`semver` or pseudo-version) into the download cache:
@@ -394,38 +415,40 @@ fn fetch_zip(url: &str, dest: &Path) -> anyhow::Result<()> {
         let aborted = Arc::clone(&aborted);
         let url = url.to_string();
         let stage = stage.clone();
-        handles.push(std::thread::spawn(move || loop {
-            if aborted.load(Ordering::SeqCst) {
-                break;
-            }
-            let i = {
-                let mut g = next.lock().unwrap();
-                let i = *g;
-                *g += 1;
-                i
-            };
-            if i >= segs {
-                break;
-            }
-            let part = stage.join(format!("{i:07}"));
-            // Resume: an existing part of the exact expected length is done.
-            if part.metadata().map(|m| m.len()).unwrap_or(0) == seg_len(i) {
-                continue;
-            }
-            let start = i * SEGMENT;
-            let end = ((i + 1) * SEGMENT - 1).min(size - 1);
-            match httpclient::get_bytes_range(&url, start, end) {
-                Ok(bytes) => {
-                    if let Err(e) = write_bytes(&part, &bytes) {
+        handles.push(std::thread::spawn(move || {
+            loop {
+                if aborted.load(Ordering::SeqCst) {
+                    break;
+                }
+                let i = {
+                    let mut g = next.lock().unwrap();
+                    let i = *g;
+                    *g += 1;
+                    i
+                };
+                if i >= segs {
+                    break;
+                }
+                let part = stage.join(format!("{i:07}"));
+                // Resume: an existing part of the exact expected length is done.
+                if part.metadata().map(|m| m.len()).unwrap_or(0) == seg_len(i) {
+                    continue;
+                }
+                let start = i * SEGMENT;
+                let end = ((i + 1) * SEGMENT - 1).min(size - 1);
+                match httpclient::get_bytes_range(&url, start, end) {
+                    Ok(bytes) => {
+                        if let Err(e) = write_bytes(&part, &bytes) {
+                            *failure.lock().unwrap() = Some(e);
+                            aborted.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                    Err(e) => {
                         *failure.lock().unwrap() = Some(e);
                         aborted.store(true, Ordering::SeqCst);
                         break;
                     }
-                }
-                Err(e) => {
-                    *failure.lock().unwrap() = Some(e);
-                    aborted.store(true, Ordering::SeqCst);
-                    break;
                 }
             }
         }));
@@ -447,7 +470,8 @@ fn fetch_zip(url: &str, dest: &Path) -> anyhow::Result<()> {
     let mut out = std::io::BufWriter::new(out);
     for i in 0..segs {
         let part = stage.join(format!("{i:07}"));
-        let bytes = std::fs::read(&part).with_context(|| format!("reading part {}", part.display()))?;
+        let bytes =
+            std::fs::read(&part).with_context(|| format!("reading part {}", part.display()))?;
         out.write_all(&bytes)
             .with_context(|| format!("assembling {}", dest.display()))?;
     }
@@ -459,9 +483,7 @@ fn fetch_zip(url: &str, dest: &Path) -> anyhow::Result<()> {
     let got = dest.metadata().map(|m| m.len()).unwrap_or(0);
     let _ = std::fs::remove_dir_all(&stage);
     if got != size {
-        anyhow::bail!(
-            "toolchain download size mismatch: got {got}, expected {size} for {url}"
-        );
+        anyhow::bail!("toolchain download size mismatch: got {got}, expected {size} for {url}");
     }
     // Keep the cache consistent with secrets/unit files: private (0600).
     #[cfg(unix)]
@@ -484,7 +506,8 @@ fn write_bytes(path: &Path, data: &[u8]) -> anyhow::Result<()> {
         .mode(0o600)
         .open(&tmp)
         .with_context(|| format!("writing {}", tmp.display()))?;
-    f.write_all(data).with_context(|| format!("writing {}", tmp.display()))?;
+    f.write_all(data)
+        .with_context(|| format!("writing {}", tmp.display()))?;
     f.sync_all().ok();
     drop(f);
     std::fs::rename(&tmp, path).with_context(|| format!("renaming {}", tmp.display()))?;
@@ -497,8 +520,14 @@ mod tests {
 
     #[test]
     fn tag_format_matches_go_convention() {
-        assert_eq!(toolchain_tag("1.27.0", "linux", "amd64"), "v0.0.1-go1.27.0.linux-amd64");
-        assert_eq!(toolchain_tag("go1.26.6", "darwin", "arm64"), "v0.0.1-go1.26.6.darwin-arm64");
+        assert_eq!(
+            toolchain_tag("1.27.0", "linux", "amd64"),
+            "v0.0.1-go1.27.0.linux-amd64"
+        );
+        assert_eq!(
+            toolchain_tag("go1.26.6", "darwin", "arm64"),
+            "v0.0.1-go1.26.6.darwin-arm64"
+        );
     }
 
     #[test]
@@ -573,7 +602,11 @@ mod tests {
         std::fs::write(p.join("go.mod"), "module probe.example\n\ngo 1.27.0\n").unwrap();
 
         let env = go_toolchain_env(&p, &[]).unwrap();
-        assert_eq!(env.len(), 3, "expected GOPROXY + GOTOOLCHAIN + GONOSUMDB, got {env:?}");
+        assert_eq!(
+            env.len(),
+            3,
+            "expected GOPROXY + GOTOOLCHAIN + GONOSUMDB, got {env:?}"
+        );
         assert!(env[0].0 == "GOPROXY" && env[0].1.starts_with("file://"));
         assert!(env[1] == ("GOTOOLCHAIN".to_string(), "auto".to_string()));
         assert!(
@@ -597,7 +630,11 @@ mod tests {
                  \t \n\
                  some random line h1:nope\n";
         let rows = go_sum_entries(s);
-        assert_eq!(rows.len(), 1, "only the three-field h1 row should parse: {rows:?}");
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the three-field h1 row should parse: {rows:?}"
+        );
         assert_eq!(rows[0].0, "github.com/foo/bar");
         assert_eq!(rows[0].1, "v1.2.3");
         assert_eq!(rows[0].2, "h1:AAA=");
@@ -626,21 +663,40 @@ mod tests {
         assert_eq!(first.ready, 1, "the pseudoversion row should seed once");
         assert!(first.failed.is_empty(), "no failures expected: {first:?}");
 
-        let vdir = p
-            .join(".ghost-cache/go-mod/cache/download/google.golang.org/genproto/googleapis/api/@v");
+        let vdir = p.join(
+            ".ghost-cache/go-mod/cache/download/google.golang.org/genproto/googleapis/api/@v",
+        );
         let zip = vdir.join("v0.0.0-20260810153831-ec0a7760b754.zip");
         assert!(zip.metadata().unwrap().len() > 0, "zip not fetched");
-        let ziphash = std::fs::read_to_string(vdir.join("v0.0.0-20260810153831-ec0a7760b754.ziphash"))
-            .unwrap();
+        let ziphash =
+            std::fs::read_to_string(vdir.join("v0.0.0-20260810153831-ec0a7760b754.ziphash"))
+                .unwrap();
         assert!(
-            ziphash.trim().ends_with("dWeMvEJ3JhYgqSCAHUZZJgMUyfniiiCvDc72x5EqJP0="),
+            ziphash
+                .trim()
+                .ends_with("dWeMvEJ3JhYgqSCAHUZZJgMUyfniiiCvDc72x5EqJP0="),
             "ziphash must carry the go.sum h1 line: {ziphash}"
         );
-        assert!(vdir.join("v0.0.0-20260810153831-ec0a7760b754.info").metadata().unwrap().len() > 0);
-        assert!(vdir.join("v0.0.0-20260810153831-ec0a7760b754.mod").metadata().unwrap().len() > 0);
+        assert!(
+            vdir.join("v0.0.0-20260810153831-ec0a7760b754.info")
+                .metadata()
+                .unwrap()
+                .len()
+                > 0
+        );
+        assert!(
+            vdir.join("v0.0.0-20260810153831-ec0a7760b754.mod")
+                .metadata()
+                .unwrap()
+                .len()
+                > 0
+        );
 
         let second = seed_go_modules(&p).unwrap();
-        assert_eq!(second.ready, 1, "second run sees the seeded zip and does nothing");
+        assert_eq!(
+            second.ready, 1,
+            "second run sees the seeded zip and does nothing"
+        );
         assert!(second.failed.is_empty(), "no failures expected: {second:?}");
         let _ = std::fs::remove_dir_all(&p);
     }

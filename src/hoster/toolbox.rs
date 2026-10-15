@@ -163,8 +163,7 @@ fn select_pin(tool: Tool, min: Option<Ver>, libc: Libc) -> anyhow::Result<&'stat
             continue;
         }
         match pin.libc {
-            Some(l)
-                if l == if libc == Libc::Musl { "musl" } else { "glibc" } => {}
+            Some(l) if l == if libc == Libc::Musl { "musl" } else { "glibc" } => {}
             Some(_) => continue,
             // Go's tarball is libc-agnostic.
             None => {}
@@ -178,20 +177,18 @@ fn select_pin(tool: Tool, min: Option<Ver>, libc: Libc) -> anyhow::Result<&'stat
             best = Some(pin);
         }
     }
-    best.ok_or_else(|| {
-        match (name, min) {
-            (_, Some(m)) => anyhow!(
-                "no pinned {name} >= {} for this platform/libc (pins: {}); the manifest \
+    best.ok_or_else(|| match (name, min) {
+        (_, Some(m)) => anyhow!(
+            "no pinned {name} >= {} for this platform/libc (pins: {}); the manifest \
                  would need a newer build than this release can provision. Install the \
                  tool system-wide or bump the pin table in toolbox.rs.",
-                crate::hoster::toolcheck::v_str(m),
-                pin_list(name)
-            ),
-            _ => anyhow!(
-                "no pinned {name} for this platform/libc (pins: {})",
-                pin_list(name)
-            ),
-        }
+            crate::hoster::toolcheck::v_str(m),
+            pin_list(name)
+        ),
+        _ => anyhow!(
+            "no pinned {name} for this platform/libc (pins: {})",
+            pin_list(name)
+        ),
     })
 }
 
@@ -199,13 +196,7 @@ fn pin_list(name: &str) -> String {
     TOOLBOX_PINS
         .iter()
         .filter(|p| p.tool == name)
-        .map(|p| {
-            format!(
-                "{}-{}",
-                p.version,
-                p.libc.unwrap_or("any")
-            )
-        })
+        .map(|p| format!("{}-{}", p.version, p.libc.unwrap_or("any")))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -282,8 +273,7 @@ pub fn provision(
     }
     let libc = detect_libc();
     let box_dir = toolbox_dir(project_dir);
-    std::fs::create_dir_all(&box_dir)
-        .with_context(|| format!("creating {}", box_dir.display()))?;
+    std::fs::create_dir_all(&box_dir).with_context(|| format!("creating {}", box_dir.display()))?;
     cleanup_tmp(&box_dir);
 
     let mut out = Provisioned::default();
@@ -323,18 +313,23 @@ fn provision_one(box_dir: &Path, pin: &'static Pin) -> anyhow::Result<PathBuf> {
             if stamp.is_file() && target.is_file() {
                 return Ok(bin_dir);
             }
-let bytes = fetch_verify(box_dir, pin)?;
-            let tmp = box_dir.join(format!(".tmp-{}", crate::atomic::random_hex(4).unwrap_or_default()));
-            std::fs::create_dir_all(&tmp)
-                .with_context(|| format!("creating {}", tmp.display()))?;
+            let bytes = fetch_verify(box_dir, pin)?;
+            let tmp = box_dir.join(format!(
+                ".tmp-{}",
+                crate::atomic::random_hex(4).unwrap_or_default()
+            ));
+            std::fs::create_dir_all(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
             let entry = zip_bin_entry(&bytes, pin.tool)
                 .with_context(|| format!("extracting {} from {}", pin.tool, pin.asset))?;
             std::fs::create_dir_all(&bin_dir)?;
-            let staged = bin_dir.join(format!(".tmp-{}-{}", pin.tool, crate::atomic::random_hex(3).unwrap_or_default()));
+            let staged = bin_dir.join(format!(
+                ".tmp-{}-{}",
+                pin.tool,
+                crate::atomic::random_hex(3).unwrap_or_default()
+            ));
             write_executable(&staged, &entry)?;
-            std::fs::rename(&staged, &target).with_context(|| {
-                format!("placing {} into {}", pin.asset, target.display())
-            })?;
+            std::fs::rename(&staged, &target)
+                .with_context(|| format!("placing {} into {}", pin.asset, target.display()))?;
             let _ = std::fs::remove_dir_all(&tmp);
             write_stamp(&stamp)?;
             Ok(bin_dir)
@@ -345,7 +340,10 @@ let bytes = fetch_verify(box_dir, pin)?;
             if bin.is_file() {
                 return Ok(dir);
             }
-            let tmp = box_dir.join(format!(".tmp-{}", crate::atomic::random_hex(4).unwrap_or_default()));
+            let tmp = box_dir.join(format!(
+                ".tmp-{}",
+                crate::atomic::random_hex(4).unwrap_or_default()
+            ));
             unpack_tree(&tmp, box_dir, pin)?;
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::rename(&tmp, &dir)
@@ -359,7 +357,10 @@ let bytes = fetch_verify(box_dir, pin)?;
             if bin.is_file() {
                 return Ok(dir.join("bin"));
             }
-            let tmp = box_dir.join(format!(".tmp-{}", crate::atomic::random_hex(4).unwrap_or_default()));
+            let tmp = box_dir.join(format!(
+                ".tmp-{}",
+                crate::atomic::random_hex(4).unwrap_or_default()
+            ));
             unpack_tree(&tmp, box_dir, pin)?;
             let src = tmp.join("go");
             if !src.join("bin").join("go").is_file() {
@@ -417,8 +418,7 @@ fn fetch_sharded(box_dir: &Path, pin: &'static Pin, size: u64) -> anyhow::Result
         ".tmp-fetch-{}",
         crate::atomic::random_hex(4).unwrap_or_default()
     ));
-    std::fs::create_dir_all(&stage)
-        .with_context(|| format!("creating {}", stage.display()))?;
+    std::fs::create_dir_all(&stage).with_context(|| format!("creating {}", stage.display()))?;
     let segs = size.div_ceil(SEGMENT);
     let seg_len = move |i: u64| ((i + 1) * SEGMENT).min(size) - i * SEGMENT;
     let next = Arc::new(Mutex::new(0u64));
@@ -432,49 +432,52 @@ fn fetch_sharded(box_dir: &Path, pin: &'static Pin, size: u64) -> anyhow::Result
         let aborted = Arc::clone(&aborted);
         let url = pin.url.to_string();
         let stage = stage.clone();
-        handles.push(std::thread::spawn(move || loop {
-            if aborted.load(Ordering::SeqCst) {
-                break;
-            }
-            let i = {
-                let mut g = next.lock().unwrap();
-                let i = *g;
-                *g += 1;
-                i
-            };
-            if i >= segs {
-                break;
-            }
-            let part = stage.join(format!("{i:07}"));
-            if part.metadata().map(|m| m.len()).unwrap_or(0) == seg_len(i) {
-                continue;
-            }
-            let start = i * SEGMENT;
-            let end = ((i + 1) * SEGMENT - 1).min(size - 1);
-            match crate::hoster::httpclient::get_bytes_range(&url, start, end) {
-                Ok(bytes) => {
-                    if bytes.len() as u64 != seg_len(i) {
-                        *failure.lock().unwrap() = Some(anyhow!(
-                            "short range {}..={} for {} (got {} of {} bytes)",
-                            start,
-                            end,
-                            url,
-                            bytes.len(),
-                            seg_len(i)
-                        ));
-                        aborted.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                    if let Err(e) = std::fs::write(&part, &bytes) {
-                        *failure.lock().unwrap() = Some(anyhow!("writing {}: {e}", part.display()));
-                        aborted.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                }
-                Err(e) => {
-                    *failure.lock().unwrap() = Some(e);
-                    aborted.store(true, Ordering::SeqCst);
+        handles.push(std::thread::spawn(move || {
+            loop {
+                if aborted.load(Ordering::SeqCst) {
                     break;
+                }
+                let i = {
+                    let mut g = next.lock().unwrap();
+                    let i = *g;
+                    *g += 1;
+                    i
+                };
+                if i >= segs {
+                    break;
+                }
+                let part = stage.join(format!("{i:07}"));
+                if part.metadata().map(|m| m.len()).unwrap_or(0) == seg_len(i) {
+                    continue;
+                }
+                let start = i * SEGMENT;
+                let end = ((i + 1) * SEGMENT - 1).min(size - 1);
+                match crate::hoster::httpclient::get_bytes_range(&url, start, end) {
+                    Ok(bytes) => {
+                        if bytes.len() as u64 != seg_len(i) {
+                            *failure.lock().unwrap() = Some(anyhow!(
+                                "short range {}..={} for {} (got {} of {} bytes)",
+                                start,
+                                end,
+                                url,
+                                bytes.len(),
+                                seg_len(i)
+                            ));
+                            aborted.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        if let Err(e) = std::fs::write(&part, &bytes) {
+                            *failure.lock().unwrap() =
+                                Some(anyhow!("writing {}: {e}", part.display()));
+                            aborted.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        *failure.lock().unwrap() = Some(e);
+                        aborted.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 }
             }
         }));
@@ -504,11 +507,8 @@ fn write_executable(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 }
 
 fn set_executable(path: &Path) -> anyhow::Result<()> {
-    std::fs::set_permissions(
-        path,
-        Permissions::from_mode(0o755),
-    )
-    .with_context(|| format!("chmod +x {}", path.display()))
+    std::fs::set_permissions(path, Permissions::from_mode(0o755))
+        .with_context(|| format!("chmod +x {}", path.display()))
 }
 
 fn write_stamp(stamp: &Path) -> anyhow::Result<()> {
@@ -531,13 +531,15 @@ fn zip_bin_entry(bytes: &[u8], tool: &str) -> anyhow::Result<Vec<u8>> {
         }
         if path.ends_with(&wanted) {
             let mut buf = Vec::with_capacity(file.size() as usize);
-            file.read_to_end(&mut buf).context("reading zip entry body")?;
+            file.read_to_end(&mut buf)
+                .context("reading zip entry body")?;
             hit = Some((path, buf));
             break;
         }
     }
-    hit.map(|(_, b)| b)
-        .ok_or_else(|| anyhow!("no entry ending in '{wanted}' inside the zip (bun layout changed?)"))
+    hit.map(|(_, b)| b).ok_or_else(|| {
+        anyhow!("no entry ending in '{wanted}' inside the zip (bun layout changed?)")
+    })
 }
 
 /// Extract a gzip'd tar tree into `dest`. Used for the standalone pnpm and Go
@@ -565,11 +567,14 @@ mod tests {
             assert_eq!(pin.sha256.len(), 64, "{}", pin.asset);
             assert!(
                 pin.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
-                "{}: {}", pin.asset, pin.sha256
+                "{}: {}",
+                pin.asset,
+                pin.sha256
             );
             assert!(
                 pin.url.starts_with("https://"),
-                "{} must be https", pin.asset
+                "{} must be https",
+                pin.asset
             );
         }
     }
@@ -580,11 +585,13 @@ mod tests {
             match pin.kind {
                 Pack::ZipBin => assert!(
                     pin.asset.ends_with(".zip"),
-                    "{}: ZipBin asset must be a zip", pin.asset
+                    "{}: ZipBin asset must be a zip",
+                    pin.asset
                 ),
                 Pack::StandaloneTree | Pack::GoTree => assert!(
                     pin.asset.ends_with(".tar.gz"),
-                    "{}: tree asset must be a tar.gz", pin.asset
+                    "{}: tree asset must be a tar.gz",
+                    pin.asset
                 ),
             }
         }

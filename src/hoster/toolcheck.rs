@@ -399,8 +399,7 @@ pub fn manifest_requirements(project_dir: &Path) -> Vec<(Tool, Ver)> {
 fn provision_note(service: &str, tool: Tool, min: Ver, gap: &Gap) -> String {
     let name = tool.label();
     let bin = tool.bin();
-    let suffix =
-        " — a pinned, SHA-256-verified build will be provisioned into this project's \
+    let suffix = " — a pinned, SHA-256-verified build will be provisioned into this project's \
          .ghost-cache for the deploy (this software never installs system packages)";
     match gap {
         Gap::Missing => format!(
@@ -432,8 +431,7 @@ pub fn check_findings(project_dir: &Path, service: &str) -> Vec<Finding> {
                     blocking: false,
                     text: provision_note(service, *t, *m, g),
                 }
-            } else if matches!((t, g), (Tool::Go, Gap::Outdated { .. })) && toolchain_auto_fetch()
-            {
+            } else if matches!((t, g), (Tool::Go, Gap::Outdated { .. })) && toolchain_auto_fetch() {
                 // Installable-but-old Go under auto-toolchain mode: the
                 // existing informational note (toolchain fetched from the
                 // seeded file:// proxy during the build).

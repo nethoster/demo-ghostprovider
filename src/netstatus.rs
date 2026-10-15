@@ -164,10 +164,7 @@ mod tests {
     #[test]
     fn first_failure_reports_and_second_is_silent() {
         *STATE.lock().unwrap() = None;
-        assert!(
-            note_down("github.com"),
-            "first failure must emit one line"
-        );
+        assert!(note_down("github.com"), "first failure must emit one line");
         let s1 = summary().expect("down after first failure");
         assert_eq!(s1.down_hosts, 1);
         assert!(
