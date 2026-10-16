@@ -59,18 +59,12 @@ pub(crate) const MAIN_MENU: &[(&str, &str, &str, Color)] = &[
         "probe interfaces and occupied ports",
         ACCENT,
     ),
+    ("#", "Self-hosting", "manage deployed units", OK_GREEN),
     (
         "^",
         "Deploy Service",
         "deploy via GitHub URL or service.yaml",
         MAGENTA,
-    ),
-    ("#", "Self-hosting", "manage deployed units", OK_GREEN),
-    (
-        "≡",
-        "Logs",
-        "deploy + software + crash logs (3 screens)",
-        WARN_YELLOW,
     ),
     (
         "+",
@@ -79,6 +73,12 @@ pub(crate) const MAIN_MENU: &[(&str, &str, &str, Color)] = &[
         VIOLET,
     ),
     ("♥", "My Services", "your added services", BLUE),
+    (
+        "≡",
+        "Logs",
+        "deploy + software + crash logs (3 screens)",
+        WARN_YELLOW,
+    ),
 ];
 
 // Hard bound on the deploy log held in memory. A heavy build (a SvelteKit +
@@ -768,7 +768,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 return Flow::Continue;
             }
             match key {
-                KeyCode::Esc => app.screen = Screen::Main { selected: 1 },
+                KeyCode::Esc => app.screen = Screen::Main { selected: 2 },
                 KeyCode::Backspace => {
                     buffer.pop();
                 }
@@ -836,7 +836,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
         Screen::Deploy { .. } => {
             let finished = matches!(app.screen, Screen::Deploy { done: Some(_), .. });
             if finished && (matches!(key, KeyCode::Enter | KeyCode::Esc) || cmd == Some('q')) {
-                app.screen = Screen::Main { selected: 1 };
+                app.screen = Screen::Main { selected: 2 };
             }
         }
         Screen::Services {
@@ -847,11 +847,11 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             let _ = message; // status messages surface via the actions below
             let count = rows.len();
             match key {
-                KeyCode::Esc => app.screen = Screen::Main { selected: 2 },
+                KeyCode::Esc => app.screen = Screen::Main { selected: 1 },
                 KeyCode::Up if count > 0 => *selected = selected.saturating_sub(1),
                 KeyCode::Down if count > 0 => *selected = (*selected + 1).min(count - 1),
                 _ => match cmd {
-                    Some('q') => app.screen = Screen::Main { selected: 2 },
+                    Some('q') => app.screen = Screen::Main { selected: 1 },
                     Some('k') if count > 0 => *selected = selected.saturating_sub(1),
                     Some('j') if count > 0 => *selected = (*selected + 1).min(count - 1),
                     Some('r') if count > 0 => {
@@ -985,7 +985,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 };
             } else if exit {
                 stop_log_tailers(app);
-                app.screen = Screen::Main { selected: 3 };
+                app.screen = Screen::Main { selected: 5 };
             }
         }
         Screen::ConfirmClear {
@@ -1119,7 +1119,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             // navigation disarms a pending delete.
             let last = lib_row_count(files.len()).saturating_sub(1);
             match key {
-                KeyCode::Esc => app.screen = Screen::Main { selected: 4 },
+                KeyCode::Esc => app.screen = Screen::Main { selected: 3 },
                 KeyCode::Up => {
                     *selected = selected.saturating_sub(1);
                     *armed_delete = None;
@@ -1159,7 +1159,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     None => {}
                 },
                 _ => match cmd {
-                    Some('q') => app.screen = Screen::Main { selected: 4 },
+                    Some('q') => app.screen = Screen::Main { selected: 3 },
                     Some('k') => {
                         *selected = selected.saturating_sub(1);
                         *armed_delete = None;
@@ -1269,7 +1269,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
         } => {
             let count = files.len();
             match key {
-                KeyCode::Esc => app.screen = Screen::Main { selected: 5 },
+                KeyCode::Esc => app.screen = Screen::Main { selected: 4 },
                 KeyCode::Up if count > 0 => {
                     *selected = selected.saturating_sub(1);
                 }
@@ -1312,7 +1312,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     }
                 }
                 _ => match cmd {
-                    Some('q') => app.screen = Screen::Main { selected: 5 },
+                    Some('q') => app.screen = Screen::Main { selected: 4 },
                     Some('k') if count > 0 => {
                         *selected = selected.saturating_sub(1);
                     }
@@ -1727,13 +1727,6 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
             };
         }
         1 => {
-            app.screen = Screen::UrlInput {
-                buffer: String::new(),
-                error: None,
-                busy: false,
-            }
-        }
-        2 => {
             let rows = workers::service_rows();
             app.screen = Screen::Services {
                 rows,
@@ -1741,7 +1734,35 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                 message: None,
             };
         }
+        2 => {
+            app.screen = Screen::UrlInput {
+                buffer: String::new(),
+                error: None,
+                busy: false,
+            }
+        }
         3 => {
+            app.screen = Screen::AddService {
+                files: crate::hoster::library::list(),
+                selected: 0,
+                message: None,
+                armed_delete: None,
+            };
+        }
+        4 => {
+            let files = crate::hoster::library::list();
+            let deployed: Vec<String> = crate::state::list()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            app.screen = Screen::UserServices {
+                files,
+                deployed,
+                selected: 0,
+                message: None,
+            };
+        }
+        5 => {
             // Deploy logs: single shared file is the source of truth so every
             // window streams the same live deploy. File survives across processes.
             let mut deploy_lines = workers::read_deploy_log();
@@ -1787,27 +1808,6 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                 scroll: 0,
             };
             start_log_tailers(app);
-        }
-        4 => {
-            app.screen = Screen::AddService {
-                files: crate::hoster::library::list(),
-                selected: 0,
-                message: None,
-                armed_delete: None,
-            };
-        }
-        5 => {
-            let files = crate::hoster::library::list();
-            let deployed: Vec<String> = crate::state::list()
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect();
-            app.screen = Screen::UserServices {
-                files,
-                deployed,
-                selected: 0,
-                message: None,
-            };
         }
         _ => {}
     }
@@ -3790,11 +3790,11 @@ mod tests {
             titles,
             vec![
                 "System Scan",
-                "Deploy Service",
                 "Self-hosting",
-                "Logs",
+                "Deploy Service",
                 "Add Service",
-                "My Services"
+                "My Services",
+                "Logs"
             ]
         );
     }

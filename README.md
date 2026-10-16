@@ -127,11 +127,11 @@ This demo ships three built-in `service.yaml` manifests (`docs/MANIFEST.md`):
 Custom services use the same format: `demo-ghostprovider __check-manifest service.yaml`
 validates and prints the deploy plan, `demo-ghostprovider __deploy --manifest service.yaml`
 deploys it through the identical sandbox + loopback + cleanup pipeline.
-In the panel, menu item 5 (Add Service) imports `service.yaml` files into your
+In the panel, menu item 4 (Add Service) imports `service.yaml` files into your
 library (`~/.local/share/demo-ghostprovider/manifests/`) for one-key redeploys,
 or walks you through writing one with the built-in 9-step wizard (first row).
-Menu item 6 (My Services) lists your added services with deploy status;
-item 3 (Self-hosting) manages the actually deployed units.
+Menu item 5 (My Services) lists your added services with deploy status;
+item 2 (Self-hosting) manages the actually deployed units.
 
 ## Install
 
