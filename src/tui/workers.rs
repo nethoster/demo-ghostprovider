@@ -287,6 +287,11 @@ pub fn classify_deploy_input(input: &str) -> Result<DeployTarget, String> {
     }
 }
 
+/// First line of an anyhow error, capped for one-line UI error slots.
+pub(crate) fn short_error_for(e: &anyhow::Error) -> String {
+    short_error(e)
+}
+
 /// First line of an anyhow error, capped for the one-line input error slot.
 fn short_error(e: &anyhow::Error) -> String {
     let first = format!("{e:#}")

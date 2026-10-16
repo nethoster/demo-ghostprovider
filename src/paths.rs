@@ -36,6 +36,13 @@ pub fn services_dir() -> PathBuf {
     data_home().join("demo-ghostprovider/services")
 }
 
+/// User's manifest library: imported `service.yaml` files live here as
+/// `<service-id>.yaml` so the Add Service screen can list, re-validate and
+/// redeploy them without retyping paths.
+pub fn manifests_dir() -> PathBuf {
+    data_home().join("demo-ghostprovider/manifests")
+}
+
 /// Registry of deployed services: ~/.local/state/demo-ghostprovider/state.json
 pub fn state_file() -> PathBuf {
     state_home().join("demo-ghostprovider/state.json")

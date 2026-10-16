@@ -49,6 +49,36 @@ const RAMP: [Color; 3] = [ACCENT, MAGENTA, WARN_YELLOW];
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/// Main menu: (icon, title, description, hue). Navigation caps, activation
+/// and the menu test derive from this, so adding an item cannot desync them.
+pub(crate) const MAIN_MENU: &[(&str, &str, &str, Color)] = &[
+    (
+        "@",
+        "System Scan",
+        "probe interfaces and occupied ports",
+        ACCENT,
+    ),
+    (
+        "^",
+        "Deploy Service",
+        "deploy via GitHub URL or service.yaml",
+        MAGENTA,
+    ),
+    ("#", "My Services", "manage deployed units", OK_GREEN),
+    (
+        "≡",
+        "Logs",
+        "deploy + software + crash logs (3 screens)",
+        WARN_YELLOW,
+    ),
+    (
+        "+",
+        "Add Service",
+        "import service.yaml into your library",
+        VIOLET,
+    ),
+];
+
 // Hard bound on the deploy log held in memory. A heavy build (a SvelteKit +
 // wasm app, a large Python project) can emit tens of thousands of lines; the
 // deploy screen re-wraps the entire buffer every ~80ms tick, so unbounded
@@ -143,6 +173,19 @@ pub(crate) enum Screen {
     ConfirmClear {
         target: LogView,
         yes_selected: bool,
+    },
+    /// Manifest library (menu "Add Service"): imported `service.yaml` files.
+    AddService {
+        files: Vec<crate::hoster::library::LibraryEntry>,
+        selected: usize,
+        message: Option<String>,
+        /// Armed delete: first `d` arms for this id, second `d` deletes it.
+        armed_delete: Option<String>,
+    },
+    /// Import prompt: path to a `service.yaml` file to copy into the library.
+    Import {
+        buffer: String,
+        error: Option<String>,
     },
 }
 
@@ -570,7 +613,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             KeyCode::Esc => return Flow::Exit,
             _ => match cmd {
                 Some('k') | Some('h') => *selected = selected.saturating_sub(1),
-                Some('j') | Some('l') => *selected = (*selected + 1).min(3),
+                Some('j') | Some('l') => *selected = (*selected + 1).min(MAIN_MENU.len() - 1),
                 Some('q') => return Flow::Exit,
                 _ => {}
             },
@@ -930,6 +973,125 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 None => {}
             }
         }
+        Screen::AddService {
+            files,
+            selected,
+            message,
+            armed_delete,
+        } => {
+            let count = files.len();
+            // Any navigation disarms a pending delete.
+            match key {
+                KeyCode::Esc => app.screen = Screen::Main { selected: 4 },
+                KeyCode::Up if count > 0 => {
+                    *selected = selected.saturating_sub(1);
+                    *armed_delete = None;
+                }
+                KeyCode::Down if count > 0 => {
+                    *selected = (*selected + 1).min(count - 1);
+                    *armed_delete = None;
+                }
+                KeyCode::Enter if count > 0 => {
+                    if let Some(f) = files.get(*selected) {
+                        let path = f.path.display().to_string();
+                        match workers::classify_deploy_input(&path) {
+                            Ok(target) => {
+                                app.screen = Screen::Confirm {
+                                    target,
+                                    yes_selected: true,
+                                };
+                            }
+                            Err(e) => *message = Some(e),
+                        }
+                    }
+                }
+                _ => match cmd {
+                    Some('q') => app.screen = Screen::Main { selected: 4 },
+                    Some('k') if count > 0 => {
+                        *selected = selected.saturating_sub(1);
+                        *armed_delete = None;
+                    }
+                    Some('j') if count > 0 => {
+                        *selected = (*selected + 1).min(count - 1);
+                        *armed_delete = None;
+                    }
+                    Some('a') | Some('i') => {
+                        app.screen = Screen::Import {
+                            buffer: String::new(),
+                            error: None,
+                        }
+                    }
+                    Some('r') => {
+                        *files = crate::hoster::library::list();
+                        if *selected >= files.len() {
+                            *selected = files.len().saturating_sub(1);
+                        }
+                        *message = Some("refreshed".into());
+                    }
+                    Some('d') if count > 0 => {
+                        if let Some(f) = files.get(*selected).cloned() {
+                            if armed_delete.as_deref() == Some(f.id.as_str()) {
+                                match crate::hoster::library::remove(&f.id) {
+                                    Ok(true) => {
+                                        *message = Some(format!("removed {} from library", f.id));
+                                    }
+                                    Ok(false) => {
+                                        *message = Some(format!("{} is already gone", f.id));
+                                    }
+                                    Err(e) => *message = Some(format!("! {e:#}")),
+                                }
+                                *armed_delete = None;
+                                *files = crate::hoster::library::list();
+                                if *selected >= files.len() {
+                                    *selected = files.len().saturating_sub(1);
+                                }
+                            } else {
+                                *armed_delete = Some(f.id.clone());
+                                *message =
+                                    Some(format!("press d again to delete {} from library", f.id));
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
+        Screen::Import { buffer, error } => match key {
+            KeyCode::Esc => {
+                app.screen = Screen::AddService {
+                    files: crate::hoster::library::list(),
+                    selected: 0,
+                    message: None,
+                    armed_delete: None,
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Enter => {
+                if buffer.trim().is_empty() {
+                    *error = Some("enter a path to service.yaml".into());
+                } else {
+                    let path = crate::hoster::manifest::expand_manifest_path(buffer.trim());
+                    match crate::hoster::library::import(&path) {
+                        Ok(id) => {
+                            let files = crate::hoster::library::list();
+                            let selected = files.iter().position(|f| f.id == id).unwrap_or(0);
+                            app.screen = Screen::AddService {
+                                files,
+                                selected,
+                                message: Some(format!("imported {id}")),
+                                armed_delete: None,
+                            };
+                        }
+                        Err(e) => *error = Some(workers::short_error_for(&e)),
+                    }
+                }
+            }
+            // Raw char: paths must be typed verbatim on any layout.
+            KeyCode::Char(c) => buffer.push(c),
+            _ => {}
+        },
     }
     Flow::Continue
 }
@@ -937,7 +1099,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
 fn move_main_selection(selected: &mut usize, key: KeyCode) {
     match key {
         KeyCode::Up | KeyCode::Left => *selected = selected.saturating_sub(1),
-        _ => *selected = (*selected + 1).min(3),
+        _ => *selected = (*selected + 1).min(MAIN_MENU.len() - 1),
     }
 }
 
@@ -1013,6 +1175,14 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                 scroll: 0,
             };
             start_log_tailers(app);
+        }
+        4 => {
+            app.screen = Screen::AddService {
+                files: crate::hoster::library::list(),
+                selected: 0,
+                message: None,
+                armed_delete: None,
+            };
         }
         _ => {}
     }
@@ -1274,6 +1444,24 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         } => {
             draw_confirm_clear(f, chunks[1], *target, *yes_selected);
         }
+        Screen::AddService {
+            files,
+            selected,
+            message,
+            armed_delete,
+        } => {
+            draw_add_service(
+                f,
+                chunks[1],
+                files,
+                *selected,
+                message.as_deref(),
+                armed_delete.as_deref(),
+            );
+        }
+        Screen::Import { buffer, error } => {
+            draw_import(f, chunks[1], buffer, error.as_deref(), app.tick);
+        }
     }
 
     f.render_widget(Paragraph::new(hint_line(&app.screen)), chunks[2]);
@@ -1310,28 +1498,7 @@ fn draw_header(f: &mut ratatui::Frame, area: ratatui::prelude::Rect) {
 // --- main menu --------------------------------------------------------------
 
 fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected: usize) {
-    let items = [
-        (
-            "@",
-            "System Scan",
-            "probe interfaces and occupied ports",
-            ACCENT,
-        ),
-        (
-            "^",
-            "Deploy Service",
-            "deploy via GitHub URL or service.yaml",
-            MAGENTA,
-        ),
-        ("#", "My Services", "manage deployed units", OK_GREEN),
-        (
-            "≡",
-            "Logs",
-            "deploy + software + crash logs (3 screens)",
-            WARN_YELLOW,
-        ),
-    ];
-    let list = List::new(items.iter().enumerate().map(|(i, (icon, t, d, hue))| {
+    let list = List::new(MAIN_MENU.iter().enumerate().map(|(i, (icon, t, d, hue))| {
         let sel = i == selected;
         let marker = if sel { " » " } else { "   " };
         ListItem::new(Line::from(vec![
@@ -1799,6 +1966,139 @@ fn draw_confirm_clear(
     );
 }
 
+// --- add service (manifest library) -----------------------------------------
+
+fn draw_add_service(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    files: &[crate::hoster::library::LibraryEntry],
+    selected: usize,
+    message: Option<&str>,
+    armed_delete: Option<&str>,
+) {
+    if files.is_empty() {
+        let mut text = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " No service.yaml files in your library yet.",
+                Style::default().fg(BODY),
+            )),
+            Line::from(Span::styled(
+                " Press a to import one from disk.",
+                Style::default().fg(DIM),
+            )),
+        ];
+        if let Some(m) = message {
+            text.push(Line::from(""));
+            text.push(Line::from(Span::styled(
+                format!(" {m}"),
+                Style::default().fg(WARN_YELLOW),
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .block(block("Add Service", VIOLET)),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = files
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let sel = i == selected;
+            let marker = if sel { " » " } else { "   " };
+            let (status, hue) = if e.valid {
+                ("ready", OK_GREEN)
+            } else {
+                ("invalid", ERR_RED)
+            };
+            let mut spans = vec![
+                Span::styled(marker, Style::default().fg(if sel { VIOLET } else { DIM })),
+                Span::styled(
+                    e.id.clone(),
+                    Style::default()
+                        .fg(if sel { Color::White } else { BODY })
+                        .add_modifier(if sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(format!("  [{status}]"), Style::default().fg(hue)),
+            ];
+            if let Some(src) = e.source_git.as_deref() {
+                spans.push(Span::styled(format!("  {src}"), Style::default().fg(DIM)));
+            } else if let Some(err) = e.error.as_deref() {
+                spans.push(Span::styled(
+                    format!("  {err}"),
+                    Style::default().fg(ERR_RED),
+                ));
+            }
+            if armed_delete == Some(e.id.as_str()) {
+                spans.push(Span::styled(
+                    "  ← press d again to delete",
+                    Style::default().fg(ERR_RED).add_modifier(Modifier::BOLD),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut block_widget = block("Add Service", VIOLET);
+    if let Some(m) = message {
+        block_widget = block_widget.title_bottom(Span::styled(
+            format!(" {m} "),
+            Style::default().fg(WARN_YELLOW),
+        ));
+    }
+    f.render_widget(List::new(items).block(block_widget), area);
+}
+
+fn draw_import(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    buffer: &str,
+    error: Option<&str>,
+    tick: u64,
+) {
+    let mut text = vec![
+        Line::from(Span::styled(
+            " Copy a service.yaml file into your library (~/.local/share/demo-ghostprovider/manifests).",
+            Style::default().fg(DIM),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Manifest file path: ", Style::default().fg(VIOLET)),
+            Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
+            cursor_span(tick),
+        ]),
+    ];
+    if let Some(e) = error {
+        text.push(Line::from(Span::styled(
+            format!(" x {e}"),
+            Style::default().fg(ERR_RED),
+        )));
+    } else if !buffer.trim().is_empty() {
+        let (mark, msg, color) = if crate::hoster::manifest::looks_like_manifest_path(buffer.trim())
+        {
+            ("+", " looks like a service.yaml path", OK_GREEN)
+        } else {
+            ("△", " expected /path/to/service.yaml", WARN_YELLOW)
+        };
+        text.push(Line::from(Span::styled(
+            format!(" {mark}{msg}"),
+            Style::default().fg(color),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block("Import service.yaml", VIOLET)),
+        area,
+    );
+}
+
 /// Blinking terminal-style cursor block.
 fn cursor_span(tick: u64) -> Span<'static> {
     if (tick / 4).is_multiple_of(2) {
@@ -2238,6 +2538,14 @@ fn hint_line(screen: &Screen) -> Line<'static> {
             ("Enter confirm", OK_GREEN),
             ("Esc cancel", WARN_YELLOW),
         ],
+        Screen::AddService { .. } => vec![
+            ("Enter deploy", OK_GREEN),
+            ("a import", VIOLET),
+            ("d delete", ERR_RED),
+            ("r refresh", BLUE),
+            ("Esc back", WARN_YELLOW),
+        ],
+        Screen::Import { .. } => vec![("Enter import", OK_GREEN), ("Esc back", WARN_YELLOW)],
     };
     let mut spans: Vec<Span> = Vec::new();
     for (i, (text, color)) in pairs.iter().enumerate() {
@@ -2266,6 +2574,22 @@ fn block(title: &str, color: Color) -> Block<'_> {
 mod tests {
     use super::*;
 
+    /// The menu is the single source of truth: five items, Add Service last.
+    /// Navigation caps derive from MAIN_MENU so this guards desync.
+    #[test]
+    fn main_menu_lists_five_items_ending_with_add_service() {
+        let titles: Vec<&str> = MAIN_MENU.iter().map(|(_, t, _, _)| *t).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "System Scan",
+                "Deploy Service",
+                "My Services",
+                "Logs",
+                "Add Service"
+            ]
+        );
+    }
     /// Port rows: our deployments render yellow bold; anonymous occupied
     /// ports render violet bold — both without any owner data.
     #[test]

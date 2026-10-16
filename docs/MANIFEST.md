@@ -68,6 +68,19 @@ demo-ghostprovider __deploy --manifest service.yaml
 source/revision, host-prefetch vs offline-build steps, run command, port
 and limits.
 
+## Library (Add Service screen)
+
+The panel's 5th menu item keeps your own manifests in
+`~/.local/share/demo-ghostprovider/manifests/<service-id>.yaml`:
+
+* `a` imports a file from disk (validated before copying; duplicates are
+  refused — delete the stored one first to replace it),
+* `Enter` deploys the selected file through the same Confirm gate and the
+  same sandbox + loopback + cleanup pipeline as everything else,
+* `d` twice deletes the stored file (the deployed service, if any, is
+  untouched — remove it separately from My Services),
+* `r` refreshes the list (files are re-validated on every listing).
+
 ## Built-ins
 
 `src/hoster/manifests/{vert,searxng,memos}.yaml` are the three former
