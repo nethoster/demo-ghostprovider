@@ -253,11 +253,28 @@ pub(crate) enum Screen {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum LogView {
     Deploy,
     Software,
     Crash,
+}
+
+/// Logs tab order: Deploy → Software → Crash → Deploy (Tab/→), reverse on ←.
+fn logs_tab_next(view: LogView) -> LogView {
+    match view {
+        LogView::Deploy => LogView::Software,
+        LogView::Software => LogView::Crash,
+        LogView::Crash => LogView::Deploy,
+    }
+}
+
+fn logs_tab_prev(view: LogView) -> LogView {
+    match view {
+        LogView::Deploy => LogView::Crash,
+        LogView::Software => LogView::Deploy,
+        LogView::Crash => LogView::Software,
+    }
 }
 
 pub(crate) enum Msg {
@@ -935,12 +952,12 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             let mut clear_target: Option<LogView> = None;
             match key {
                 KeyCode::Esc | KeyCode::Enter => exit = true,
-                KeyCode::Tab | KeyCode::Right | KeyCode::Left => {
-                    *view = match view {
-                        LogView::Deploy => LogView::Software,
-                        LogView::Software => LogView::Crash,
-                        LogView::Crash => LogView::Deploy,
-                    };
+                KeyCode::Tab | KeyCode::Right => {
+                    *view = logs_tab_next(*view);
+                    *scroll = 0;
+                }
+                KeyCode::Left => {
+                    *view = logs_tab_prev(*view);
                     *scroll = 0;
                 }
                 KeyCode::Up => *scroll = scroll.saturating_sub(1),
@@ -3780,6 +3797,23 @@ mod tests {
                 "My Services"
             ]
         );
+    }
+
+    /// ←/→ walk the Logs tabs in opposite directions (left must not act as
+    /// right — that was the reported bug).
+    #[test]
+    fn logs_tabs_cycle_forward_and_backward() {
+        use LogView as V;
+        assert_eq!(logs_tab_next(V::Deploy), V::Software);
+        assert_eq!(logs_tab_next(V::Software), V::Crash);
+        assert_eq!(logs_tab_next(V::Crash), V::Deploy);
+        assert_eq!(logs_tab_prev(V::Deploy), V::Crash);
+        assert_eq!(logs_tab_prev(V::Crash), V::Software);
+        assert_eq!(logs_tab_prev(V::Software), V::Deploy);
+        for v in [V::Deploy, V::Software, V::Crash] {
+            assert_eq!(logs_tab_prev(logs_tab_next(v)), v);
+            assert_eq!(logs_tab_next(logs_tab_prev(v)), v);
+        }
     }
 
     #[test]
