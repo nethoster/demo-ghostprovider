@@ -75,6 +75,10 @@ The panel's 5th menu item keeps your own manifests in
 
 * `a` imports a file from disk (validated before copying; duplicates are
   refused — delete the stored one first to replace it),
+* `n` starts the built-in wizard: 9 plain questions (name → git URL →
+  commit pin → build profile → download steps → build steps → run command
+  and port → memory/task limits → YAML review), then Enter saves the file
+  into the library,
 * `Enter` deploys the selected file through the same Confirm gate and the
   same sandbox + loopback + cleanup pipeline as everything else,
 * `d` twice deletes the stored file (the deployed service, if any, is

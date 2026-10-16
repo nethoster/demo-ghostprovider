@@ -9,6 +9,7 @@
 //! · red errors · violet scan sections). The event loop ticks ~80ms; the
 //! title gradient and busy spinners are driven off that tick.
 
+pub mod wizard;
 pub mod workers;
 
 use std::collections::{HashMap, HashSet};
@@ -185,6 +186,57 @@ pub(crate) enum Screen {
     /// Import prompt: path to a `service.yaml` file to copy into the library.
     Import {
         buffer: String,
+        error: Option<String>,
+    },
+    /// New-service wizard: one question per screen, "Step n/9" in the title.
+    /// Each screen carries the [`wizard::Draft`] built so far; Esc walks back.
+    WzId {
+        buffer: String,
+        error: Option<String>,
+        draft: wizard::Draft,
+    },
+    WzGit {
+        buffer: String,
+        error: Option<String>,
+        draft: wizard::Draft,
+    },
+    WzCommit {
+        buffer: String,
+        error: Option<String>,
+        draft: wizard::Draft,
+    },
+    WzProfile {
+        selected: usize,
+        draft: wizard::Draft,
+    },
+    WzPrefetch {
+        editor: wizard::StepEditor,
+        draft: wizard::Draft,
+    },
+    WzBuild {
+        editor: wizard::StepEditor,
+        draft: wizard::Draft,
+    },
+    WzRun {
+        cmd: String,
+        port: String,
+        /// Tab switches between the two fields.
+        focus_port: bool,
+        error: Option<String>,
+        draft: wizard::Draft,
+    },
+    WzRes {
+        memory: String,
+        tasks: String,
+        /// Tab switches between the two fields.
+        focus_tasks: bool,
+        error: Option<String>,
+        draft: wizard::Draft,
+    },
+    WzReview {
+        draft: wizard::Draft,
+        /// Rendered YAML, or None when the draft does not validate (error set).
+        yaml: Option<String>,
         error: Option<String>,
     },
 }
@@ -484,6 +536,61 @@ fn event_loop(
             }
         }
     }
+}
+
+/// Progress of one editor interaction: used by both step-list screens.
+#[derive(PartialEq, Eq)]
+enum WzStepsFlow {
+    Next,
+    Back,
+    Stay,
+}
+
+/// Shared keys for the prefetch/build step editors: navigate, inline-edit,
+/// add/delete lines, Tab = next screen, Esc/q = back. The draft is untouched
+/// until the screen is left (lines are taken, never borrowed out).
+fn wz_steps_key(editor: &mut wizard::StepEditor, key: KeyCode, cmd: Option<char>) -> WzStepsFlow {
+    use WzStepsFlow as Flow;
+    if editor.editing.is_some() {
+        match key {
+            KeyCode::Char(c) => {
+                if let Some(buf) = editor.editing.as_mut() {
+                    buf.push(c);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(buf) = editor.editing.as_mut() {
+                    buf.pop();
+                }
+            }
+            KeyCode::Enter => editor.commit_edit(),
+            KeyCode::Esc => editor.cancel_edit(),
+            _ => {}
+        }
+        return Flow::Stay;
+    }
+    match key {
+        KeyCode::Up => editor.move_up(),
+        KeyCode::Down => editor.move_down(),
+        KeyCode::Tab => return Flow::Next,
+        KeyCode::Enter => {
+            if editor.lines.is_empty() {
+                editor.add_line();
+            } else {
+                editor.start_edit();
+            }
+        }
+        KeyCode::Esc => return Flow::Back,
+        _ => match cmd {
+            Some('k') => editor.move_up(),
+            Some('j') => editor.move_down(),
+            Some('a') => editor.add_line(),
+            Some('d') => editor.delete_line(),
+            Some('q') => return Flow::Back,
+            _ => {}
+        },
+    }
+    Flow::Stay
 }
 
 enum Flow {
@@ -1021,6 +1128,13 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             error: None,
                         }
                     }
+                    Some('n') => {
+                        app.screen = Screen::WzId {
+                            buffer: String::new(),
+                            error: None,
+                            draft: wizard::Draft::default(),
+                        }
+                    }
                     Some('r') => {
                         *files = crate::hoster::library::list();
                         if *selected >= files.len() {
@@ -1090,6 +1204,372 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             }
             // Raw char: paths must be typed verbatim on any layout.
             KeyCode::Char(c) => buffer.push(c),
+            _ => {}
+        },
+        Screen::WzId {
+            buffer,
+            error,
+            draft,
+        } => match key {
+            KeyCode::Esc => {
+                app.screen = Screen::AddService {
+                    files: crate::hoster::library::list(),
+                    selected: 0,
+                    message: None,
+                    armed_delete: None,
+                }
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Enter => {
+                let mut draft = std::mem::take(draft);
+                match wizard::check_id(buffer) {
+                    Ok(()) => {
+                        draft.id = buffer.trim().to_string();
+                        app.screen = Screen::WzGit {
+                            buffer: draft.git.clone(),
+                            error: None,
+                            draft,
+                        };
+                    }
+                    Err(e) => *error = Some(e),
+                }
+            }
+            KeyCode::Char(c) => buffer.push(c),
+            _ => {}
+        },
+        Screen::WzGit {
+            buffer,
+            error,
+            draft,
+        } => match key {
+            KeyCode::Esc => {
+                let mut draft = std::mem::take(draft);
+                draft.git = std::mem::take(buffer);
+                app.screen = Screen::WzId {
+                    buffer: draft.id.clone(),
+                    error: None,
+                    draft,
+                };
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Enter => {
+                let mut draft = std::mem::take(draft);
+                match wizard::check_git(buffer) {
+                    Ok(()) => {
+                        draft.git = buffer.trim().to_string();
+                        app.screen = Screen::WzCommit {
+                            buffer: draft.commit.clone(),
+                            error: None,
+                            draft,
+                        };
+                    }
+                    Err(e) => *error = Some(e),
+                }
+            }
+            KeyCode::Char(c) => buffer.push(c),
+            _ => {}
+        },
+        Screen::WzCommit {
+            buffer,
+            error,
+            draft,
+        } => match key {
+            KeyCode::Esc => {
+                let mut draft = std::mem::take(draft);
+                draft.commit = std::mem::take(buffer);
+                app.screen = Screen::WzGit {
+                    buffer: draft.git.clone(),
+                    error: None,
+                    draft,
+                };
+            }
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Enter => {
+                let mut draft = std::mem::take(draft);
+                match wizard::check_commit(buffer) {
+                    Ok(()) => {
+                        draft.commit = buffer.trim().to_string();
+                        app.screen = Screen::WzProfile { selected: 0, draft };
+                    }
+                    Err(e) => *error = Some(e),
+                }
+            }
+            KeyCode::Char(c) => buffer.push(c),
+            _ => {}
+        },
+        Screen::WzProfile { selected, draft } => {
+            let count = wizard::PROFILES.len();
+            match key {
+                KeyCode::Esc => {
+                    let draft = std::mem::take(draft);
+                    app.screen = Screen::WzCommit {
+                        buffer: draft.commit.clone(),
+                        error: None,
+                        draft,
+                    };
+                }
+                KeyCode::Up if count > 0 => {
+                    *selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down if count > 0 => {
+                    *selected = (*selected + 1).min(count - 1);
+                }
+                KeyCode::Enter => {
+                    let mut draft = std::mem::take(draft);
+                    let profile = wizard::PROFILES[*selected].0;
+                    wizard::apply_profile_defaults(&mut draft, profile);
+                    let editor = wizard::StepEditor::new(draft.prefetch.clone());
+                    app.screen = Screen::WzPrefetch { editor, draft };
+                }
+                _ => match cmd {
+                    Some('q') => {
+                        let draft = std::mem::take(draft);
+                        app.screen = Screen::WzCommit {
+                            buffer: draft.commit.clone(),
+                            error: None,
+                            draft,
+                        };
+                    }
+                    Some('k') if count > 0 => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    Some('j') if count > 0 => {
+                        *selected = (*selected + 1).min(count - 1);
+                    }
+                    _ => {}
+                },
+            }
+        }
+        Screen::WzPrefetch { editor, draft } => match wz_steps_key(editor, key, cmd) {
+            WzStepsFlow::Next => {
+                let mut draft = std::mem::take(draft);
+                let editor = std::mem::take(editor);
+                draft.prefetch = editor.take_lines();
+                let next = wizard::StepEditor::new(draft.build_steps.clone());
+                app.screen = Screen::WzBuild {
+                    editor: next,
+                    draft,
+                };
+            }
+            WzStepsFlow::Back => {
+                let mut draft = std::mem::take(draft);
+                let editor = std::mem::take(editor);
+                draft.prefetch = editor.take_lines();
+                let idx = wizard::PROFILES
+                    .iter()
+                    .position(|(id, _)| *id == draft.profile)
+                    .unwrap_or(0);
+                app.screen = Screen::WzProfile {
+                    selected: idx,
+                    draft,
+                };
+            }
+            WzStepsFlow::Stay => {}
+        },
+        Screen::WzBuild { editor, draft } => match wz_steps_key(editor, key, cmd) {
+            WzStepsFlow::Next => {
+                let mut draft = std::mem::take(draft);
+                let editor = std::mem::take(editor);
+                draft.build_steps = editor.take_lines();
+                let run_cmd = draft.run_cmd.clone();
+                let port = draft.port.clone();
+                app.screen = Screen::WzRun {
+                    cmd: run_cmd,
+                    port,
+                    focus_port: false,
+                    error: None,
+                    draft,
+                };
+            }
+            WzStepsFlow::Back => {
+                let mut draft = std::mem::take(draft);
+                let editor = std::mem::take(editor);
+                draft.build_steps = editor.take_lines();
+                let back = wizard::StepEditor::new(draft.prefetch.clone());
+                app.screen = Screen::WzPrefetch {
+                    editor: back,
+                    draft,
+                };
+            }
+            WzStepsFlow::Stay => {}
+        },
+        Screen::WzRun {
+            cmd: run_cmd,
+            port,
+            focus_port,
+            error,
+            draft,
+        } => match key {
+            KeyCode::Esc => {
+                let mut draft = std::mem::take(draft);
+                draft.run_cmd = std::mem::take(run_cmd);
+                draft.port = std::mem::take(port);
+                let back = wizard::StepEditor::new(draft.build_steps.clone());
+                app.screen = Screen::WzBuild {
+                    editor: back,
+                    draft,
+                };
+            }
+            KeyCode::Tab => {
+                *focus_port = !*focus_port;
+            }
+            KeyCode::Backspace => {
+                if *focus_port {
+                    port.pop();
+                } else {
+                    run_cmd.pop();
+                }
+            }
+            KeyCode::Enter => {
+                if run_cmd.trim().is_empty() {
+                    *error = Some(
+                        "run command must not be empty (use {bin}/{venv}/{self}/{project}/{port})"
+                            .into(),
+                    );
+                } else {
+                    let mut d = std::mem::take(draft);
+                    d.run_cmd = run_cmd.trim().to_string();
+                    match wizard::check_port(port) {
+                        Ok(_) => {
+                            d.port = port.trim().to_string();
+                            app.screen = Screen::WzRes {
+                                memory: d.memory_max.clone(),
+                                tasks: d.tasks_max.clone(),
+                                focus_tasks: false,
+                                error: None,
+                                draft: d,
+                            };
+                        }
+                        Err(e) => {
+                            *draft = d;
+                            *error = Some(e);
+                        }
+                    }
+                }
+            }
+            // Raw char: commands must be typed verbatim on any layout.
+            KeyCode::Char(c) => {
+                if *focus_port {
+                    port.push(c);
+                } else {
+                    run_cmd.push(c);
+                }
+            }
+            _ => {}
+        },
+        Screen::WzRes {
+            memory,
+            tasks,
+            focus_tasks,
+            error,
+            draft,
+        } => match key {
+            KeyCode::Esc => {
+                let mut draft = std::mem::take(draft);
+                draft.memory_max = std::mem::take(memory);
+                draft.tasks_max = std::mem::take(tasks);
+                app.screen = Screen::WzRun {
+                    cmd: draft.run_cmd.clone(),
+                    port: draft.port.clone(),
+                    focus_port: false,
+                    error: None,
+                    draft,
+                };
+            }
+            KeyCode::Tab => {
+                *focus_tasks = !*focus_tasks;
+            }
+            KeyCode::Backspace => {
+                if *focus_tasks {
+                    tasks.pop();
+                } else {
+                    memory.pop();
+                }
+            }
+            KeyCode::Enter => {
+                let mut d = std::mem::take(draft);
+                let mem_ok = wizard::check_memory(memory);
+                let tasks_ok = wizard::check_tasks(tasks);
+                match (mem_ok, tasks_ok) {
+                    (Ok(()), Ok(())) => {
+                        d.memory_max = memory.trim().to_string();
+                        d.tasks_max = tasks.trim().to_string();
+                        match wizard::preview_yaml(&d) {
+                            Ok(yaml) => {
+                                app.screen = Screen::WzReview {
+                                    draft: d,
+                                    yaml: Some(yaml),
+                                    error: None,
+                                };
+                            }
+                            Err(e) => {
+                                *draft = d;
+                                *error = Some(e);
+                            }
+                        }
+                    }
+                    (Err(e), _) | (_, Err(e)) => {
+                        *draft = d;
+                        *error = Some(e);
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if *focus_tasks {
+                    tasks.push(c);
+                } else {
+                    memory.push(c);
+                }
+            }
+            _ => {}
+        },
+        Screen::WzReview { draft, yaml, error } => match key {
+            KeyCode::Esc => {
+                let draft = std::mem::take(draft);
+                app.screen = Screen::WzRes {
+                    memory: draft.memory_max.clone(),
+                    tasks: draft.tasks_max.clone(),
+                    focus_tasks: false,
+                    error: None,
+                    draft,
+                };
+            }
+            KeyCode::Enter => {
+                if yaml.is_none() {
+                    *error = Some("fix the errors above first (Esc goes back)".into());
+                } else {
+                    match wizard::build_manifest(draft) {
+                        Ok(manifest) => {
+                            let text = yaml.clone().unwrap_or_default();
+                            match crate::hoster::library::save(&manifest, &text) {
+                                Ok(id) => {
+                                    let files = crate::hoster::library::list();
+                                    let selected =
+                                        files.iter().position(|f| f.id == id).unwrap_or(0);
+                                    app.screen = Screen::AddService {
+                                        files,
+                                        selected,
+                                        message: Some(format!("created {id} — Enter deploys it")),
+                                        armed_delete: None,
+                                    };
+                                }
+                                Err(e) => {
+                                    *error = Some(workers::short_error_for(&e));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            *error = Some(e);
+                        }
+                    }
+                }
+            }
             _ => {}
         },
     }
@@ -1461,6 +1941,115 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         }
         Screen::Import { buffer, error } => {
             draw_import(f, chunks[1], buffer, error.as_deref(), app.tick);
+        }
+        Screen::WzId { buffer, error, .. } => {
+            draw_wz_input(
+                f,
+                chunks[1],
+                "New Service 1/9 · name",
+                &[
+                    "Give the service a short id: lowercase letters, digits, dashes.",
+                    "Example: my-blog, paperless, uptime-kuma.",
+                ],
+                " Service id: ",
+                buffer,
+                error.as_deref(),
+                app.tick,
+            );
+        }
+        Screen::WzGit { buffer, error, .. } => {
+            draw_wz_input(
+                f,
+                chunks[1],
+                "New Service 2/9 · source",
+                &["Where does the code live? Paste the GitHub repository URL."],
+                " Git URL: ",
+                buffer,
+                error.as_deref(),
+                app.tick,
+            );
+        }
+        Screen::WzCommit { buffer, error, .. } => {
+            draw_wz_input(
+                f,
+                chunks[1],
+                "New Service 3/9 · version pin",
+                &[
+                    "Which exact version to deploy? Paste the full 40-character commit SHA.",
+                    "Get it with: git ls-remote <url> HEAD",
+                    "The deploy always builds exactly this revision — never a moving branch.",
+                ],
+                " Commit SHA: ",
+                buffer,
+                error.as_deref(),
+                app.tick,
+            );
+        }
+        Screen::WzProfile { selected, .. } => {
+            draw_wz_profile(f, chunks[1], *selected);
+        }
+        Screen::WzPrefetch { editor, .. } => {
+            draw_wz_steps(
+                f,
+                chunks[1],
+                "New Service 5/9 · download dependencies",
+                &[
+                    "These run ONCE on your machine with network (before the offline build).",
+                    "Only downloaders here — they must never run project code.",
+                ],
+                editor,
+                app.tick,
+            );
+        }
+        Screen::WzBuild { editor, .. } => {
+            draw_wz_steps(
+                f,
+                chunks[1],
+                "New Service 6/9 · build offline",
+                &[
+                    "These run inside the sandbox with NO network.",
+                    "Everything they need must be downloaded on the previous step.",
+                ],
+                editor,
+                app.tick,
+            );
+        }
+        Screen::WzRun {
+            cmd: run_cmd,
+            port,
+            focus_port,
+            error,
+            ..
+        } => {
+            draw_wz_run(
+                f,
+                chunks[1],
+                run_cmd,
+                port,
+                *focus_port,
+                error.as_deref(),
+                app.tick,
+            );
+        }
+        Screen::WzRes {
+            memory,
+            tasks,
+            focus_tasks,
+            error,
+            ..
+        } => {
+            draw_wz_res(
+                f,
+                chunks[1],
+                memory,
+                tasks,
+                *focus_tasks,
+                error.as_deref(),
+                app.tick,
+            );
+        }
+        Screen::WzReview { yaml, error, .. } => {
+            draw_wz_review(f, chunks[1], yaml.as_deref(), error.as_deref());
         }
     }
 
@@ -2099,6 +2688,305 @@ fn draw_import(
     );
 }
 
+// --- new-service wizard -------------------------------------------------------
+
+/// Generic one-field wizard screen: explanation lines + prompt + buffer.
+#[allow(clippy::too_many_arguments)]
+fn draw_wz_input(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    title: &str,
+    explain: &[&str],
+    prompt: &str,
+    buffer: &str,
+    error: Option<&str>,
+    tick: u64,
+) {
+    let mut text = vec![Line::from("")];
+    for line in explain {
+        text.push(Line::from(Span::styled(
+            format!(" {line}"),
+            Style::default().fg(DIM),
+        )));
+    }
+    text.push(Line::from(""));
+    text.push(Line::from(vec![
+        Span::styled(prompt.to_string(), Style::default().fg(VIOLET)),
+        Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
+        cursor_span(tick),
+    ]));
+    if let Some(e) = error {
+        text.push(Line::from(Span::styled(
+            format!(" x {e}"),
+            Style::default().fg(ERR_RED),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block(title, VIOLET)),
+        area,
+    );
+}
+
+fn draw_wz_profile(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected: usize) {
+    let mut text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " What is the project built with? The next steps are prefilled for it.",
+            Style::default().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            " (changing the profile later resets those steps)",
+            Style::default().fg(DIM),
+        )),
+        Line::from(""),
+    ];
+    for (i, (id, about)) in wizard::PROFILES.iter().enumerate() {
+        let sel = i == selected;
+        text.push(Line::from(vec![
+            Span::styled(if sel { " » " } else { "   " }, Style::default().fg(VIOLET)),
+            Span::styled(
+                format!("{id} "),
+                Style::default()
+                    .fg(if sel { Color::White } else { BODY })
+                    .add_modifier(if sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(format!("— {about}"), Style::default().fg(DIM)),
+        ]));
+    }
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block("New Service 4/9 · build profile", VIOLET)),
+        area,
+    );
+}
+
+fn draw_wz_steps(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    title: &str,
+    explain: &[&str],
+    editor: &wizard::StepEditor,
+    tick: u64,
+) {
+    let mut text = vec![Line::from("")];
+    for line in explain {
+        text.push(Line::from(Span::styled(
+            format!(" {line}"),
+            Style::default().fg(DIM),
+        )));
+    }
+    text.push(Line::from(""));
+    if editor.lines.is_empty() {
+        text.push(Line::from(Span::styled(
+            " (no steps — press a to add one, Tab when done)",
+            Style::default().fg(DIM),
+        )));
+    }
+    for (i, line) in editor.lines.iter().enumerate() {
+        let sel = i == editor.selected;
+        if editor.editing.is_some() && sel {
+            let buf = editor.editing.as_deref().unwrap_or("");
+            text.push(Line::from(vec![
+                Span::styled(" » ", Style::default().fg(VIOLET)),
+                Span::styled(buf.to_string(), Style::default().fg(Color::White)),
+                cursor_span(tick),
+            ]));
+        } else {
+            text.push(Line::from(vec![
+                Span::styled(if sel { " » " } else { "   " }, Style::default().fg(VIOLET)),
+                Span::styled(
+                    line.clone(),
+                    Style::default().fg(if sel { Color::White } else { BODY }),
+                ),
+            ]));
+        }
+    }
+    if let Some(m) = editor.message.as_deref() {
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            format!(" {m}"),
+            Style::default().fg(WARN_YELLOW),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block(title, VIOLET)),
+        area,
+    );
+}
+
+fn draw_wz_run(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    cmd: &str,
+    port: &str,
+    focus_port: bool,
+    error: Option<&str>,
+    tick: u64,
+) {
+    let cursor_here = |focused: bool| {
+        if focused {
+            cursor_span(tick)
+        } else {
+            Span::raw("")
+        }
+    };
+    let mut text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " How is the built service started? One command, words split on spaces.",
+            Style::default().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            " Placeholders: {bin} {venv} {self} {project} {port}. Must bind 127.0.0.1.",
+            Style::default().fg(DIM),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Run: ", Style::default().fg(VIOLET)),
+            Span::styled(cmd.to_string(), Style::default().fg(Color::White)),
+            cursor_here(!focus_port),
+        ]),
+        Line::from(vec![
+            Span::styled(" Port (0 = random): ", Style::default().fg(VIOLET)),
+            Span::styled(port.to_string(), Style::default().fg(Color::White)),
+            cursor_here(focus_port),
+        ]),
+    ];
+    if let Some(e) = error {
+        text.push(Line::from(Span::styled(
+            format!(" x {e}"),
+            Style::default().fg(ERR_RED),
+        )));
+    } else {
+        text.push(Line::from(Span::styled(
+            " Tab switches fields",
+            Style::default().fg(DIM),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block("New Service 7/9 · run", VIOLET)),
+        area,
+    );
+}
+
+fn draw_wz_res(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    memory: &str,
+    tasks: &str,
+    focus_tasks: bool,
+    error: Option<&str>,
+    tick: u64,
+) {
+    let cursor_here = |focused: bool| {
+        if focused {
+            cursor_span(tick)
+        } else {
+            Span::raw("")
+        }
+    };
+    let mut text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " Safety budgets: a runaway service must never grind your session.",
+            Style::default().fg(DIM),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" Memory max (e.g. 384M, 1G): ", Style::default().fg(VIOLET)),
+            Span::styled(memory.to_string(), Style::default().fg(Color::White)),
+            cursor_here(!focus_tasks),
+        ]),
+        Line::from(vec![
+            Span::styled(" Tasks max (e.g. 300): ", Style::default().fg(VIOLET)),
+            Span::styled(tasks.to_string(), Style::default().fg(Color::White)),
+            cursor_here(focus_tasks),
+        ]),
+    ];
+    if let Some(e) = error {
+        text.push(Line::from(Span::styled(
+            format!(" x {e}"),
+            Style::default().fg(ERR_RED),
+        )));
+    } else {
+        text.push(Line::from(Span::styled(
+            " Tab switches fields",
+            Style::default().fg(DIM),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block("New Service 8/9 · limits", VIOLET)),
+        area,
+    );
+}
+
+fn draw_wz_review(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    yaml: Option<&str>,
+    error: Option<&str>,
+) {
+    let mut text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " This exact file will be saved into your library. Read it once more.",
+            Style::default().fg(DIM),
+        )),
+        Line::from(""),
+    ];
+    match yaml {
+        Some(y) => {
+            // Fit the preview into the visible area; the file itself is whole.
+            let budget = area.height.saturating_sub(10) as usize;
+            let shown: Vec<&str> = y.lines().take(budget.max(4)).collect();
+            for line in shown {
+                text.push(Line::from(Span::styled(
+                    line.to_string(),
+                    Style::default().fg(BODY),
+                )));
+            }
+            if y.lines().count() > budget.max(4) {
+                text.push(Line::from(Span::styled(
+                    " …(truncated on screen — saved whole)",
+                    Style::default().fg(DIM),
+                )));
+            }
+        }
+        None => {
+            text.push(Line::from(Span::styled(
+                " The draft does not validate yet:",
+                Style::default().fg(ERR_RED),
+            )));
+        }
+    }
+    if let Some(e) = error {
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            format!(" x {e}"),
+            Style::default().fg(ERR_RED),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block("New Service 9/9 · review (Enter saves)", VIOLET)),
+        area,
+    );
+}
+
 /// Blinking terminal-style cursor block.
 fn cursor_span(tick: u64) -> Span<'static> {
     if (tick / 4).is_multiple_of(2) {
@@ -2540,12 +3428,34 @@ fn hint_line(screen: &Screen) -> Line<'static> {
         ],
         Screen::AddService { .. } => vec![
             ("Enter deploy", OK_GREEN),
-            ("a import", VIOLET),
+            ("n new a import", VIOLET),
             ("d delete", ERR_RED),
             ("r refresh", BLUE),
             ("Esc back", WARN_YELLOW),
         ],
         Screen::Import { .. } => vec![("Enter import", OK_GREEN), ("Esc back", WARN_YELLOW)],
+        Screen::WzId { .. } | Screen::WzGit { .. } | Screen::WzCommit { .. } => {
+            vec![("Enter next", OK_GREEN), ("Esc back", WARN_YELLOW)]
+        }
+        Screen::WzProfile { .. } => vec![
+            ("↑↓ select", VIOLET),
+            ("Enter next", OK_GREEN),
+            ("Esc back", WARN_YELLOW),
+        ],
+        Screen::WzPrefetch { .. } | Screen::WzBuild { .. } => vec![
+            ("Enter edit", OK_GREEN),
+            ("a add d del", VIOLET),
+            ("Tab next", ACCENT),
+            ("Esc back", WARN_YELLOW),
+        ],
+        Screen::WzRun { .. } | Screen::WzRes { .. } => {
+            vec![
+                ("Tab field", ACCENT),
+                ("Enter next", OK_GREEN),
+                ("Esc back", WARN_YELLOW),
+            ]
+        }
+        Screen::WzReview { .. } => vec![("Enter save", OK_GREEN), ("Esc back", WARN_YELLOW)],
     };
     let mut spans: Vec<Span> = Vec::new();
     for (i, (text, color)) in pairs.iter().enumerate() {

@@ -19,7 +19,7 @@
 
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Max accepted manifest file size (64 KiB): a manifest is hand-written
 /// config, never a data dump.
@@ -32,7 +32,7 @@ pub const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 ///   - ["bun", "install", "--frozen-lockfile", "--ignore-scripts"]
 ///   - "python3 -m venv --clear .venv"
 /// ```
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum Step {
     Shell(String),
@@ -92,7 +92,7 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\"'\"'"))
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServiceMeta {
     pub id: String,
     #[serde(default)]
@@ -101,20 +101,20 @@ pub struct ServiceMeta {
     pub description: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SourceSpec {
     pub git: String,
     pub commit: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BuildSpec {
     pub profile: String,
     #[serde(default)]
     pub steps: Vec<Step>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RunSpec {
     pub command: Vec<String>,
     #[serde(default = "default_port")]
@@ -125,17 +125,23 @@ fn default_port() -> u16 {
     0
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct ResourcesSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_high: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_max: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tasks_max: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_quota: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_nofile: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oom_score_adjust: Option<i32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HealthcheckSpec {
     #[serde(default = "default_hc_type")]
     #[allow(dead_code)]
@@ -151,29 +157,29 @@ fn default_hc_path() -> String {
     "/".to_string()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginPin {
     pub url: String,
     pub sha256: String,
 }
 
 /// Top-level `service.yaml`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServiceManifest {
     pub manifest_version: u32,
     pub service: ServiceMeta,
     pub source: SourceSpec,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pre_build: Vec<Step>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prefetch: Vec<Step>,
     pub build: BuildSpec,
     pub run: RunSpec,
     #[serde(default)]
     pub resources: ResourcesSpec,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<HealthcheckSpec>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plugins: Vec<PluginPin>,
     /// SearXNG-style settings patch (secret + loopback bind). Only valid
     /// with `build.profile: python-searxng`; kept explicit instead of an

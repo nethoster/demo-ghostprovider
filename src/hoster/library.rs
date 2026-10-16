@@ -83,26 +83,39 @@ pub fn list() -> Vec<LibraryEntry> {
 /// when the shelf is full. Returns the service id.
 pub fn import(src: &Path) -> anyhow::Result<String> {
     let m = ServiceManifest::load_from_file(src)?;
-    let items = list();
-    if items.len() >= MAX_LIBRARY_FILES {
+    let bytes = std::fs::read(src)?;
+    store_new(&m.service.id, &bytes)?;
+    Ok(m.service.id)
+}
+
+/// Store an already-validated manifest's YAML text under its service id.
+/// Same duplicate/shelf guards as [`import`]; used by the TUI wizard, which
+/// builds the manifest in memory instead of reading a file.
+pub fn save(manifest: &ServiceManifest, yaml: &str) -> anyhow::Result<String> {
+    manifest.validate("wizard")?;
+    if yaml.len() > super::manifest::MAX_MANIFEST_BYTES {
+        anyhow::bail!("manifest is too large");
+    }
+    store_new(&manifest.service.id, yaml.as_bytes())?;
+    Ok(manifest.service.id.clone())
+}
+
+fn store_new(id: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    if list().len() >= MAX_LIBRARY_FILES {
         anyhow::bail!("manifest library is full ({MAX_LIBRARY_FILES} files)");
     }
-    if items.iter().any(|e| e.id == m.service.id) {
-        anyhow::bail!(
-            "“{}” is already in the library — delete it first to replace",
-            m.service.id
-        );
+    if list().iter().any(|e| e.id == id) {
+        anyhow::bail!("“{id}” is already in the library — delete it first to replace");
     }
-    let dest = dir().join(format!("{}.yaml", m.service.id));
+    let dest = dir().join(format!("{id}.yaml"));
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let bytes = std::fs::read(src)?;
     // Atomic + 0600, symlink-proof (see atomic.rs): readers never see a
     // half-written file and a pre-planted symlink is replaced, not followed.
     // The duplicate-id check above is what prevents silent replacement.
-    crate::atomic::write_atomic(&dest, &bytes)?;
-    Ok(m.service.id)
+    crate::atomic::write_atomic(&dest, bytes)?;
+    Ok(())
 }
 
 /// Delete a stored manifest. Returns true when a file was actually removed.
@@ -214,6 +227,18 @@ tools: ["bun"]
         import(&src).unwrap();
         let err = format!("{:#}", import(&src).unwrap_err());
         assert!(err.contains("already in the library"), "{err}");
+    }
+
+    #[test]
+    fn save_stores_validated_yaml() {
+        let _env = isolated_data_home("save");
+        let m = ServiceManifest::load_from_str(GOOD, "test").unwrap();
+        let yaml = serde_yaml::to_string(&m).unwrap();
+        // Preview round-trips through the schema.
+        ServiceManifest::load_from_str(&yaml, "preview").unwrap();
+        assert_eq!(save(&m, &yaml).unwrap(), "lib-demo");
+        assert!(list().iter().any(|e| e.id == "lib-demo" && e.valid));
+        assert!(save(&m, &yaml).is_err());
     }
 
     #[test]
