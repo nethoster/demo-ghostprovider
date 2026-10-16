@@ -12,8 +12,10 @@ pre_build:
 prefetch:
   - ["bun", "install", "--frozen-lockfile", "--ignore-scripts"]
 plugins:
+  # Pinned 2026-10-16: upstream released under the @4 tag (npm 4.5.4 —
+  # tarball dist/index.js matches these bytes). Bump consciously on drift.
   - url: "https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format@4/dist/index.js"
-    sha256: "765b487bbe95a20c7f83a940a3fba81bacef18bce0bbe916df6807f7ddd512ca"
+    sha256: "85a5ce9d714530f6cf2e5491fa6118b5759396e27f2cb673e334fa4adeca7ab3"
   - url: "https://cdn.jsdelivr.net/npm/@inlang/plugin-m-function-matcher@2/dist/index.js"
     sha256: "a7e6c41307afc64b3f34116f220e925f0ad3aca47231e849f080051a2fb459a8"
 build:
