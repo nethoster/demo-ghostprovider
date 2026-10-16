@@ -1,7 +1,7 @@
 //! Interactive panel — ratatui port of the Textual UI.
 //!
 //! Screen flow mirrors the Python version:
-//! Main menu → System Scan / Deploy (URL input) / My Services.
+//! Main menu → System Scan / Deploy (URL input) / Self-hosting.
 //! Long operations run on worker threads reporting through a channel.
 //!
 //! Visual language: neon-on-black maxicolor theme. Every data type owns a
@@ -65,7 +65,7 @@ pub(crate) const MAIN_MENU: &[(&str, &str, &str, Color)] = &[
         "deploy via GitHub URL or service.yaml",
         MAGENTA,
     ),
-    ("#", "My Services", "manage deployed units", OK_GREEN),
+    ("#", "Self-hosting", "manage deployed units", OK_GREEN),
     (
         "≡",
         "Logs",
@@ -78,6 +78,7 @@ pub(crate) const MAIN_MENU: &[(&str, &str, &str, Color)] = &[
         "import service.yaml into your library",
         VIOLET,
     ),
+    ("♥", "My Services", "your added services", BLUE),
 ];
 
 // Hard bound on the deploy log held in memory. A heavy build (a SvelteKit +
@@ -238,6 +239,17 @@ pub(crate) enum Screen {
         /// Rendered YAML, or None when the draft does not validate (error set).
         yaml: Option<String>,
         error: Option<String>,
+    },
+    /// Overview of the user's own added services (menu "My Services"): the
+    /// manifest library annotated with deploy status. Read-mostly: Enter
+    /// deploys (or jumps to Self-hosting when already deployed); managing
+    /// (import/delete) stays in Add Service.
+    UserServices {
+        files: Vec<crate::hoster::library::LibraryEntry>,
+        /// Ids currently deployed (from state.json), for the ●/○ marks.
+        deployed: Vec<String>,
+        selected: usize,
+        message: Option<String>,
     },
 }
 
@@ -1232,6 +1244,79 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             KeyCode::Char(c) => buffer.push(c),
             _ => {}
         },
+        Screen::UserServices {
+            files,
+            deployed,
+            selected,
+            message,
+        } => {
+            let count = files.len();
+            match key {
+                KeyCode::Esc => app.screen = Screen::Main { selected: 5 },
+                KeyCode::Up if count > 0 => {
+                    *selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down if count > 0 => {
+                    *selected = (*selected + 1).min(count - 1);
+                }
+                KeyCode::Enter if count > 0 => {
+                    if let Some(f) = files.get(*selected) {
+                        if !f.valid {
+                            *message = f
+                                .error
+                                .clone()
+                                .map(|e| format!("invalid manifest: {e}"))
+                                .or_else(|| Some("invalid manifest".into()));
+                        } else if deployed.iter().any(|d| d == &f.id) {
+                            // Already deployed: jump to Self-hosting with the
+                            // cursor on this unit instead of redeploying.
+                            let rows = workers::service_rows();
+                            let at = rows
+                                .iter()
+                                .position(|(name, _, _)| name == &f.id)
+                                .unwrap_or(0);
+                            app.screen = Screen::Services {
+                                rows,
+                                selected: at,
+                                message: None,
+                            };
+                        } else {
+                            let path = f.path.display().to_string();
+                            match workers::classify_deploy_input(&path) {
+                                Ok(target) => {
+                                    app.screen = Screen::Confirm {
+                                        target,
+                                        yes_selected: true,
+                                    };
+                                }
+                                Err(e) => *message = Some(e),
+                            }
+                        }
+                    }
+                }
+                _ => match cmd {
+                    Some('q') => app.screen = Screen::Main { selected: 5 },
+                    Some('k') if count > 0 => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    Some('j') if count > 0 => {
+                        *selected = (*selected + 1).min(count - 1);
+                    }
+                    Some('r') => {
+                        *files = crate::hoster::library::list();
+                        if *selected >= files.len() {
+                            *selected = files.len().saturating_sub(1);
+                        }
+                        *deployed = crate::state::list()
+                            .into_iter()
+                            .map(|(name, _)| name)
+                            .collect();
+                        *message = Some("refreshed".into());
+                    }
+                    _ => {}
+                },
+            }
+        }
         Screen::WzId {
             buffer,
             error,
@@ -1694,6 +1779,19 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                 armed_delete: None,
             };
         }
+        5 => {
+            let files = crate::hoster::library::list();
+            let deployed: Vec<String> = crate::state::list()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            app.screen = Screen::UserServices {
+                files,
+                deployed,
+                selected: 0,
+                message: None,
+            };
+        }
         _ => {}
     }
     Flow::Continue
@@ -1971,6 +2069,14 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         }
         Screen::Import { buffer, error } => {
             draw_import(f, chunks[1], buffer, error.as_deref(), app.tick);
+        }
+        Screen::UserServices {
+            files,
+            deployed,
+            selected,
+            message,
+        } => {
+            draw_user_services(f, chunks[1], files, deployed, *selected, message.as_deref());
         }
         Screen::WzId { buffer, error, .. } => {
             draw_wz_input(
@@ -2706,6 +2812,105 @@ fn draw_add_service(
     f.render_widget(List::new(items).block(block_widget), area);
 }
 
+/// Deploy mark for one library row: ● when its id is deployed, ○ otherwise.
+fn deployed_mark(deployed: &[String], id: &str) -> (&'static str, Color) {
+    if deployed.iter().any(|d| d == id) {
+        ("●", OK_GREEN)
+    } else {
+        ("○", DIM)
+    }
+}
+
+fn draw_user_services(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    files: &[crate::hoster::library::LibraryEntry],
+    deployed: &[String],
+    selected: usize,
+    message: Option<&str>,
+) {
+    if files.is_empty() {
+        let mut text = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " No services added yet.",
+                Style::default().fg(BODY),
+            )),
+            Line::from(Span::styled(
+                " Use “Add Service” from the menu to import or create one.",
+                Style::default().fg(DIM),
+            )),
+        ];
+        if let Some(m) = message {
+            text.push(Line::from(""));
+            text.push(Line::from(Span::styled(
+                format!(" {m}"),
+                Style::default().fg(WARN_YELLOW),
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .block(block("My Services", BLUE)),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = files
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let sel = i == selected;
+            let (mark, mark_hue) = deployed_mark(deployed, &e.id);
+            let (status, hue) = if e.valid {
+                ("ready", OK_GREEN)
+            } else {
+                ("invalid", ERR_RED)
+            };
+            let mut spans = vec![
+                Span::styled(if sel { " » " } else { "   " }, Style::default().fg(BLUE)),
+                Span::styled(
+                    e.id.clone(),
+                    Style::default()
+                        .fg(if sel { Color::White } else { BODY })
+                        .add_modifier(if sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(format!("  [{status}]"), Style::default().fg(hue)),
+                Span::styled(format!("  {mark} "), Style::default().fg(mark_hue)),
+                Span::styled(
+                    if deployed.iter().any(|d| d == &e.id) {
+                        "deployed"
+                    } else {
+                        "not deployed"
+                    },
+                    Style::default().fg(DIM),
+                ),
+            ];
+            if let Some(src) = e.source_git.as_deref() {
+                spans.push(Span::styled(format!("  {src}"), Style::default().fg(DIM)));
+            } else if let Some(err) = e.error.as_deref() {
+                spans.push(Span::styled(
+                    format!("  {err}"),
+                    Style::default().fg(ERR_RED),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut block_widget = block("My Services", BLUE);
+    if let Some(m) = message {
+        block_widget = block_widget.title_bottom(Span::styled(
+            format!(" {m} "),
+            Style::default().fg(WARN_YELLOW),
+        ));
+    }
+    f.render_widget(List::new(items).block(block_widget), area);
+}
+
 fn draw_import(
     f: &mut ratatui::Frame,
     area: ratatui::prelude::Rect,
@@ -3247,7 +3452,7 @@ fn draw_services(
     message: Option<&str>,
 ) {
     let mut title = Line::from(vec![
-        Span::styled(" My Services ", Style::default().fg(BLUE)),
+        Span::styled(" Self-hosting ", Style::default().fg(BLUE)),
         Span::styled("[", Style::default().fg(DIM)),
         Span::styled("s", Style::default().fg(WARN_YELLOW)),
         Span::styled("]top ", Style::default().fg(DIM)),
@@ -3495,6 +3700,11 @@ fn hint_line(screen: &Screen) -> Line<'static> {
             ("Esc back", WARN_YELLOW),
         ],
         Screen::Import { .. } => vec![("Enter import", OK_GREEN), ("Esc back", WARN_YELLOW)],
+        Screen::UserServices { .. } => vec![
+            ("Enter open", OK_GREEN),
+            ("r refresh", BLUE),
+            ("Esc back", WARN_YELLOW),
+        ],
         Screen::WzId { .. } | Screen::WzGit { .. } | Screen::WzCommit { .. } => {
             vec![("Enter next", OK_GREEN), ("Esc back", WARN_YELLOW)]
         }
@@ -3561,19 +3771,31 @@ mod tests {
         assert_eq!(lib_row_count(3), 5);
     }
 
+    /// The menu is the single source of truth: Self-hosting manages units,
+    /// My Services lists the user's own added services. Navigation caps derive
+    /// from MAIN_MENU so this guards desync.
     #[test]
-    fn main_menu_lists_five_items_ending_with_add_service() {
+    fn main_menu_lists_six_items_with_self_hosting_and_my_services() {
         let titles: Vec<&str> = MAIN_MENU.iter().map(|(_, t, _, _)| *t).collect();
         assert_eq!(
             titles,
             vec![
                 "System Scan",
                 "Deploy Service",
-                "My Services",
+                "Self-hosting",
                 "Logs",
-                "Add Service"
+                "Add Service",
+                "My Services"
             ]
         );
+    }
+
+    #[test]
+    fn deployed_mark_distinguishes_deployed_ids() {
+        let deployed = vec!["my-blog".to_string()];
+        assert_eq!(deployed_mark(&deployed, "my-blog").0, "●");
+        assert_eq!(deployed_mark(&deployed, "other").0, "○");
+        assert_eq!(deployed_mark(&[], "my-blog").0, "○");
     }
     /// Port rows: our deployments render yellow bold; anonymous occupied
     /// ports render violet bold — both without any owner data.

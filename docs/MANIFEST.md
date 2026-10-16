@@ -68,7 +68,7 @@ demo-ghostprovider __deploy --manifest service.yaml
 source/revision, host-prefetch vs offline-build steps, run command, port
 and limits.
 
-## Library (Add Service screen)
+## Library (Add Service screen, menu item 5)
 
 The panel's 5th menu item keeps your own manifests in
 `~/.local/share/demo-ghostprovider/manifests/<service-id>.yaml`. The top of
@@ -89,6 +89,14 @@ Below them, every stored file (re-validated on each listing):
 * `d` twice deletes the stored file (the deployed service, if any, is
   untouched — remove it separately from My Services),
 * `r` refreshes the list.
+
+## My Services (menu item 6)
+
+Menu item 6 is the overview of the services you added: the same library
+annotated with deploy status (`● deployed` / `○ not deployed`). Enter on a
+ready service deploys it through the usual Confirm gate; Enter on a deployed
+one jumps to Self-hosting with the cursor on its unit. Importing, creating
+and deleting stay in Add Service.
 
 ## Built-ins
 
