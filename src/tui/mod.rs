@@ -1086,47 +1086,58 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             message,
             armed_delete,
         } => {
-            let count = files.len();
-            // Any navigation disarms a pending delete.
+            // Selection spans the two action rows plus the files; any
+            // navigation disarms a pending delete.
+            let last = lib_row_count(files.len()).saturating_sub(1);
             match key {
                 KeyCode::Esc => app.screen = Screen::Main { selected: 4 },
-                KeyCode::Up if count > 0 => {
+                KeyCode::Up => {
                     *selected = selected.saturating_sub(1);
                     *armed_delete = None;
                 }
-                KeyCode::Down if count > 0 => {
-                    *selected = (*selected + 1).min(count - 1);
+                KeyCode::Down => {
+                    *selected = (*selected + 1).min(last);
                     *armed_delete = None;
                 }
-                KeyCode::Enter if count > 0 => {
-                    if let Some(f) = files.get(*selected) {
-                        let path = f.path.display().to_string();
-                        match workers::classify_deploy_input(&path) {
-                            Ok(target) => {
-                                app.screen = Screen::Confirm {
-                                    target,
-                                    yes_selected: true,
-                                };
-                            }
-                            Err(e) => *message = Some(e),
-                        }
+                KeyCode::Enter => match lib_row(files.len(), *selected) {
+                    Some(LibRow::CreateNew) => {
+                        app.screen = Screen::WzId {
+                            buffer: String::new(),
+                            error: None,
+                            draft: wizard::Draft::default(),
+                        };
                     }
-                }
-                _ => match cmd {
-                    Some('q') => app.screen = Screen::Main { selected: 4 },
-                    Some('k') if count > 0 => {
-                        *selected = selected.saturating_sub(1);
-                        *armed_delete = None;
-                    }
-                    Some('j') if count > 0 => {
-                        *selected = (*selected + 1).min(count - 1);
-                        *armed_delete = None;
-                    }
-                    Some('a') | Some('i') => {
+                    Some(LibRow::ImportFile) => {
                         app.screen = Screen::Import {
                             buffer: String::new(),
                             error: None,
+                        };
+                    }
+                    Some(LibRow::Entry(i)) => {
+                        if let Some(f) = files.get(i) {
+                            let path = f.path.display().to_string();
+                            match workers::classify_deploy_input(&path) {
+                                Ok(target) => {
+                                    app.screen = Screen::Confirm {
+                                        target,
+                                        yes_selected: true,
+                                    };
+                                }
+                                Err(e) => *message = Some(e),
+                            }
                         }
+                    }
+                    None => {}
+                },
+                _ => match cmd {
+                    Some('q') => app.screen = Screen::Main { selected: 4 },
+                    Some('k') => {
+                        *selected = selected.saturating_sub(1);
+                        *armed_delete = None;
+                    }
+                    Some('j') => {
+                        *selected = (*selected + 1).min(last);
+                        *armed_delete = None;
                     }
                     Some('n') => {
                         app.screen = Screen::WzId {
@@ -1135,15 +1146,24 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             draft: wizard::Draft::default(),
                         }
                     }
+                    Some('a') | Some('i') => {
+                        app.screen = Screen::Import {
+                            buffer: String::new(),
+                            error: None,
+                        }
+                    }
                     Some('r') => {
                         *files = crate::hoster::library::list();
-                        if *selected >= files.len() {
-                            *selected = files.len().saturating_sub(1);
+                        let last = lib_row_count(files.len()).saturating_sub(1);
+                        if *selected > last {
+                            *selected = last;
                         }
                         *message = Some("refreshed".into());
                     }
-                    Some('d') if count > 0 => {
-                        if let Some(f) = files.get(*selected).cloned() {
+                    Some('d') => {
+                        if let Some(LibRow::Entry(i)) = lib_row(files.len(), *selected)
+                            && let Some(f) = files.get(i).cloned()
+                        {
                             if armed_delete.as_deref() == Some(f.id.as_str()) {
                                 match crate::hoster::library::remove(&f.id) {
                                     Ok(true) => {
@@ -1156,8 +1176,9 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                                 }
                                 *armed_delete = None;
                                 *files = crate::hoster::library::list();
-                                if *selected >= files.len() {
-                                    *selected = files.len().saturating_sub(1);
+                                let last = lib_row_count(files.len()).saturating_sub(1);
+                                if *selected > last {
+                                    *selected = last;
                                 }
                             } else {
                                 *armed_delete = Some(f.id.clone());
@@ -1190,7 +1211,12 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     match crate::hoster::library::import(&path) {
                         Ok(id) => {
                             let files = crate::hoster::library::list();
-                            let selected = files.iter().position(|f| f.id == id).unwrap_or(0);
+                            // Selection space has 2 action rows on top.
+                            let selected = files
+                                .iter()
+                                .position(|f| f.id == id)
+                                .map(|i| i + 2)
+                                .unwrap_or(0);
                             app.screen = Screen::AddService {
                                 files,
                                 selected,
@@ -1550,8 +1576,12 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             match crate::hoster::library::save(&manifest, &text) {
                                 Ok(id) => {
                                     let files = crate::hoster::library::list();
-                                    let selected =
-                                        files.iter().position(|f| f.id == id).unwrap_or(0);
+                                    // Selection space has 2 action rows on top.
+                                    let selected = files
+                                        .iter()
+                                        .position(|f| f.id == id)
+                                        .map(|i| i + 2)
+                                        .unwrap_or(2);
                                     app.screen = Screen::AddService {
                                         files,
                                         selected,
@@ -2555,6 +2585,37 @@ fn draw_confirm_clear(
     );
 }
 
+/// Rows of the Add Service screen: two clickable actions on top, then the
+/// stored manifests. Everything is reachable with ↑↓ + Enter — no hidden
+/// hotkeys required (n/a/d/r still work as shortcuts).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LibRow {
+    CreateNew,
+    ImportFile,
+    Entry(usize),
+}
+
+/// Map a selection index to a row: 0 = create, 1 = import, 2.. = files.
+fn lib_row(file_count: usize, selected: usize) -> Option<LibRow> {
+    match selected {
+        0 => Some(LibRow::CreateNew),
+        1 => Some(LibRow::ImportFile),
+        n => {
+            let i = n - 2;
+            if i < file_count {
+                Some(LibRow::Entry(i))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Total selectable rows for a given library size.
+fn lib_row_count(file_count: usize) -> usize {
+    file_count + 2
+}
+
 // --- add service (manifest library) -----------------------------------------
 
 fn draw_add_service(
@@ -2565,75 +2626,76 @@ fn draw_add_service(
     message: Option<&str>,
     armed_delete: Option<&str>,
 ) {
-    if files.is_empty() {
-        let mut text = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                " No service.yaml files in your library yet.",
-                Style::default().fg(BODY),
-            )),
-            Line::from(Span::styled(
-                " Press a to import one from disk.",
-                Style::default().fg(DIM),
-            )),
-        ];
-        if let Some(m) = message {
-            text.push(Line::from(""));
-            text.push(Line::from(Span::styled(
-                format!(" {m}"),
-                Style::default().fg(WARN_YELLOW),
-            )));
-        }
-        f.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .block(block("Add Service", VIOLET)),
-            area,
-        );
-        return;
+    let action_row = |label: &str, about: &str, row: LibRow| {
+        let sel = lib_row(files.len(), selected) == Some(row);
+        ListItem::new(Line::from(vec![
+            Span::styled(if sel { " » " } else { "   " }, Style::default().fg(VIOLET)),
+            Span::styled(
+                label.to_string(),
+                Style::default()
+                    .fg(if sel { Color::White } else { BODY })
+                    .add_modifier(if sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(format!("  {about}"), Style::default().fg(DIM)),
+        ]))
+    };
+    let mut items = vec![
+        action_row(
+            "+ Create new service.yaml",
+            "step-by-step wizard (9 steps)",
+            LibRow::CreateNew,
+        ),
+        action_row(
+            "⇪ Import existing file",
+            "copy from disk into the library",
+            LibRow::ImportFile,
+        ),
+    ];
+    if !files.is_empty() {
+        items.push(ListItem::new(Line::from("")));
     }
-    let items: Vec<ListItem> = files
-        .iter()
-        .enumerate()
-        .map(|(i, e)| {
-            let sel = i == selected;
-            let marker = if sel { " » " } else { "   " };
-            let (status, hue) = if e.valid {
-                ("ready", OK_GREEN)
-            } else {
-                ("invalid", ERR_RED)
-            };
-            let mut spans = vec![
-                Span::styled(marker, Style::default().fg(if sel { VIOLET } else { DIM })),
-                Span::styled(
-                    e.id.clone(),
-                    Style::default()
-                        .fg(if sel { Color::White } else { BODY })
-                        .add_modifier(if sel {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(format!("  [{status}]"), Style::default().fg(hue)),
-            ];
-            if let Some(src) = e.source_git.as_deref() {
-                spans.push(Span::styled(format!("  {src}"), Style::default().fg(DIM)));
-            } else if let Some(err) = e.error.as_deref() {
-                spans.push(Span::styled(
-                    format!("  {err}"),
-                    Style::default().fg(ERR_RED),
-                ));
-            }
-            if armed_delete == Some(e.id.as_str()) {
-                spans.push(Span::styled(
-                    "  ← press d again to delete",
-                    Style::default().fg(ERR_RED).add_modifier(Modifier::BOLD),
-                ));
-            }
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
+    items.extend(files.iter().enumerate().map(|(i, e)| {
+        let sel = lib_row(files.len(), selected) == Some(LibRow::Entry(i));
+        let marker = if sel { " » " } else { "   " };
+        let (status, hue) = if e.valid {
+            ("ready", OK_GREEN)
+        } else {
+            ("invalid", ERR_RED)
+        };
+        let mut spans = vec![
+            Span::styled(marker, Style::default().fg(if sel { VIOLET } else { DIM })),
+            Span::styled(
+                e.id.clone(),
+                Style::default()
+                    .fg(if sel { Color::White } else { BODY })
+                    .add_modifier(if sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(format!("  [{status}]"), Style::default().fg(hue)),
+        ];
+        if let Some(src) = e.source_git.as_deref() {
+            spans.push(Span::styled(format!("  {src}"), Style::default().fg(DIM)));
+        } else if let Some(err) = e.error.as_deref() {
+            spans.push(Span::styled(
+                format!("  {err}"),
+                Style::default().fg(ERR_RED),
+            ));
+        }
+        if armed_delete == Some(e.id.as_str()) {
+            spans.push(Span::styled(
+                "  ← press d again to delete",
+                Style::default().fg(ERR_RED).add_modifier(Modifier::BOLD),
+            ));
+        }
+        ListItem::new(Line::from(spans))
+    }));
     let mut block_widget = block("Add Service", VIOLET);
     if let Some(m) = message {
         block_widget = block_widget.title_bottom(Span::styled(
@@ -3427,8 +3489,7 @@ fn hint_line(screen: &Screen) -> Line<'static> {
             ("Esc cancel", WARN_YELLOW),
         ],
         Screen::AddService { .. } => vec![
-            ("Enter deploy", OK_GREEN),
-            ("n new a import", VIOLET),
+            ("Enter choose", OK_GREEN),
             ("d delete", ERR_RED),
             ("r refresh", BLUE),
             ("Esc back", WARN_YELLOW),
@@ -3486,6 +3547,20 @@ mod tests {
 
     /// The menu is the single source of truth: five items, Add Service last.
     /// Navigation caps derive from MAIN_MENU so this guards desync.
+    #[test]
+    fn lib_rows_map_selection_to_actions_and_files() {
+        assert_eq!(lib_row(0, 0), Some(LibRow::CreateNew));
+        assert_eq!(lib_row(0, 1), Some(LibRow::ImportFile));
+        assert_eq!(lib_row(0, 2), None);
+        assert_eq!(lib_row(2, 0), Some(LibRow::CreateNew));
+        assert_eq!(lib_row(2, 1), Some(LibRow::ImportFile));
+        assert_eq!(lib_row(2, 2), Some(LibRow::Entry(0)));
+        assert_eq!(lib_row(2, 3), Some(LibRow::Entry(1)));
+        assert_eq!(lib_row(2, 4), None);
+        assert_eq!(lib_row_count(0), 2);
+        assert_eq!(lib_row_count(3), 5);
+    }
+
     #[test]
     fn main_menu_lists_five_items_ending_with_add_service() {
         let titles: Vec<&str> = MAIN_MENU.iter().map(|(_, t, _, _)| *t).collect();

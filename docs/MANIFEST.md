@@ -71,19 +71,24 @@ and limits.
 ## Library (Add Service screen)
 
 The panel's 5th menu item keeps your own manifests in
-`~/.local/share/demo-ghostprovider/manifests/<service-id>.yaml`:
+`~/.local/share/demo-ghostprovider/manifests/<service-id>.yaml`. The top of
+the list holds two clickable rows (↑↓ + Enter, hotkeys in brackets):
 
-* `a` imports a file from disk (validated before copying; duplicates are
-  refused — delete the stored one first to replace it),
-* `n` starts the built-in wizard: 9 plain questions (name → git URL →
-  commit pin → build profile → download steps → build steps → run command
-  and port → memory/task limits → YAML review), then Enter saves the file
-  into the library,
+* `+ Create new service.yaml` (`n`) — the built-in wizard: 9 plain questions
+  (name → git URL → commit pin → build profile → download steps → build
+  steps → run command and port → memory/task limits → YAML review), then
+  Enter saves the file into the library,
+* `⇪ Import existing file` (`a`) — copy a file from disk (validated before
+  copying; duplicates are refused — delete the stored one first to replace
+  it).
+
+Below them, every stored file (re-validated on each listing):
+
 * `Enter` deploys the selected file through the same Confirm gate and the
   same sandbox + loopback + cleanup pipeline as everything else,
 * `d` twice deletes the stored file (the deployed service, if any, is
   untouched — remove it separately from My Services),
-* `r` refreshes the list (files are re-validated on every listing).
+* `r` refreshes the list.
 
 ## Built-ins
 
