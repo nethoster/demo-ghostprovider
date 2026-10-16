@@ -180,16 +180,34 @@ pub enum DeployOutcome {
 }
 
 /// Lines that earn a spot in the (deliberately laconic) deploy output:
-/// verification and warning lines plus the final reachable URL. Pure progress
-/// chatter — pre-flight, source summary, build steps, unit install, service
-/// start — is dropped; the final verdict line is what matters.
+/// the deploy subject (`source:`, always first), verification and warning
+/// lines plus the final reachable URL. Pure progress chatter — pre-flight,
+/// build steps, unit install, service start — is dropped; the final verdict
+/// line is what matters.
 fn screen_line(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with('!')
         || t.starts_with("warn: ")
         || t.starts_with("sandbox: ")
+        || t.starts_with("source: ")
         || t.starts_with("provision: ")
         || t.contains("listening on ")
+}
+
+/// One-line deploy subject for the laconic output: what is being deployed.
+/// Printed before any gate verdict so `sandbox: FULL` reads in context
+/// instead of hanging as the unexplained first line.
+fn source_line(manifest: &super::manifest::ServiceManifest) -> String {
+    let what = manifest
+        .owner_name()
+        .map(|(o, n)| format!("{o}/{n}"))
+        .unwrap_or_else(|| manifest.service.id.clone());
+    let short: String = manifest.source.commit.chars().take(7).collect();
+    format!(
+        "source: {what} @ {short} (profile {}, tools [{}])",
+        manifest.build.profile,
+        manifest.tools.join(", ")
+    )
 }
 
 /// Which of the recipe's tools need provisioning into the project cache, in
@@ -242,6 +260,23 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
             log(line);
         }
     };
+    // Resolve the subject first (pure: no network, no disk): the `source:`
+    // line hits the log before any gate verdict, so the sandbox verdict
+    // below reads in context instead of as the unexplained first line.
+    let Some((owner, name)) = super::github::parse_github_url(url) else {
+        screen("! invalid GitHub URL format".into());
+        return DeployOutcome::Rejected("bad-url");
+    };
+    // v0.0.44: the curated catalog is now three built-in `service.yaml`
+    // manifests (1:1 with the former hardcoded recipes). The deploy
+    // pipeline below is unchanged; the manifest is converted into the
+    // engine's recipe shape so every security gate stays identical.
+    let Some(manifest) = super::manifest::find_builtin(&owner, &name) else {
+        screen("! this URL is not in the built-in catalog.".into());
+        screen("! deploy it with a service.yaml (see docs/MANIFEST.md)".into());
+        return DeployOutcome::Rejected("not-curated");
+    };
+    screen(source_line(&manifest));
     // Full build isolation is mandatory: any state short of FULL is a hard
     // rejection — a build must not run weakened or as a plain host process.
     match super::sandbox::sandbox_grade() {
@@ -270,19 +305,6 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
         );
     }
 
-    let Some((owner, name)) = super::github::parse_github_url(url) else {
-        screen("! invalid GitHub URL format".into());
-        return DeployOutcome::Rejected("bad-url");
-    };
-    // v0.0.44: the curated catalog is now three built-in `service.yaml`
-    // manifests (1:1 with the former hardcoded recipes). The deploy
-    // pipeline below is unchanged; the manifest is converted into the
-    // engine's recipe shape so every security gate stays identical.
-    let Some(manifest) = super::manifest::find_builtin(&owner, &name) else {
-        screen("! this URL is not in the built-in catalog.".into());
-        screen("! deploy it with a service.yaml (see docs/MANIFEST.md)".into());
-        return DeployOutcome::Rejected("not-curated");
-    };
     let recipe = super::manifest::to_leaked_recipe(&manifest);
 
     // Preflight including per-recipe build tools (audit lesson).
@@ -392,6 +414,8 @@ pub fn run_manifest_deployment(
             log(line);
         }
     };
+    // Same subject-first order as run_deployment: what, then gates.
+    screen(source_line(manifest));
     match super::sandbox::sandbox_grade() {
         super::sandbox::SandboxGrade::Full => {
             screen("sandbox: FULL".into());
@@ -749,6 +773,10 @@ pub fn deploy_service(
     if recipe.language == "Python" {
         build_env.extend(super::prefetch::pip_offline_env(&project_dir));
     }
+    // The sandbox engages here: every step below runs inside a transient
+    // systemd unit with PrivateNetwork=yes (no network). All downloads
+    // (clone, toolbox, prefetch, seeds) are done on the host above.
+    emit("sandbox: offline build — no network from here");
     for step in recipe.pre_build.iter().chain(recipe.build_steps.iter()) {
         if interrupted() {
             rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
@@ -1479,7 +1507,9 @@ mod tests {
     fn screen_line_keeps_verdicts_and_warnings_only() {
         let kept = [
             "! pre-flight failed, aborting",
+            "source: usememos/memos @ 245e5e3 (profile go, tools [pnpm, go])",
             "sandbox: FULL",
+            "sandbox: offline build — no network from here",
             "! sandbox: ALMOST — GHOSTPROVIDER_BUILD_USER set but unusable; refusing to deploy without full isolation",
             "! sandbox: NO — refusing to build without isolation (the sandbox is mandatory)",
             "listening on http://localhost:8888",
@@ -1503,6 +1533,20 @@ mod tests {
         for line in dropped {
             assert!(!screen_line(line), "expected to drop: {line}");
         }
+    }
+
+    /// The laconic output names the subject first: `source:` passes the
+    /// filter so the sandbox verdict below it reads in context.
+    #[test]
+    fn source_line_names_subject_and_passes_filter() {
+        let m = crate::hoster::manifest::builtin("demo-memos").expect("builtin memos");
+        let line = source_line(&m);
+        assert!(
+            line.starts_with("source: usememos/memos @ "),
+            "unexpected: {line}"
+        );
+        assert!(line.contains("(profile go, tools [pnpm, go])"), "{line}");
+        assert!(screen_line(&line));
     }
 
     /// README promise: deleting a service wipes the clone together with its
