@@ -279,9 +279,8 @@ pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
     // pipeline below is unchanged; the manifest is converted into the
     // engine's recipe shape so every security gate stays identical.
     let Some(manifest) = super::manifest::find_builtin(&owner, &name) else {
-        screen("! this URL is not in the built-in catalog:".into());
-        screen("! VERT-sh/VERT · searxng/searxng · usememos/memos".into());
-        screen("! anything else needs a service.yaml (see docs/MANIFEST.md)".into());
+        screen("! this URL is not in the built-in catalog.".into());
+        screen("! deploy it with a service.yaml (see docs/MANIFEST.md)".into());
         return DeployOutcome::Rejected("not-curated");
     };
     let recipe = super::manifest::to_leaked_recipe(&manifest);

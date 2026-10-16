@@ -1004,17 +1004,9 @@ fn draw_url_input(
 ) {
     let mut text = vec![
         Line::from(Span::styled(
-            " Built-in services (or paste a path to service.yaml):",
+            " Deploy from the built-in catalog or your own service.yaml:",
             Style::default().fg(DIM),
         )),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled("VERT-sh/VERT", Style::default().fg(RED)),
-            Span::styled(" · ", Style::default().fg(DIM)),
-            Span::styled("searxng/searxng", Style::default().fg(DIM_RED)),
-            Span::styled(" · ", Style::default().fg(DIM)),
-            Span::styled("usememos/memos", Style::default().fg(RED)),
-        ]),
         Line::from(""),
         Line::from(vec![
             Span::styled(" GitHub URL or manifest path: ", Style::default().fg(DIM)),
