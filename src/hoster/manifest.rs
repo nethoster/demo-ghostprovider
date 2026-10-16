@@ -688,6 +688,124 @@ mod tests {
         }
     }
 
+    /// The built-in shelf is exactly these three manifests: no more, no less.
+    /// New services ship as user files, never as engine edits.
+    #[test]
+    fn builtin_shelf_holds_exactly_three() {
+        assert!(builtin("demo-vert").is_some());
+        assert!(builtin("demo-searxng").is_some());
+        assert!(builtin("demo-memos").is_some());
+        assert!(builtin("demo-evil").is_none());
+    }
+
+    /// Every built-in carries a resource budget through conversion: an
+    /// unbounded unit can grind the whole user session.
+    #[test]
+    fn every_builtin_has_resource_limits() {
+        for id in ["demo-vert", "demo-searxng", "demo-memos"] {
+            let m = builtin(id).expect(id);
+            let r = to_leaked_recipe(&m);
+            assert!(
+                r.res.memory_max.is_some() && r.res.tasks_max.is_some(),
+                "{id}: must set memory_max and tasks_max"
+            );
+        }
+    }
+
+    /// Audit lesson, now asserted on the converted manifests: every build
+    /// step's interpreter must be declared in `tools`.
+    #[test]
+    fn every_builtin_tool_covers_build_steps() {
+        for id in ["demo-vert", "demo-searxng", "demo-memos"] {
+            let m = builtin(id).expect(id);
+            let r = to_leaked_recipe(&m);
+            for step in r
+                .pre_build
+                .iter()
+                .chain(r.build_steps.iter())
+                .chain(r.prefetch_steps.iter())
+            {
+                let head = step.split_whitespace().next().unwrap();
+                let base = head.rsplit('/').next().unwrap();
+                if matches!(base, "bun" | "pnpm" | "go" | "python3") {
+                    assert!(
+                        r.tools.contains(&base),
+                        "{id}: step '{step}' requires '{base}' not in {:?}",
+                        r.tools
+                    );
+                }
+            }
+        }
+    }
+
+    /// Host-phase prefetch steps may never execute fetched package or project
+    /// code on the host: bun needs --ignore-scripts, pnpm must stay a
+    /// script-free `fetch`, pip must pin binary-only wheels.
+    #[test]
+    fn builtin_prefetch_never_runs_lifecycle_scripts_on_host() {
+        for id in ["demo-vert", "demo-searxng", "demo-memos"] {
+            let m = builtin(id).expect(id);
+            let r = to_leaked_recipe(&m);
+            for step in r.prefetch_steps {
+                // `touch` marker tails carry no interpreter (see searxng.yaml).
+                if step.starts_with("touch ") {
+                    continue;
+                }
+                let base = step.split_whitespace().next().unwrap();
+                match base {
+                    "bun" => assert!(
+                        step.contains("--ignore-scripts"),
+                        "{id}: bun prefetch must use --ignore-scripts: '{step}'"
+                    ),
+                    "pnpm" => assert!(
+                        step.split_whitespace().any(|w| w == "fetch"),
+                        "{id}: pnpm prefetch must be a script-free `fetch`: '{step}'"
+                    ),
+                    "python3" => assert!(
+                        step.contains("--only-binary=:all:"),
+                        "{id}: pip prefetch must pin binary-only wheels: '{step}'"
+                    ),
+                    other => panic!("{id}: unexpected prefetch tool '{other}'"),
+                }
+            }
+        }
+    }
+
+    /// Only VERT carries plugin pins, and every pin is a jsdelivr paraglide
+    /// module whose cache filename matches the FNV1a-64 derivation.
+    #[test]
+    fn builtin_plugin_pins_are_paraglide_jsdelivr_and_well_formed() {
+        for id in ["demo-vert", "demo-searxng", "demo-memos"] {
+            let m = builtin(id).expect(id);
+            let r = to_leaked_recipe(&m);
+            assert!(r.plugins.len() <= 2, "{id}: unexpected plugin count");
+            if id != "demo-vert" {
+                assert!(r.plugins.is_empty(), "{id}: non-VERT plugin pins");
+            }
+            for (url, sha) in r.plugins {
+                assert!(
+                    url.starts_with("https://cdn.jsdelivr.net/npm/@inlang/plugin-"),
+                    "{id}: {url}"
+                );
+                assert_eq!(sha.len(), 64, "{id}: {url}");
+                assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()), "{id}: {url}");
+                super::super::prefetch::paraglide_cache_name(url);
+            }
+        }
+    }
+
+    /// resolve_start must preserve the loopback pin through placeholder
+    /// expansion, so the deployed unit actually binds 127.0.0.1.
+    #[test]
+    fn builtin_memos_resolve_start_keeps_loopback_after_expansion() {
+        use std::path::Path;
+        let m = find_builtin("usememos", "memos").unwrap();
+        let r = to_leaked_recipe(&m);
+        let resolved = super::super::deploy::resolve_start(&r, Path::new("/srv/memos"), 12345);
+        assert!(resolved.contains("--addr 127.0.0.1"), "got: {resolved}");
+        assert!(resolved.contains("--port 12345"), "got: {resolved}");
+    }
+
     #[test]
     fn builtin_lookup_is_case_insensitive() {
         assert!(find_builtin("VERT-sh", "VERT").is_some());
