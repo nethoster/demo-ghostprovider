@@ -1,4 +1,6 @@
-//! Deploy sequence for service manifests (built-in catalog + user files).
+//! Deploy sequence for service manifests (user `service.yaml` files — the
+//! built-in URL catalog was removed in v0.0.44; examples live in
+//! `docs/examples/`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -251,160 +253,14 @@ fn toolbox_needs(
     out
 }
 
-/// Shared entry point used by both the TUI and the `__deploy` subcommand:
-/// validate the URL against the built-in manifest catalog, preflight the build tools,
-/// then run the full deploy pipeline. Progress goes through `log`.
-pub fn run_deployment(url: &str, log: &dyn Fn(String)) -> DeployOutcome {
-    let screen = |line: String| {
-        if screen_line(&line) {
-            log(line);
-        }
-    };
-    // Resolve the subject first (pure: no network, no disk): the `source:`
-    // line hits the log before any gate verdict, so the sandbox verdict
-    // below reads in context instead of as the unexplained first line.
-    let Some((owner, name)) = super::github::parse_github_url(url) else {
-        screen("! invalid GitHub URL format".into());
-        return DeployOutcome::Rejected("bad-url");
-    };
-    // v0.0.44: the curated catalog is now three built-in `service.yaml`
-    // manifests (1:1 with the former hardcoded recipes). The deploy
-    // pipeline below is unchanged; the manifest is converted into the
-    // engine's recipe shape so every security gate stays identical.
-    let Some(manifest) = super::manifest::find_builtin(&owner, &name) else {
-        screen("! this URL is not in the built-in catalog.".into());
-        screen("! deploy it with a service.yaml (see docs/MANIFEST.md)".into());
-        return DeployOutcome::Rejected("not-curated");
-    };
-    screen(source_line(&manifest));
-    // Full build isolation is mandatory: any state short of FULL is a hard
-    // rejection — a build must not run weakened or as a plain host process.
-    match super::sandbox::sandbox_grade() {
-        super::sandbox::SandboxGrade::Full => {
-            screen("sandbox: FULL".into());
-        }
-        super::sandbox::SandboxGrade::Almost => {
-            screen(
-                "! sandbox: ALMOST — GHOSTPROVIDER_BUILD_USER set but unusable; refusing to \
-                 deploy without full isolation"
-                    .into(),
-            );
-            return DeployOutcome::Rejected("sandbox-unavailable");
-        }
-        super::sandbox::SandboxGrade::None => {
-            screen(
-                "! sandbox: NO — refusing to build without isolation (the sandbox is mandatory)"
-                    .into(),
-            );
-            return DeployOutcome::Rejected("sandbox-unavailable");
-        }
-    }
-    if crate::netlog::logging_disabled() {
-        screen(
-            "warn: GHOSTPROVIDER_NO_NETLOG — outbound requests are not written to net.log".into(),
-        );
-    }
-
-    let recipe = super::manifest::to_leaked_recipe(&manifest);
-
-    // Preflight including per-recipe build tools (audit lesson).
-    let issues = super::preflight::preflight_check(recipe.tools);
-    if !issues.is_empty() {
-        for i in issues {
-            screen(format!("! {i}"));
-        }
-        screen("! pre-flight failed, aborting".into());
-        return DeployOutcome::Rejected("preflight");
-    }
-
-    let analysis = RepoAnalysis {
-        url: url.to_string(),
-        owner,
-        name,
-        language: recipe.language.into(),
-        exists: true,
-        clone_path: None,
-        errors: vec![],
-    };
-    // Journal the in-flight deploy. The entry is what lets an out-of-band
-    // interruption (panel exit/kill, shutdown/reboot) become a clean removal
-    // at the next launch; it is cleared at the end of this function for every
-    // in-process outcome (success or rollback).
-    //
-    // The cross-process deploy lock serializes pipelines: only one deploy may
-    // be running per user session (a second TUI, a scripted `__deploy`, or a
-    // stale caller would otherwise race the same clone/unit/port namespace).
-    // The lock is held from just before `journal::begin` until just after
-    // `journal::clear`, so a background sweeper that finds "journal entry
-    // present + lock free" knows the deploying process is dead and may remove
-    // leftovers without ever tearing down a live deploy.
-    DEPLOY_IN_FLIGHT.store(true, Ordering::Relaxed);
-    let Some(_lock) = super::lock::try_lock_exclusive() else {
-        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
-        screen(
-            "! another deployment is already running (deploy.lock held) — refusing to \
-             start a second one"
-                .into(),
-        );
-        return DeployOutcome::Rejected("deploy-locked");
-    };
-    journal::begin(recipe.service_name, url);
-
-    // Race guard for a just-spawned worker: if the exit path already asked us
-    // to stop (it set `EXITING` before this thread reached this line), settle
-    // our own entry now — nothing has been cloned or built yet, so there is
-    // nothing for the exit path to find and we must not leave a fresh entry
-    // behind after it reconciled.
-    if super::cancel::is_exiting() {
-        journal::clear(recipe.service_name);
-        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
-        return DeployOutcome::Rejected("exiting");
-    }
-
-    let result = deploy_service(
-        &analysis,
-        &recipe,
-        None,
-        DeployHooks {
-            on_status: Some(&|line| screen(line.to_string())),
-        },
-    );
-
-    for u in &result.urls {
-        screen(format!("listening on {u}"));
-    }
-    // The deploy reached a terminal state the process itself handled (success
-    // or the in-process rollback already removed artifacts); clear our journal
-    // entry so the next launch does not re-clean a finished deploy. The deploy
-    // lock is released here — after the entry is gone, so a sweeper can never
-    // see a live deploy's entry while the lock is free.
-    //
-    // The one exception is a graceful exit in progress: the exit path is about
-    // to reconcile and performs the *final* clean removal, and it needs the
-    // entry to remain so it can wipe a partial clone tree that never got a
-    // rollback (e.g. `clone_repo` failed — there is no project path to remove
-    // on our side). Leave the entry; the exit path settles it. See `cancel.rs`.
-    if super::cancel::is_exiting() {
-        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
-    } else {
-        journal::clear(recipe.service_name);
-        DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
-    }
-    if !result.service_names.is_empty() && result.errors.is_empty() {
-        DeployOutcome::Deployed
-    } else {
-        DeployOutcome::Failed
-    }
-}
-
 /// Deploy one validated user manifest (`service.yaml`).
 ///
-/// Same pipeline as [`run_deployment`]: sandbox FULL gate, preflight,
-/// deploy lock + journal, [`deploy_service`], journal settle. The only
-/// difference is the recipe source — a user file instead of the built-in
-/// catalog. The manifest MUST already be validated
-/// (`ServiceManifest::load_from_file` does that); this reuses the audited
-/// pipeline verbatim via [`super::manifest::to_leaked_recipe`].
+/// The only scripted/interactive deploy entry left (v0.0.44, demo-declutter:
+/// the built-in URL catalog is gone): sandbox FULL gate, preflight,
+/// deploy lock + journal, [`deploy_service`], journal settle. The manifest
+/// MUST already be validated (`ServiceManifest::load_from_file` does that);
+/// this reuses the audited pipeline verbatim via
+/// [`super::manifest::to_leaked_recipe`].
 pub fn run_manifest_deployment(
     manifest: &super::manifest::ServiceManifest,
     log: &dyn Fn(String),
@@ -414,7 +270,7 @@ pub fn run_manifest_deployment(
             log(line);
         }
     };
-    // Same subject-first order as run_deployment: what, then gates.
+    // Subject-first order: the `source:` line, then gate verdicts.
     screen(source_line(manifest));
     match super::sandbox::sandbox_grade() {
         super::sandbox::SandboxGrade::Full => {
@@ -1555,7 +1411,10 @@ mod tests {
     /// filter so the sandbox verdict below it reads in context.
     #[test]
     fn source_line_names_subject_and_passes_filter() {
-        let m = crate::hoster::manifest::builtin("demo-memos").expect("builtin memos");
+        let m = crate::hoster::manifest::ServiceManifest::load_from_file(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/examples/memos.yaml"),
+        )
+        .expect("memos example must validate");
         let line = source_line(&m);
         assert!(
             line.starts_with("source: usememos/memos @ "),

@@ -416,6 +416,15 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                         *error = Some("enter a GitHub URL or a path to service.yaml".into());
                     } else {
                         match crate::tui::workers::classify_deploy_input(buffer.trim()) {
+                            // This stripped panel has no detect/wizard flow:
+                            // URL detection lives in the main panel.
+                            Ok(crate::tui::workers::DeployTarget::Detect { .. }) => {
+                                *error = Some(
+                                    "URL detection runs in the main panel \
+                                     (Add Service → Detect)"
+                                        .into(),
+                                );
+                            }
                             Ok(target) => {
                                 app.screen = Screen::Confirm {
                                     target,
@@ -449,14 +458,32 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 },
             }
             match decision {
-                Some(true) => {
-                    let label = target.describe();
-                    crate::tui::workers::start_target_deployment(app.tx.clone(), target.clone());
-                    app.screen = Screen::Deploy {
-                        lines: vec![format!("deploying {label}...")],
-                        done: None,
-                    };
-                }
+                Some(true) => match target {
+                    // Defensive: URLs are rejected at the input in this
+                    // panel (no wizard here); detection is main-panel only.
+                    crate::tui::workers::DeployTarget::Detect { .. } => {
+                        app.screen = Screen::UrlInput {
+                            buffer: target.back_to_input(),
+                            error: Some(
+                                "URL detection runs in the main panel \
+                                 (Add Service → Detect)"
+                                    .into(),
+                            ),
+                            busy: false,
+                        };
+                    }
+                    manifest @ crate::tui::workers::DeployTarget::Manifest { .. } => {
+                        let label = manifest.describe();
+                        crate::tui::workers::start_target_deployment(
+                            app.tx.clone(),
+                            manifest.clone(),
+                        );
+                        app.screen = Screen::Deploy {
+                            lines: vec![format!("deploying {label}...")],
+                            done: None,
+                        };
+                    }
+                },
                 Some(false) => {
                     app.screen = Screen::UrlInput {
                         buffer: target.back_to_input(),
@@ -1017,7 +1044,7 @@ fn draw_url_input(
 ) {
     let mut text = vec![
         Line::from(Span::styled(
-            " Deploy from the built-in catalog or your own service.yaml:",
+            " Paste a path to service.yaml (this panel deploys manifests only):",
             Style::default().fg(DIM),
         )),
         Line::from(""),
@@ -1099,20 +1126,26 @@ fn draw_confirm(
 ) {
     use crate::tui::workers::DeployTarget as Target;
     let mut text = vec![Line::from("")];
-    match target {
-        Target::Url { url, service_label } => {
+    let (title, yes_label) = match target {
+        Target::Detect { url, service_label } => {
             text.push(Line::from(vec![
                 Span::styled(
-                    " Host ",
+                    " Detect ",
                     Style::default().fg(DIM).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(service_label.to_string(), Style::default().fg(RED)),
-                Span::styled(" on this machine?", Style::default().fg(BODY)),
+                Span::styled(" from GitHub?", Style::default().fg(BODY)),
             ]));
             text.push(Line::from(vec![
                 Span::styled(" URL: ", Style::default().fg(DIM)),
                 Span::styled(url.to_string(), Style::default().fg(RED)),
             ]));
+            text.push(Line::from(Span::styled(
+                " Nothing is deployed yet: shallow clone → detect the stack → \
+                 review the prefilled wizard.",
+                Style::default().fg(DIM),
+            )));
+            ("Confirm Detect", " — detect stack")
         }
         Target::Manifest {
             path,
@@ -1140,11 +1173,12 @@ fn draw_confirm(
                     Style::default().fg(DIM),
                 )));
             }
+            ("Confirm Deployment", " — deploy")
         }
-    }
+    };
     text.extend([
         Line::from(""),
-        Line::from(choice_spans("[Y]es", " — deploy", RED, yes_selected)),
+        Line::from(choice_spans("[Y]es", yes_label, RED, yes_selected)),
         Line::from(choice_spans("[N]o", " — cancel", DIM_RED, !yes_selected)),
         Line::from(""),
         Line::from(Span::styled(
@@ -1152,11 +1186,10 @@ fn draw_confirm(
             Style::default().fg(DIM),
         )),
     ]);
-    let block_title = "Confirm Deployment";
     f.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
-            .block(block(block_title, RED)),
+            .block(block(title, RED)),
         area,
     );
 }
@@ -1661,7 +1694,7 @@ fn hint_line(screen: &Screen) -> Line<'static> {
             if *busy {
                 vec![("working…", DIM_RED)]
             } else {
-                vec![("Enter deploy", RED), ("Esc back", DIM_RED)]
+                vec![("Enter continue", RED), ("Esc back", DIM_RED)]
             }
         }
         Screen::Confirm { .. } => vec![

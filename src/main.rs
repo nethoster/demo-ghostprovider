@@ -14,7 +14,10 @@
 //!   __egress-probe [--hosts a,b]  internal: probe beats for egress checks
 //!   __check-manifest PATH   validate a service.yaml and print the plan
 //!   __recipe-edit ID        edit a stored service.yaml in $EDITOR (re-validated)
-//!   __deploy URL | --manifest PATH   scripted deploy (URL or manifest file)
+//!   __deploy URL            detect the stack of a GitHub URL and print a
+//!                            service.yaml to stdout (review, then deploy
+//!                            with --manifest — a URL never deploys itself)
+//!   __deploy --manifest PATH scripted deploy of one service.yaml
 
 #![deny(unsafe_code)]
 
@@ -122,18 +125,17 @@ fn main() -> anyhow::Result<()> {
         }
         Some("__deploy") => {
             reconcile_on_startup();
-            // A scripted deploy gets the same clean-removal guarantee as the
-            // panel: on SIGINT/SIGTERM/SIGHUP (Ctrl+C, systemd shutdown,
-            // terminal close) a watchdog runs the removal-II reconciliation
-            // path before exiting, so a half-finished clone/build tree and the
-            // journal entry never survive the process. While the deploy is
-            // running, this process itself holds the deploy lock, so the
-            // watchdog has no concurrent live deploy to race.
-            arm_deploy_signal_watchdog();
             use std::cell::RefCell;
-            // v0.0.44: `__deploy --manifest PATH` deploys one user manifest;
-            // `__deploy URL` keeps the built-in catalog path.
+            // v0.0.44 (demo-declutter): the built-in URL catalog is gone —
+            // a deploy only ever runs from a `service.yaml`. Two modes:
+            //   * `--manifest PATH` — the deploy pipeline itself, with the
+            //     exit-signal watchdog armed (SIGINT cleans up mid-deploy);
+            //   * `URL` — the smart path: clone to a temp dir, detect the
+            //     stack, print the resulting service.yaml on stdout for
+            //     review. Detection holds no deploy lock and starts no
+            //     pipeline, so no watchdog is needed there.
             if args.get(1).map(String::as_str) == Some("--manifest") {
+                arm_deploy_signal_watchdog();
                 let path = args.get(2).context("usage: __deploy --manifest PATH")?;
                 let painter = RefCell::new(demo_ghostprovider::output::Painter::new());
                 println!();
@@ -156,22 +158,37 @@ fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
-            let url = args.get(1).context("usage: __deploy GITHUB_URL")?;
-            let painter = RefCell::new(demo_ghostprovider::output::Painter::new());
-            println!();
-            println!("{}", painter.borrow().header(url));
-            let outcome = demo_ghostprovider::hoster::deploy::run_deployment(url, &|line| {
-                for out in painter.borrow_mut().render(&line) {
-                    println!("{out}");
+            let url = args
+                .get(1)
+                .context("usage: __deploy GITHUB_URL | --manifest PATH")?;
+            let ready = match demo_ghostprovider::tui::workers::detect_url(url) {
+                Ok(ready) => ready,
+                Err(e) => {
+                    eprintln!("! detect failed: {e}");
+                    std::process::exit(1);
                 }
-            });
-            match outcome {
-                // The reachable URL is already printed above ("+ listening on
-                // …"); no extra verdict line needed on success.
-                demo_ghostprovider::hoster::deploy::DeployOutcome::Deployed => {}
-                other => {
-                    eprintln!("{}", painter.borrow().summary(false));
-                    eprintln!("  reason: {other:?}");
+            };
+            let mut draft = ready.draft;
+            if draft.id.trim().is_empty() {
+                draft.id = ready.suggested_id;
+            }
+            // Detection notes (why it guessed what it guessed) are part of
+            // the review material — stderr keeps stdout a pure YAML stream,
+            // so `__deploy URL > service.yaml` yields a ready file.
+            for n in &draft.notes {
+                eprintln!("note: {n}");
+            }
+            match demo_ghostprovider::tui::wizard::preview_yaml(&draft) {
+                Ok(yaml) => {
+                    write_stdout(&yaml);
+                    eprintln!(
+                        "detected profile '{}' — review the service.yaml above, then run:\n  \
+                         demo-ghostprovider __deploy --manifest <path>",
+                        draft.profile
+                    );
+                }
+                Err(e) => {
+                    eprintln!("! cannot build a manifest from detection: {e}");
                     std::process::exit(1);
                 }
             }
@@ -245,6 +262,7 @@ fn print_help() {
          \x20 demo-ghostprovider __check-manifest PATH   validate a service.yaml and print the plan\n\
          \x20 demo-ghostprovider __recipe-edit ID   edit a stored service.yaml in $EDITOR\n\
          \x20 demo-ghostprovider __deploy --manifest PATH  deploy one service.yaml\n\
+         \x20 demo-ghostprovider __deploy GITHUB_URL  detect the stack, print service.yaml to stdout\n\
          \x20 demo-ghostprovider __egress-probe [--hosts a,b]  probe egress beats (reads only)",
         env!("CARGO_PKG_VERSION")
     );

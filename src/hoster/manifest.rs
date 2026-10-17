@@ -317,11 +317,10 @@ impl ServiceManifest {
         if self.service.id.starts_with('-') || self.service.id.ends_with('-') {
             anyhow::bail!("{}", at("service.id must not start/end with '-'"));
         }
-        for reserved in ["demo-vert", "demo-searxng", "demo-memos"] {
-            // Reserved ids stay usable ONLY via built-in manifests so a user
-            // file cannot shadow/squat the curated names.
-            let _ = reserved;
-        }
+        // Legacy ids `demo-vert`/`demo-searxng`/`demo-memos` stay valid on
+        // purpose: they name already-deployed units and the shipped examples
+        // (docs/examples/) — a redeploy of those must keep working. There is
+        // no curated catalog left to squat.
         // systemd unit safety (mirrors units::validate_unit_name, dots allowed
         // but leading dot forbidden).
         if self.service.id.starts_with('.') {
@@ -660,39 +659,11 @@ pub fn expand_manifest_path(input: &str) -> std::path::PathBuf {
     }
 }
 
-// ── built-in manifests (1:1 with the former hardcoded recipes) ──
-
-pub const MANIFEST_VERT: &str = include_str!("manifests/vert.yaml");
-pub const MANIFEST_SEARXNG: &str = include_str!("manifests/searxng.yaml");
-pub const MANIFEST_MEMOS: &str = include_str!("manifests/memos.yaml");
-
-/// Parse a built-in manifest (already validated at authorship time).
-pub fn builtin(name: &str) -> Option<ServiceManifest> {
-    let text = match name {
-        "demo-vert" => MANIFEST_VERT,
-        "demo-searxng" => MANIFEST_SEARXNG,
-        "demo-memos" => MANIFEST_MEMOS,
-        _ => return None,
-    };
-    ServiceManifest::load_from_str(text, name).ok()
-}
-
-/// Find a built-in manifest by GitHub owner/name (case-insensitive).
-pub fn find_builtin(owner: &str, name: &str) -> Option<ServiceManifest> {
-    for id in ["demo-vert", "demo-searxng", "demo-memos"] {
-        let m = builtin(id)?;
-        // NOTE: builtin() returns None only for unknown ids above; a parse
-        // failure would surface in tests. Keep the `?` so a broken built-in
-        // fails loudly here rather than silently skipping.
-        if let Some((o, n)) = m.owner_name()
-            && o.eq_ignore_ascii_case(owner)
-            && n.eq_ignore_ascii_case(name)
-        {
-            return Some(m);
-        }
-    }
-    None
-}
+// ── built-in manifests were removed in v0.0.44 (demo-declutter): reference
+// examples live as plain files in `docs/examples/*.yaml` — validated by the
+// tests below, never embedded into the binary. Every deploy goes through a
+// user-provided `service.yaml`; a GitHub URL is input for stack detection
+// (Add Service → Detect / `__deploy URL`), never a deployable on its own.
 
 /// Convert a validated manifest into the engine's recipe shape.
 ///
@@ -781,35 +752,45 @@ pub fn to_leaked_recipe(m: &ServiceManifest) -> super::recipes::DemoRecipe {
 mod tests {
     use super::*;
 
+    /// Reference example (docs/examples/<name>.yaml) loaded from disk —
+    /// examples are validated in tests, never embedded into the binary.
+    fn example(id: &str) -> ServiceManifest {
+        let file = match id {
+            "demo-vert" => "vert.yaml",
+            "demo-searxng" => "searxng.yaml",
+            "demo-memos" => "memos.yaml",
+            other => panic!("unknown example {other}"),
+        };
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("docs/examples")
+            .join(file);
+        ServiceManifest::load_from_file(&path)
+            .unwrap_or_else(|e| panic!("{id} example must validate: {e}"))
+    }
+
+    fn example_ids() -> [&'static str; 3] {
+        ["demo-vert", "demo-searxng", "demo-memos"]
+    }
+
     fn sample() -> ServiceManifest {
-        ServiceManifest::load_from_str(MANIFEST_VERT, "test").expect("builtin vert must validate")
+        example("demo-vert")
     }
 
     #[test]
-    fn builtins_validate() {
-        for id in ["demo-vert", "demo-searxng", "demo-memos"] {
-            let m = builtin(id).unwrap_or_else(|| panic!("{id} must parse"));
+    fn examples_validate() {
+        for id in example_ids() {
+            let m = example(id);
             assert_eq!(m.service.id, id);
             assert_eq!(m.manifest_version, 1);
         }
     }
 
-    /// The built-in shelf is exactly these three manifests: no more, no less.
-    /// New services ship as user files, never as engine edits.
-    #[test]
-    fn builtin_shelf_holds_exactly_three() {
-        assert!(builtin("demo-vert").is_some());
-        assert!(builtin("demo-searxng").is_some());
-        assert!(builtin("demo-memos").is_some());
-        assert!(builtin("demo-evil").is_none());
-    }
-
-    /// Every built-in carries a resource budget through conversion: an
+    /// Every example carries a resource budget through conversion: an
     /// unbounded unit can grind the whole user session.
     #[test]
-    fn every_builtin_has_resource_limits() {
-        for id in ["demo-vert", "demo-searxng", "demo-memos"] {
-            let m = builtin(id).expect(id);
+    fn every_example_has_resource_limits() {
+        for id in example_ids() {
+            let m = example(id);
             let r = to_leaked_recipe(&m);
             assert!(
                 r.res.memory_max.is_some() && r.res.tasks_max.is_some(),
@@ -821,9 +802,9 @@ mod tests {
     /// Audit lesson, now asserted on the converted manifests: every build
     /// step's interpreter must be declared in `tools`.
     #[test]
-    fn every_builtin_tool_covers_build_steps() {
-        for id in ["demo-vert", "demo-searxng", "demo-memos"] {
-            let m = builtin(id).expect(id);
+    fn every_example_tool_covers_build_steps() {
+        for id in example_ids() {
+            let m = example(id);
             let r = to_leaked_recipe(&m);
             for step in r
                 .pre_build
@@ -848,9 +829,9 @@ mod tests {
     /// code on the host: bun needs --ignore-scripts, pnpm must stay a
     /// script-free `fetch`, pip must pin binary-only wheels.
     #[test]
-    fn builtin_prefetch_never_runs_lifecycle_scripts_on_host() {
-        for id in ["demo-vert", "demo-searxng", "demo-memos"] {
-            let m = builtin(id).expect(id);
+    fn example_prefetch_never_runs_lifecycle_scripts_on_host() {
+        for id in example_ids() {
+            let m = example(id);
             let r = to_leaked_recipe(&m);
             for step in r.prefetch_steps {
                 // `touch` marker tails carry no interpreter (see searxng.yaml).
@@ -880,9 +861,9 @@ mod tests {
     /// Only VERT carries plugin pins, and every pin is a jsdelivr paraglide
     /// module whose cache filename matches the FNV1a-64 derivation.
     #[test]
-    fn builtin_plugin_pins_are_paraglide_jsdelivr_and_well_formed() {
-        for id in ["demo-vert", "demo-searxng", "demo-memos"] {
-            let m = builtin(id).expect(id);
+    fn example_plugin_pins_are_paraglide_jsdelivr_and_well_formed() {
+        for id in example_ids() {
+            let m = example(id);
             let r = to_leaked_recipe(&m);
             assert!(r.plugins.len() <= 2, "{id}: unexpected plugin count");
             if id != "demo-vert" {
@@ -944,21 +925,13 @@ mod tests {
     }
 
     #[test]
-    fn builtin_memos_resolve_start_keeps_loopback_after_expansion() {
+    fn memos_example_resolve_start_keeps_loopback_after_expansion() {
         use std::path::Path;
-        let m = find_builtin("usememos", "memos").unwrap();
+        let m = example("demo-memos");
         let r = to_leaked_recipe(&m);
         let resolved = super::super::deploy::resolve_start(&r, Path::new("/srv/memos"), 12345);
         assert!(resolved.contains("--addr 127.0.0.1"), "got: {resolved}");
         assert!(resolved.contains("--port 12345"), "got: {resolved}");
-    }
-
-    #[test]
-    fn builtin_lookup_is_case_insensitive() {
-        assert!(find_builtin("VERT-sh", "VERT").is_some());
-        assert!(find_builtin("searxng", "searxng").is_some());
-        assert!(find_builtin("usememos", "memos").is_some());
-        assert!(find_builtin("foo", "bar").is_none());
     }
 
     #[test]
@@ -1049,9 +1022,9 @@ mod tests {
     }
 
     #[test]
-    fn every_builtin_binds_loopback_only() {
-        for id in ["demo-vert", "demo-searxng", "demo-memos"] {
-            let m = builtin(id).expect(id);
+    fn every_example_binds_loopback_only() {
+        for id in example_ids() {
+            let m = example(id);
             let joined = m.run.command.join(" ");
             if !m.searxng {
                 assert!(joined.contains("{port}"), "{id}");

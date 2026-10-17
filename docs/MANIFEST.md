@@ -156,8 +156,10 @@ explicitly names a host. The check is honest about its limits: TCP beats can
 report `open` through any network path the unit actually has, so treat
 `OPEN` on a deny-all service as a finding, not a probe error.
 
-## Built-ins
+## Examples
 
-`src/hoster/manifests/{vert,searxng,memos}.yaml` are the three former
-hardcoded recipes expressed as manifests 1:1. URL deploys resolve through
-them, so the old pipeline and its tests exercise the manifest path.
+`docs/examples/{vert,searxng,memos}.yaml` are the three former hardcoded
+recipes expressed as manifests 1:1 — reference files, validated by the test
+suite, never embedded into the binary. Nothing deploys from a URL by itself
+anymore: paste a GitHub URL (panel Deploy input or `__deploy URL`) and the
+stack is detected into a `service.yaml` you review before deploying.

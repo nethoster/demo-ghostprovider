@@ -69,7 +69,8 @@ announced port — in every scenario:
   `demo-ghostprovider __cleanup`, so leftovers of an interrupted deploy are
   removed in the background even if the interactive panel never opens again.
 
-A scripted deploy (`demo-ghostprovider __deploy URL`) gets the same treatment:
+A scripted deploy (`demo-ghostprovider __deploy --manifest service.yaml`) gets
+the same treatment:
 the first `SIGINT`/`SIGTERM`/`SIGHUP` triggers the removal path and exits
 `130`, so Ctrl+C cannot leave a half-built clone behind.
 
@@ -119,13 +120,17 @@ Full dashboard for all deployed services. Start, stop, restart, or remove — on
 
 ## Service support
 
-This demo ships three built-in `service.yaml` manifests (`docs/MANIFEST.md`):
+This demo ships three reference `service.yaml` manifests in `docs/examples/`
+(format: `docs/MANIFEST.md`):
 
 - **VERT** - https://github.com/VERT-sh/VERT
 - **SearXNG** - https://github.com/searxng/searxng
 - **Memos** - https://github.com/usememos/memos
 
-Custom services use the same format: `demo-ghostprovider __check-manifest service.yaml`
+Nothing deploys from a URL by itself: paste a GitHub URL anywhere (panel
+Deploy input, `demo-ghostprovider __deploy URL`) and the stack is detected
+into a `service.yaml` you review before deploying. Same format for every
+service: `demo-ghostprovider __check-manifest service.yaml`
 validates and prints the deploy plan, `demo-ghostprovider __deploy --manifest service.yaml`
 deploys it through the identical sandbox + loopback + cleanup pipeline.
 In the panel, menu item 4 (Add Service) imports `service.yaml` files into your

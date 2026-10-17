@@ -1,8 +1,9 @@
 //! On-disk journal of in-flight deployments.
 //!
 //! A deploy writes an entry (`Deploying`) before it begins, advances it at the
-//! registration step (`Registering`, then `Registered`), and `run_deployment`
-//! removes the entry when the deploy finishes — successfully or after the
+//! registration step (`Registering`, then `Registered`), and
+//! `run_manifest_deployment` removes the entry when the deploy finishes —
+//! successfully or after the
 //! in-process rollback. An entry still present at the next launch therefore
 //! means the previous run was interrupted out-of-band (user exited the panel,
 //! the process was killed, or the machine shut down / rebooted), and the

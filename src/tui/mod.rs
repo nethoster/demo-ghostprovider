@@ -143,8 +143,9 @@ pub(crate) enum Screen {
         busy: bool,
     },
     /// YES/NO gate before hosting a service (see README "Security model").
-    /// The target is either a GitHub URL (built-in catalog) or a local
-    /// `service.yaml` manifest the user pointed at.
+    /// The target is either a GitHub URL (routes to stack detection — the
+    /// wizard review, nothing deployed) or a local `service.yaml` manifest
+    /// the user pointed at (deploys).
     Confirm {
         target: workers::DeployTarget,
         /// Which button the arrow keys currently highlight.
@@ -784,7 +785,7 @@ fn exit_with_reconcile(app: &mut App) -> anyhow::Result<()> {
     // screen (still `done: None`) is the reliable "a worker exists" signal, and
     // it is set by the UI thread before any exit key can be read. Asking for an
     // exit first makes even a worker that starts mid-exit abort before its
-    // first clone (see the race guard in `run_deployment`).
+    // first clone (see the race guard in `run_manifest_deployment`).
     let worker_live = crate::hoster::deploy::deploy_in_flight()
         || matches!(app.screen, Screen::Deploy { done: None, .. });
     // Captured before the reconcile settles the journal, so the terminal
@@ -960,14 +961,27 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 },
             }
             match decision {
-                Some(true) => {
-                    let label = target.describe();
-                    workers::start_target_deployment(app.tx.clone(), target.clone());
-                    app.screen = Screen::Deploy {
-                        lines: vec![format!("deploying {label}...")],
-                        done: None,
-                    };
-                }
+                Some(true) => match target {
+                    // A URL never deploys: it feeds stack detection, whose
+                    // result lands in the wizard for explicit review.
+                    workers::DeployTarget::Detect { url, .. } => {
+                        let url = url.clone();
+                        app.screen = Screen::DetectInput {
+                            buffer: url.clone(),
+                            error: None,
+                            busy: true,
+                        };
+                        workers::spawn_detect(app.tx.clone(), url);
+                    }
+                    manifest @ workers::DeployTarget::Manifest { .. } => {
+                        let label = manifest.describe();
+                        workers::start_target_deployment(app.tx.clone(), manifest.clone());
+                        app.screen = Screen::Deploy {
+                            lines: vec![format!("deploying {label}...")],
+                            done: None,
+                        };
+                    }
+                },
                 // Back to the input with the URL/path preserved.
                 Some(false) => {
                     app.screen = Screen::UrlInput {
@@ -2905,7 +2919,7 @@ fn draw_url_input(
 ) {
     let mut text = vec![
         Line::from(Span::styled(
-            " Deploy from the built-in catalog or your own service.yaml:",
+            " Paste a GitHub URL (detects the stack, nothing deployed yet) or a path to service.yaml:",
             Style::default().fg(DIM),
         )),
         Line::from(""),
@@ -2998,22 +3012,28 @@ fn draw_confirm(
     use workers::DeployTarget as Target;
     // Header rows differ by source; the YES/NO gate below is identical.
     let mut text = vec![Line::from("")];
-    match target {
-        Target::Url { url, service_label } => {
+    let (title, yes_label) = match target {
+        Target::Detect { url, service_label } => {
             text.push(Line::from(vec![
                 Span::styled(
-                    " Host ",
+                    " Detect ",
                     Style::default()
                         .fg(WARN_YELLOW)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(service_label.to_string(), Style::default().fg(Color::White)),
-                Span::styled(" on this machine?", Style::default().fg(BODY)),
+                Span::styled(" from GitHub?", Style::default().fg(BODY)),
             ]));
             text.push(Line::from(vec![
                 Span::styled(" URL: ", Style::default().fg(DIM)),
                 Span::styled(url.to_string(), Style::default().fg(ACCENT)),
             ]));
+            text.push(Line::from(Span::styled(
+                " Nothing is deployed yet: shallow clone → detect the stack → \
+                 review the prefilled wizard.",
+                Style::default().fg(DIM),
+            )));
+            ("Confirm Detect", " — detect stack")
         }
         Target::Manifest {
             path,
@@ -3044,11 +3064,12 @@ fn draw_confirm(
                     Style::default().fg(DIM),
                 )));
             }
+            ("Confirm Deployment", " — deploy")
         }
-    }
+    };
     text.extend([
         Line::from(""),
-        Line::from(choice_spans("[Y]es", " — deploy", OK_GREEN, yes_selected)),
+        Line::from(choice_spans("[Y]es", yes_label, OK_GREEN, yes_selected)),
         Line::from(choice_spans(
             "[N]o",
             " — cancel",
@@ -3064,7 +3085,7 @@ fn draw_confirm(
     f.render_widget(
         Paragraph::new(text)
             .wrap(Wrap { trim: false })
-            .block(block("Confirm Deployment", WARN_YELLOW)),
+            .block(block(title, WARN_YELLOW)),
         area,
     );
 }
@@ -4400,7 +4421,7 @@ fn hint_line(screen: &Screen) -> Line<'static> {
             if *busy {
                 vec![("working…", WARN_YELLOW)]
             } else {
-                vec![("Enter deploy", OK_GREEN), ("Esc back", WARN_YELLOW)]
+                vec![("Enter continue", OK_GREEN), ("Esc back", WARN_YELLOW)]
             }
         }
         Screen::Confirm { .. } => vec![
