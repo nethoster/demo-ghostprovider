@@ -161,6 +161,11 @@ pub struct UnitSpec<'a> {
     pub extra_env: &'a [(String, String)],
     /// Resource caps rendered into the unit (see `ResourceLimits`).
     pub res: ResourceLimits,
+    /// Per-service egress exceptions (manifest `egress.allow`) — already
+    /// resolved to literal addresses by the deploy pipeline: systemd's
+    /// `IPAddressAllow=` rejects hostnames, so names never reach the unit.
+    /// Empty keeps the historic deny-all: loopback only.
+    pub egress_allow: &'a [&'a str],
 }
 
 pub fn create_unit(spec: &UnitSpec) -> anyhow::Result<()> {
@@ -364,11 +369,24 @@ fn render_unit(spec: &UnitSpec) -> anyhow::Result<String> {
     // a single value and stays unquoted.
     let working = escape_unit_value(&spec.working_dir.to_string_lossy());
     let inaccessible = inaccessible_paths();
-    // Egress is removed for EVERY service. IPAddressAllow takes precedence
-    // over IPAddressDeny, so `Deny=any` + `Allow=127.0.0.1 ::1` means the unit
-    // may only talk to loopback: the localhost:PORT surface stays reachable
-    // while any outbound connection fails at the systemd firewall level.
-    const IP_FILTER: &str = "IPAddressDeny=any\nIPAddressAllow=127.0.0.1 ::1\n";
+    // Egress is denied for EVERY service by default. IPAddressAllow takes
+    // precedence over IPAddressDeny, so `Deny=any` + `Allow=127.0.0.1 ::1`
+    // means the unit may only talk to loopback: the localhost:PORT surface
+    // stays reachable while any outbound connection fails at the systemd
+    // firewall level. A manifest `egress.allow` list appends exceptions
+    // (each a conscious trust decision recorded in service.yaml) — already
+    // resolved to literal addresses by the deploy pipeline, because
+    // IPAddressAllow= rejects hostnames and would refuse the whole unit.
+    // Empty keeps the historic deny-all byte-for-byte.
+    let mut ip_filter = String::from("IPAddressDeny=any\nIPAddressAllow=127.0.0.1 ::1");
+    for h in spec.egress_allow {
+        ip_filter.push(' ');
+        ip_filter.push_str(h);
+    }
+    ip_filter.push('\n');
+    // Per-unit traffic accounting: the Egress screen reads IPEgressBytes /
+    // IPIngressBytes back. Counting only — enforcement stays above.
+    let ip_filter = ip_filter + "IPAccounting=yes\n";
     let content = format!(
         "[Unit]\nDescription={desc}\nAfter=network.target\n\n\
           [Service]\nType=simple\nWorkingDirectory={working}\nExecStart={exec}\n\
@@ -397,11 +415,28 @@ RestrictSUIDSGID=yes\nProtectProc=invisible\nPrivateDevices=yes\nProcSubset=pid\
         }),
         working = working,
         exec = quote_exec_args(spec.exec_start),
-        res_lines = res_lines,
-        ip_filter = IP_FILTER,
+         res_lines = res_lines,
+        ip_filter = ip_filter,
         unset_env = runtime_unset_environment(),
     );
     Ok(content)
+}
+
+/// Per-unit traffic counters (egress, ingress) in bytes, via the
+/// `IPAccounting=yes` directive every unit carries. Used by the Egress
+/// screen; `None` when the manager cannot answer (unit gone, old systemd).
+pub fn ip_counters(service: &str) -> Option<(u64, u64)> {
+    let (_, out) = systemctl(&[
+        "show",
+        service,
+        "-p",
+        "IPEgressBytes,IPIngressBytes",
+        "--value",
+    ])?;
+    let mut lines = out.lines();
+    let egress = lines.next()?.trim().parse().ok()?;
+    let ingress = lines.next()?.trim().parse().ok()?;
+    Some((egress, ingress))
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -532,6 +567,7 @@ mod tests {
             description: "demo",
             env_file: None,
             extra_env: &[],
+            egress_allow: &[],
             res: ResourceLimits {
                 memory_high: Some("256M"),
                 memory_max: Some("384M"),
@@ -563,6 +599,8 @@ mod tests {
             "SystemCallFilter=~@mount @swap @reboot @cpu-emulation @obsolete @module @raw-io @clock @debug\n",
             "IPAddressDeny=any\n",
             "IPAddressAllow=127.0.0.1 ::1\n",
+            // Traffic accounting for the Egress screen rides on every unit.
+            "IPAccounting=yes\n",
         ] {
             assert!(content.contains(needle), "missing {needle:?}");
         }
@@ -599,6 +637,40 @@ mod tests {
         assert!(!content.contains("OOMScoreAdjust="));
     }
 
+    /// Egress exceptions append to the loopback Allow line (never replace
+    /// the deny-all), and stay empty by default. The strings are literal
+    /// addresses — hostnames never reach the unit (deploy resolves them;
+    /// see `egress::resolve_egress_hosts`), which this test pins by only
+    /// ever rendering IPs.
+    #[test]
+    fn egress_allow_renders_ip_exceptions() {
+        let base = UnitSpec {
+            service_name: "demo-x",
+            working_dir: Path::new("/tmp/x"),
+            exec_start: "/x/serve 8000",
+            description: "demo",
+            env_file: None,
+            extra_env: &[],
+            egress_allow: &[],
+            res: ResourceLimits::none(),
+        };
+        let content = render_unit(&base).unwrap();
+        assert!(
+            content.contains("IPAddressAllow=127.0.0.1 ::1\n"),
+            "empty allow must keep the loopback-only line byte-for-byte"
+        );
+        let spec = UnitSpec {
+            egress_allow: &["93.184.216.34", "1.1.1.1"],
+            ..base
+        };
+        let content = render_unit(&spec).unwrap();
+        assert!(
+            content.contains("IPAddressAllow=127.0.0.1 ::1 93.184.216.34 1.1.1.1\n"),
+            "allow list must append to the same Allow line"
+        );
+        assert!(content.contains("IPAddressDeny=any\n"));
+    }
+
     /// Runtime `UnsetEnvironment=` must always cover the sandbox scrub lists
     /// (otherwise the applied credential policy would widen at runtime) and
     /// the enumerated cloud/panel secret names, whatever the host env looks
@@ -612,6 +684,7 @@ mod tests {
             description: "demo",
             env_file: None,
             extra_env: &[],
+            egress_allow: &[],
             res: ResourceLimits::none(),
         })
         .unwrap();

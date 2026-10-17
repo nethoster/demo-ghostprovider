@@ -270,6 +270,10 @@ fn event_loop(
                 // this screen out of its selector, so the reload/clear requests
                 // it may still receive are no-ops here.
                 Msg::CrashLog(_) | Msg::CrashLogsCleared => {}
+                // Stack detection lives in the primary TUI only; drop it here.
+                Msg::DetectDone(_) => {}
+                // Same for egress live-checks.
+                Msg::EgressChecked { .. } => {}
                 Msg::Terminate => {
                     // Termination signal: clean up any in-flight deploy, then
                     // leave (mirrors the primary TUI's early-exit behaviour).

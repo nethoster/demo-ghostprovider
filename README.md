@@ -129,9 +129,11 @@ validates and prints the deploy plan, `demo-ghostprovider __deploy --manifest se
 deploys it through the identical sandbox + loopback + cleanup pipeline.
 In the panel, menu item 4 (Add Service) imports `service.yaml` files into your
 library (`~/.local/share/demo-ghostprovider/manifests/`) for one-key redeploys,
-or walks you through writing one with the built-in 9-step wizard (first row).
+or walks you through writing one with the built-in 9-step wizard (first row);
+the third row detects the stack of a GitHub URL and prefills the wizard.
 Menu item 5 (My Services) lists your added services with deploy status;
-item 2 (Self-hosting) manages the actually deployed units.
+item 6 (Egress) shows each service's runtime network allowlist with live
+verification; item 2 (Self-hosting) manages the actually deployed units.
 
 ## Install
 

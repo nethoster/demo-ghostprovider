@@ -118,12 +118,45 @@ fn store_new(id: &str, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Delete a stored manifest. Returns true when a file was actually removed.
-pub fn remove(id: &str) -> anyhow::Result<bool> {
+/// Path of a stored manifest. The id charset check doubles as a traversal
+/// guard: no slashes, no dots, no empty names can ever reach the join.
+pub fn file_path(id: &str) -> anyhow::Result<PathBuf> {
     if !valid_id(id) {
         anyhow::bail!("invalid service id “{id}”");
     }
-    let path = dir().join(format!("{id}.yaml"));
+    Ok(dir().join(format!("{id}.yaml")))
+}
+
+/// Replace a stored manifest with `bytes`: validated first, and the
+/// manifest's own service id must match the file name (rename via delete +
+/// import instead of silently forking identities).
+pub fn replace(id: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    let m = ServiceManifest::load_from_str(&String::from_utf8_lossy(bytes), id)?;
+    if m.service.id != id {
+        anyhow::bail!(
+            "service id “{}” must match the file name “{id}.yaml” (rename via delete + import)",
+            m.service.id
+        );
+    }
+    crate::atomic::write_atomic(&file_path(id)?, bytes)?;
+    Ok(())
+}
+
+/// Replace a stored manifest's egress allow list (validated as a whole),
+/// preserving every other field. The unit picks the new policy up on the
+/// next deploy (units render at install time).
+pub fn set_egress_allow(id: &str, hosts: &[String]) -> anyhow::Result<()> {
+    let mut m = load(id)?;
+    m.egress.allow = hosts.to_vec();
+    m.validate(&format!("library:{id}"))?;
+    let yaml = serde_yaml::to_string(&m).map_err(|e| anyhow::anyhow!("cannot render YAML: {e}"))?;
+    crate::atomic::write_atomic(&file_path(id)?, yaml.as_bytes())?;
+    Ok(())
+}
+
+/// Delete a stored manifest. Returns true when a file was actually removed.
+pub fn remove(id: &str) -> anyhow::Result<bool> {
+    let path = file_path(id)?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -133,10 +166,50 @@ pub fn remove(id: &str) -> anyhow::Result<bool> {
 
 /// Load a stored manifest by id (re-validated on the spot).
 pub fn load(id: &str) -> anyhow::Result<ServiceManifest> {
-    if !valid_id(id) {
-        anyhow::bail!("invalid service id “{id}”");
+    ServiceManifest::load_from_file(&file_path(id)?)
+}
+
+/// Open `path` in $EDITOR (VISUAL, EDITOR, `vi` fallback) and report whether
+/// the user changed anything. Terminal setup/teardown is the caller's job:
+/// the CLI calls this directly, the TUI suspends first.
+pub fn invoke_editor(path: &Path) -> anyhow::Result<bool> {
+    let before = std::fs::read(path).unwrap_or_default();
+    let prog = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".into());
+    let st = std::process::Command::new(&prog).arg(path).status()?;
+    if !st.success() {
+        anyhow::bail!("editor exited with {st}");
     }
-    ServiceManifest::load_from_file(&dir().join(format!("{id}.yaml")))
+    let after = std::fs::read(path).unwrap_or_default();
+    Ok(after != before)
+}
+
+/// Edit stored manifest `id` in $EDITOR: original is copied to temp, the
+/// temp is edited, and the original is swapped only when the result
+/// validates (see [`replace`]). An invalid result keeps the temp file and
+/// reports its path, so no keystroke is ever lost. Returns a one-line
+/// outcome for UIs.
+pub fn edit_in_editor(id: &str) -> anyhow::Result<String> {
+    let path = file_path(id)?;
+    let tmp = std::env::temp_dir().join(format!("gp-edit-{id}-{}.yaml", std::process::id()));
+    let orig = std::fs::read(&path)?;
+    std::fs::write(&tmp, &orig)?;
+    if !invoke_editor(&tmp)? {
+        let _ = std::fs::remove_file(&tmp);
+        return Ok("unchanged".into());
+    }
+    let bytes = std::fs::read(&tmp)?;
+    match replace(id, &bytes) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp);
+            Ok(format!("saved {id}"))
+        }
+        Err(e) => anyhow::bail!(
+            "not saved: {e:#} (your edits are kept at {})",
+            tmp.display()
+        ),
+    }
 }
 
 fn short_error(e: &anyhow::Error) -> String {
@@ -230,6 +303,27 @@ tools: ["bun"]
     }
 
     #[test]
+    fn replace_validates_id_match_and_schema() {
+        let _env = isolated_data_home("replace");
+        let src = write_src("replace", GOOD);
+        import(&src).unwrap();
+        // Valid rewrite of the same id works.
+        let m = ServiceManifest::load_from_str(GOOD, "test").unwrap();
+        let yaml = serde_yaml::to_string(&m).unwrap();
+        replace("lib-demo", yaml.as_bytes()).unwrap();
+        // Wrong id inside → refused, original untouched.
+        let other = GOOD.replace("id: lib-demo", "id: other-svc");
+        let err = format!("{:#}", replace("lib-demo", other.as_bytes()).unwrap_err());
+        assert!(err.contains("must match the file name"), "{err}");
+        assert_eq!(load("lib-demo").unwrap().service.id, "lib-demo");
+        // Garbage → refused.
+        assert!(replace("lib-demo", b"manifest_version: 99\n").is_err());
+        // Traversal → refused before touching disk.
+        assert!(file_path("../x").is_err());
+        assert!(replace("../x", b"x").is_err());
+    }
+
+    #[test]
     fn save_stores_validated_yaml() {
         let _env = isolated_data_home("save");
         let m = ServiceManifest::load_from_str(GOOD, "test").unwrap();
@@ -239,6 +333,22 @@ tools: ["bun"]
         assert_eq!(save(&m, &yaml).unwrap(), "lib-demo");
         assert!(list().iter().any(|e| e.id == "lib-demo" && e.valid));
         assert!(save(&m, &yaml).is_err());
+    }
+
+    #[test]
+    fn set_egress_allow_rewrites_policy() {
+        let _env = isolated_data_home("egress");
+        let src = write_src("egress", GOOD);
+        import(&src).unwrap();
+        set_egress_allow("lib-demo", &["api.telegram.org".into()]).unwrap();
+        let m = load("lib-demo").unwrap();
+        assert_eq!(m.egress.allow, vec!["api.telegram.org".to_string()]);
+        // Other fields survive the rewrite.
+        assert_eq!(m.run.port, 0);
+        // Garbage is refused, original kept.
+        assert!(set_egress_allow("lib-demo", &["*.evil.com".into()]).is_err());
+        assert!(set_egress_allow("lib-demo", &["a.com".into(), "a.com".into()]).is_err());
+        assert_eq!(load("lib-demo").unwrap().egress.allow.len(), 1);
     }
 
     #[test]

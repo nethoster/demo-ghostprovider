@@ -16,6 +16,89 @@ use std::thread::JoinHandle;
 use super::Msg;
 use crate::hoster::deploy;
 
+/// Detection result ready for the wizard: id suggestion plus a draft with
+/// detected steps (flagged) for the user to verify step by step.
+#[derive(Clone, Debug)]
+pub struct DetectReady {
+    pub suggested_id: String,
+    pub draft: super::wizard::Draft,
+}
+
+/// Clone a repo shallowly into a temp dir, detect its stack, resolve the
+/// HEAD pin, then wipe the tree. Runs on a worker thread; the result lands
+/// as `Msg::DetectDone`. The tree never touches the library or the deploy
+/// pipeline — detection only reads.
+pub(crate) fn spawn_detect(tx: Sender<Msg>, url: String) {
+    std::thread::spawn(move || {
+        let out = detect_url(&url).map(Box::new);
+        let _ = tx.send(Msg::DetectDone(out));
+    });
+}
+
+fn detect_url(url: &str) -> Result<DetectReady, String> {
+    use crate::hoster::{detect, gitclone};
+    let (owner, name) = crate::hoster::github::parse_github_url(url)
+        .ok_or_else(|| "must be https://github.com/<owner>/<repo> (optional .git)".to_string())?;
+    let nonce: String = crate::atomic::random_hex(4).unwrap_or_else(|_| "tmp".into());
+    let tmp = std::env::temp_dir().join(format!("gp-detect-{}-{nonce}", std::process::id()));
+    let wipe = || {
+        let _ = gitclone::force_remove_all(&tmp);
+    };
+    let status = gitclone::clone(url, &tmp, None);
+    if !status.ok {
+        wipe();
+        return Err(format!("fetch failed: {}", status.last_message));
+    }
+    let sha = std::process::Command::new("git")
+        .args(["-C", &tmp.to_string_lossy(), "rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let found = detect::detect_tree(&tmp);
+    wipe();
+    let d = found.map_err(|e| format!("stack not recognized: {e}"))?;
+    let draft = super::wizard::Draft {
+        git: url.to_string(),
+        commit: sha,
+        profile: d.profile,
+        prefetch: d.prefetch,
+        build_steps: d.build,
+        run_cmd: d.run_cmd,
+        port: d.port,
+        memory_max: d.memory_max,
+        tasks_max: d.tasks_max,
+        detected: true,
+        notes: d.notes,
+        ..Default::default()
+    };
+    Ok(DetectReady {
+        suggested_id: sanitize_id(&format!("{owner}-{name}")),
+        draft,
+    })
+}
+
+/// Repo name → service id suggestion (schema charset, best-effort: the
+/// wizard's id step validates for real).
+fn sanitize_id(name: &str) -> String {
+    let lower = name.to_lowercase();
+    let mut out: String = lower
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out.trim_matches('-').to_string()
+}
+
 /// The in-flight deploy worker thread (if any), so the exit path can wait out
 /// its final bookkeeping — the trailing `== deploy … done: … ==` line and the
 /// stderr-capture restore — before reconciling. The thread itself runs the
@@ -305,6 +388,45 @@ fn short_error(e: &anyhow::Error) -> String {
     } else {
         short
     }
+}
+
+/// Snapshot behind the Egress matrix screen: library files, deployed ids
+/// and per-unit traffic counters (units without accounting answer None).
+pub struct EgressSnapshot {
+    pub files: Vec<crate::hoster::library::LibraryEntry>,
+    pub deployed: Vec<String>,
+    pub counters: HashMap<String, (u64, u64)>,
+}
+
+pub fn egress_snapshot() -> EgressSnapshot {
+    let files = crate::hoster::library::list();
+    let deployed: Vec<String> = crate::state::list().into_iter().map(|(n, _)| n).collect();
+    let mut counters = HashMap::new();
+    for d in &deployed {
+        if let Some(c) = crate::hoster::units::ip_counters(d) {
+            counters.insert(d.clone(), c);
+        }
+    }
+    EgressSnapshot {
+        files,
+        deployed,
+        counters,
+    }
+}
+
+/// Verify one library service's egress policy live (transient probe unit
+/// with its filter). Result lands as `Msg::EgressChecked`.
+pub(crate) fn spawn_egress_check(tx: Sender<Msg>, id: String) {
+    std::thread::spawn(move || {
+        let allow = crate::hoster::library::load(&id)
+            .map(|m| m.egress.allow)
+            .unwrap_or_default();
+        let report = crate::hoster::egress::verify_egress_for(&allow);
+        let _ = tx.send(Msg::EgressChecked {
+            id,
+            lines: report.describe(),
+        });
+    });
 }
 
 pub(crate) fn start_target_deployment(tx: Sender<Msg>, target: DeployTarget) {

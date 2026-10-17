@@ -163,6 +163,76 @@ pub struct PluginPin {
     pub sha256: String,
 }
 
+/// Per-service runtime egress exceptions. Empty (the default) means the
+/// historic deny-all: the unit may only talk to loopback. Each entry opens
+/// exactly one hostname/IPv4 for that service's unit — a conscious trust
+/// decision recorded in the manifest, never a global allowlist. Hostnames
+/// resolve to literal addresses at deploy time (`egress::resolve_egress_hosts`,
+/// fail closed) because systemd's `IPAddressAllow=` rejects names.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct EgressSpec {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+}
+
+/// Max allowed egress hosts per service (v1): keeps the unit line and the
+/// live verification probe (one beat per host) bounded.
+pub const MAX_EGRESS_HOSTS: usize = 8;
+
+/// Validate one egress host; returns it normalized (trimmed, lowercased).
+fn validate_egress_host(host: &str) -> Result<String, String> {
+    let t = host.trim().to_lowercase();
+    if t.is_empty() || t.len() > 253 {
+        return Err(format!("egress host must be 1..=253 chars: '{host}'"));
+    }
+    if t == "localhost" {
+        return Err("egress host 'localhost' is redundant (loopback is always allowed)".into());
+    }
+    if t.contains('/') || t.contains(':') || t.contains(' ') || t.contains('*') || t.contains('?') {
+        return Err(format!(
+            "egress host must be a bare hostname or IPv4, no ranges/ports/wildcards: '{host}'"
+        ));
+    }
+    if is_ipv4(&t) {
+        return Ok(t);
+    }
+    let labels: Vec<&str> = t.split('.').collect();
+    if labels.len() < 2 {
+        return Err(format!("egress host needs at least two labels: '{host}'"));
+    }
+    // All-numeric TLDs are IP typos (256.1.1.1), not hostnames.
+    if !labels
+        .last()
+        .is_some_and(|tld| tld.bytes().any(|b| b.is_ascii_lowercase()))
+    {
+        return Err(format!("egress hostname needs a lettered TLD: '{host}'"));
+    }
+    for label in &labels {
+        if label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            || label.starts_with('-')
+            || label.ends_with('-')
+        {
+            return Err(format!("bad egress hostname label in '{host}'"));
+        }
+    }
+    Ok(t)
+}
+
+fn is_ipv4(t: &str) -> bool {
+    let parts: Vec<&str> = t.split('.').collect();
+    parts.len() == 4
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 3
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u8>().is_ok()
+        })
+}
+
 /// Top-level `service.yaml`.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServiceManifest {
@@ -189,6 +259,9 @@ pub struct ServiceManifest {
     /// Extra build tools required on PATH (provisionable: bun/pnpm/go).
     #[serde(default)]
     pub tools: Vec<String>,
+    /// Runtime egress exceptions (default: loopback only).
+    #[serde(default)]
+    pub egress: EgressSpec,
 }
 
 impl ServiceManifest {
@@ -398,6 +471,24 @@ impl ServiceManifest {
                 at("resources.memory_max and resources.tasks_max are required")
             );
         }
+        // ── egress allowlist (empty = historic deny-all) ──
+        if self.egress.allow.len() > MAX_EGRESS_HOSTS {
+            anyhow::bail!(
+                "{}",
+                at(&format!(
+                    "egress.allow holds at most {MAX_EGRESS_HOSTS} hosts"
+                ))
+            );
+        }
+        {
+            let mut seen = std::collections::BTreeSet::new();
+            for h in &self.egress.allow {
+                let norm = validate_egress_host(h).map_err(|r| anyhow::anyhow!("{}", at(&r)))?;
+                if !seen.insert(norm.clone()) {
+                    anyhow::bail!("{}", at(&format!("egress.allow lists '{norm}' twice")));
+                }
+            }
+        }
         if let Some(hc) = &self.healthcheck
             && !hc.path.starts_with('/')
         {
@@ -459,6 +550,14 @@ impl ServiceManifest {
             self.resources.tasks_max,
             self.resources.cpu_quota
         ));
+        if self.egress.allow.is_empty() {
+            out.push_str("egress:   loopback only (deny-all)\n");
+        } else {
+            out.push_str(&format!(
+                "egress:   loopback + {}\n",
+                self.egress.allow.join(", ")
+            ));
+        }
         out.push_str("sandbox:  FULL required; network off at build; loopback-only at runtime\n");
         out
     }
@@ -630,6 +729,12 @@ pub fn to_leaked_recipe(m: &ServiceManifest) -> super::recipes::DemoRecipe {
         .map(|p| (leak_str(&p.url), leak_str(&p.sha256)))
         .collect();
     let tools: Vec<&'static str> = m.tools.iter().map(|t| leak_str(t)).collect();
+    let egress: Vec<&'static str> = m
+        .egress
+        .allow
+        .iter()
+        .map(|h| leak_str(&h.trim().to_lowercase()))
+        .collect();
     let language: &'static str = match m.build.profile.as_str() {
         "go" => "Go",
         "python" | "python-searxng" => "Python",
@@ -660,6 +765,7 @@ pub fn to_leaked_recipe(m: &ServiceManifest) -> super::recipes::DemoRecipe {
         port: m.run.port,
         searxng: m.searxng,
         tools: leak_slice(tools),
+        egress_allow: leak_slice(egress),
         res: super::units::ResourceLimits {
             memory_high: m.resources.memory_high.as_deref().map(leak_str),
             memory_max: m.resources.memory_max.as_deref().map(leak_str),
@@ -796,6 +902,47 @@ mod tests {
 
     /// resolve_start must preserve the loopback pin through placeholder
     /// expansion, so the deployed unit actually binds 127.0.0.1.
+    #[test]
+    fn egress_hosts_validate_and_normalize() {
+        assert_eq!(
+            validate_egress_host("Api.Telegram.Org").unwrap(),
+            "api.telegram.org"
+        );
+        assert_eq!(validate_egress_host("1.1.1.1").unwrap(), "1.1.1.1");
+        for bad in [
+            "",
+            "localhost",
+            "no-dot",
+            "a..b.com",
+            "-lead.com",
+            "trail-.com",
+            "has space.com",
+            "10.0.0.0/8",
+            "example.com:443",
+            "*.example.com",
+            "256.1.1.1",
+            "1.2.3",
+        ] {
+            assert!(validate_egress_host(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn egress_allowlist_rejects_overflow_and_duplicates() {
+        let mut m = sample();
+        m.egress.allow = (0..=MAX_EGRESS_HOSTS)
+            .map(|i| format!("h{i}.example.com"))
+            .collect();
+        assert!(m.validate("t").is_err());
+        let mut m = sample();
+        m.egress.allow = vec!["a.example.com".into(), "A.EXAMPLE.COM".into()];
+        assert!(m.validate("t").is_err());
+        // Empty (default) stays valid and converts to no exceptions.
+        let m = sample();
+        assert!(m.egress.allow.is_empty());
+        assert!(to_leaked_recipe(&m).egress_allow.is_empty());
+    }
+
     #[test]
     fn builtin_memos_resolve_start_keeps_loopback_after_expansion() {
         use std::path::Path;

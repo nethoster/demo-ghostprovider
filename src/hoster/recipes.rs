@@ -47,6 +47,10 @@ pub struct DemoRecipe {
     pub searxng: bool,
     /// Executables required on PATH for the build steps to succeed.
     pub tools: &'static [&'static str],
+    /// Runtime egress exceptions: hostnames/IPv4 the unit may reach besides
+    /// loopback (empty = historic deny-all). Converted from the manifest's
+    /// `egress.allow`, normalized there.
+    pub egress_allow: &'static [&'static str],
     /// systemd resource caps for the deployed unit (cgroup memory/tasks
     /// bounds): a runaway demo service must never grind the whole user
     /// session. See `units.rs::ResourceLimits`.

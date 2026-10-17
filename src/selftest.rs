@@ -42,6 +42,7 @@ pub fn run() -> anyhow::Result<()> {
         env_file: None,
         extra_env: &[],
         res: crate::hoster::units::ResourceLimits::none(),
+        egress_allow: &[],
     };
     units::create_unit(&spec).context("unit creation")?;
 

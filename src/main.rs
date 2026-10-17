@@ -11,8 +11,9 @@
 //!   --verify-sandbox     audit the hardened build sandbox under strace:
 //!                        no outbound connects, no code-loading exec's
 //!   __serve-static DIR PORT   internal: static server used by deployed units
-//!   __egress-probe       internal: probe beat for runtime egress checks
+//!   __egress-probe [--hosts a,b]  internal: probe beats for egress checks
 //!   __check-manifest PATH   validate a service.yaml and print the plan
+//!   __recipe-edit ID        edit a stored service.yaml in $EDITOR (re-validated)
 //!   __deploy URL | --manifest PATH   scripted deploy (URL or manifest file)
 
 #![deny(unsafe_code)]
@@ -68,7 +69,14 @@ fn main() -> anyhow::Result<()> {
         }
         // Internal subcommand used by generated systemd units. Not advertised.
         Some("__egress-probe") => {
-            demo_ghostprovider::hoster::egress::run_probe_cmd()?;
+            let hosts: Vec<String> = match args.iter().position(|a| a == "--hosts") {
+                Some(i) => args
+                    .get(i + 1)
+                    .map(|s| s.split(',').map(str::to_string).collect())
+                    .unwrap_or_default(),
+                None => vec!["api.github.com".into()],
+            };
+            demo_ghostprovider::hoster::egress::run_probe_cmd(&hosts)?;
         }
         Some("__serve-static") => {
             let dir = args.get(1).context("usage: __serve-static DIR PORT")?;
@@ -98,6 +106,16 @@ fn main() -> anyhow::Result<()> {
                 }
                 Err(e) => {
                     eprintln!("! invalid manifest {path}: {e:#}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("__recipe-edit") => {
+            let id = args.get(1).context("usage: __recipe-edit SERVICE_ID")?;
+            match demo_ghostprovider::hoster::library::edit_in_editor(id) {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => {
+                    eprintln!("! {e:#}");
                     std::process::exit(1);
                 }
             }
@@ -225,7 +243,9 @@ fn print_help() {
          \x20 demo-ghostprovider --verify-sandbox       audit the build sandbox (needs strace)\n\
          \x20 demo-ghostprovider --version          version\n\
          \x20 demo-ghostprovider __check-manifest PATH   validate a service.yaml and print the plan\n\
-         \x20 demo-ghostprovider __deploy --manifest PATH  deploy one service.yaml",
+         \x20 demo-ghostprovider __recipe-edit ID   edit a stored service.yaml in $EDITOR\n\
+         \x20 demo-ghostprovider __deploy --manifest PATH  deploy one service.yaml\n\
+         \x20 demo-ghostprovider __egress-probe [--hosts a,b]  probe egress beats (reads only)",
         env!("CARGO_PKG_VERSION")
     );
 }

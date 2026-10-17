@@ -34,6 +34,11 @@ pub struct Draft {
     pub port: String,
     pub memory_max: String,
     pub tasks_max: String,
+    /// True when steps came from stack detection (not profile defaults):
+    /// the profile step keeps them unless the user picks another profile.
+    pub detected: bool,
+    /// Why detection guessed what it guessed; shown on the profile step.
+    pub notes: Vec<String>,
 }
 
 /// Preset answers for a profile: the user edits them on later steps.
@@ -97,6 +102,8 @@ pub fn defaults_for_profile(profile: &str) -> Option<ProfileDefaults> {
 }
 
 /// Apply a profile's presets to the draft (steps, run, port, budgets).
+/// Clears the detection flag: from here the answers are profile defaults
+/// the user edits, not detector guesses.
 pub fn apply_profile_defaults(draft: &mut Draft, profile: &str) -> bool {
     match defaults_for_profile(profile) {
         Some(d) => {
@@ -107,6 +114,8 @@ pub fn apply_profile_defaults(draft: &mut Draft, profile: &str) -> bool {
             draft.port = d.port;
             draft.memory_max = d.memory_max;
             draft.tasks_max = d.tasks_max;
+            draft.detected = false;
+            draft.notes.clear();
             true
         }
         None => false,
@@ -264,6 +273,7 @@ pub fn build_manifest(draft: &Draft) -> Result<ServiceManifest, String> {
         plugins: vec![],
         searxng: draft.profile == "python-searxng",
         tools,
+        egress: Default::default(),
     };
     m.validate("wizard").map_err(|e| format!("{e:#}"))?;
     Ok(m)
@@ -421,6 +431,16 @@ mod tests {
         assert!(check_memory("big").is_err());
         assert!(check_tasks("512").is_ok());
         assert!(check_tasks("").is_err());
+    }
+
+    #[test]
+    fn applying_profile_clears_detection_flag() {
+        let mut d = filled("go");
+        d.detected = true;
+        d.notes = vec!["guessed".into()];
+        assert!(apply_profile_defaults(&mut d, "go"));
+        assert!(!d.detected);
+        assert!(d.notes.is_empty());
     }
 
     #[test]

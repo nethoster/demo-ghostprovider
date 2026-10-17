@@ -2,6 +2,7 @@
 
 pub mod cancel;
 pub mod deploy;
+pub mod detect;
 pub mod egress;
 pub mod gitclone;
 pub mod github;

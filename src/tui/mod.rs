@@ -14,6 +14,7 @@ pub mod workers;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{
     Arc,
@@ -73,6 +74,7 @@ pub(crate) const MAIN_MENU: &[(&str, &str, &str, Color)] = &[
         VIOLET,
     ),
     ("♥", "My Services", "your added services", BLUE),
+    ("⇄", "Egress", "allowed outbound per service", ERR_RED),
     (
         "≡",
         "Logs",
@@ -189,6 +191,14 @@ pub(crate) enum Screen {
         buffer: String,
         error: Option<String>,
     },
+    /// Detect prompt: GitHub URL to clone shallowly and detect the stack
+    /// for. The worker reports back via `Msg::DetectDone`; leaving the
+    /// screen meanwhile drops the stale result.
+    DetectInput {
+        buffer: String,
+        error: Option<String>,
+        busy: bool,
+    },
     /// New-service wizard: one question per screen, "Step n/9" in the title.
     /// Each screen carries the [`wizard::Draft`] built so far; Esc walks back.
     WzId {
@@ -240,6 +250,32 @@ pub(crate) enum Screen {
         yaml: Option<String>,
         error: Option<String>,
     },
+    /// Egress matrix (menu "Egress"): every library service with its allow
+    /// list, deploy mark, traffic counters and last verification verdict.
+    Egress {
+        files: Vec<crate::hoster::library::LibraryEntry>,
+        deployed: Vec<String>,
+        /// (unit, out_bytes, in_bytes) for deployed units with accounting.
+        counters: HashMap<String, (u64, u64)>,
+        /// Latest verification verdicts by service id (this view only).
+        verdicts: HashMap<String, String>,
+        /// Service id a verification worker is running for right now.
+        checking: Option<String>,
+        selected: usize,
+        message: Option<String>,
+    },
+    /// Allow-list editor for one library service: add/delete hostnames,
+    /// saved validated on every change (applies on next deploy).
+    EgressHosts {
+        id: String,
+        hosts: Vec<String>,
+        selected: usize,
+        buffer: String,
+        editing: bool,
+        armed: bool,
+        error: Option<String>,
+        message: Option<String>,
+    },
     /// Overview of the user's own added services (menu "My Services"): the
     /// manifest library annotated with deploy status. Read-mostly: Enter
     /// deploys (or jumps to Self-hosting when already deployed); managing
@@ -287,6 +323,15 @@ pub(crate) enum Msg {
     DeployLogsCleared,
     SoftwareLogsCleared,
     CrashLogsCleared,
+    /// Stack detection finished (Add Service → Detect): prefilled wizard
+    /// draft on success, human-readable reason on failure. Boxed — the
+    /// draft keeps `Msg` small (channel-backed enum).
+    DetectDone(Result<Box<workers::DetectReady>, String>),
+    /// Egress live-check finished for one library service: rendered lines.
+    EgressChecked {
+        id: String,
+        lines: Vec<String>,
+    },
     /// Shutdown requested by a termination signal (SIGTERM/SIGHUP).
     Terminate,
 }
@@ -522,6 +567,42 @@ fn event_loop(
                         *scroll = 0;
                     }
                 }
+                Msg::DetectDone(res) => {
+                    // Apply only while the Detect screen is still open: Esc
+                    // meanwhile means the user cancelled — drop the stale result.
+                    if let Screen::DetectInput { error, busy, .. } = &mut app.screen {
+                        match res {
+                            Ok(ready) => {
+                                app.screen = Screen::WzId {
+                                    buffer: ready.suggested_id,
+                                    error: None,
+                                    draft: ready.draft,
+                                };
+                            }
+                            Err(e) => {
+                                *error = Some(e);
+                                *busy = false;
+                            }
+                        }
+                    }
+                }
+                Msg::EgressChecked { id, lines } => {
+                    // Apply only while the matrix is still open; the verdict
+                    // text joins with newlines for the row detail.
+                    if let Screen::Egress {
+                        verdicts,
+                        checking,
+                        message,
+                        ..
+                    } = &mut app.screen
+                    {
+                        verdicts.insert(id.clone(), lines.join("\n"));
+                        if checking.as_deref() == Some(id.as_str()) {
+                            *checking = None;
+                        }
+                        *message = Some(format!("checked {id}"));
+                    }
+                }
                 Msg::Terminate => {
                     // Termination signal: leave exactly like a deliberate exit.
                     return exit_with_reconcile(app);
@@ -548,6 +629,10 @@ fn event_loop(
                         match on_key(app, key.code, key.modifiers) {
                             Flow::Continue => {}
                             Flow::Exit => return exit_with_reconcile(app),
+                            Flow::EditFile(path) => {
+                                edit_file_suspended(terminal, app, &path);
+                                last_repaint = Some(Instant::now());
+                            }
                         }
                         // Screen switched: ratatui's cell-diff would keep glyphs
                         // from the longer previous screen — force a full repaint.
@@ -625,6 +710,10 @@ fn wz_steps_key(editor: &mut wizard::StepEditor, key: KeyCode, cmd: Option<char>
 enum Flow {
     Continue,
     Exit,
+    /// Open a stored manifest in $EDITOR: the panel suspends (raw mode off,
+    /// alternate screen left), the edit runs on the real terminal, then the
+    /// panel resumes. Handled in `event_loop`, which owns the terminal.
+    EditFile(PathBuf),
 }
 
 /// Positional mapping national-layout → QWERTY for *command* keys only.
@@ -726,6 +815,63 @@ fn exit_with_reconcile(app: &mut App) -> anyhow::Result<()> {
         crate::tui::workers::append_deploy_log(&format!("== deploy {url} done: interrupted =="));
     }
     Ok(())
+}
+
+/// Suspend the panel, edit a stored manifest in $EDITOR on the real
+/// terminal, then resume with a repaint. The file is validated before it is
+/// swapped (see `library::edit_in_editor`); library screens showing it are
+/// refreshed and carry the one-line outcome as their message.
+fn edit_file_suspended(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    app: &mut App,
+    path: &std::path::Path,
+) {
+    let id = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let _ = io::stdout().execute(LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+    let outcome = crate::hoster::library::edit_in_editor(&id).map_err(|e| format!("{e:#}"));
+    let _ = enable_raw_mode();
+    let _ = io::stdout().execute(EnterAlternateScreen);
+    clear_screen(terminal);
+    let msg = match outcome {
+        Ok(s) => s,
+        Err(e) => format!("! {e}"),
+    };
+    match &mut app.screen {
+        Screen::AddService {
+            files,
+            selected,
+            message,
+            ..
+        } => {
+            *files = crate::hoster::library::list();
+            let last = lib_row_count(files.len()).saturating_sub(1);
+            if *selected > last {
+                *selected = last;
+            }
+            *message = Some(msg);
+        }
+        Screen::UserServices {
+            files,
+            deployed,
+            selected,
+            message,
+        } => {
+            *files = crate::hoster::library::list();
+            if *selected >= files.len() {
+                *selected = files.len().saturating_sub(1);
+            }
+            *deployed = crate::state::list()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            *message = Some(msg);
+        }
+        _ => {}
+    }
 }
 
 fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
@@ -985,7 +1131,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 };
             } else if exit {
                 stop_log_tailers(app);
-                app.screen = Screen::Main { selected: 5 };
+                app.screen = Screen::Main { selected: 6 };
             }
         }
         Screen::ConfirmClear {
@@ -1142,6 +1288,13 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             error: None,
                         };
                     }
+                    Some(LibRow::DetectUrl) => {
+                        app.screen = Screen::DetectInput {
+                            buffer: String::new(),
+                            error: None,
+                            busy: false,
+                        };
+                    }
                     Some(LibRow::Entry(i)) => {
                         if let Some(f) = files.get(i) {
                             let path = f.path.display().to_string();
@@ -1188,6 +1341,13 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             *selected = last;
                         }
                         *message = Some("refreshed".into());
+                    }
+                    Some('e') => {
+                        if let Some(LibRow::Entry(i)) = lib_row(files.len(), *selected)
+                            && let Some(f) = files.get(i).cloned()
+                        {
+                            return Flow::EditFile(f.path);
+                        }
                     }
                     Some('d') => {
                         if let Some(LibRow::Entry(i)) = lib_row(files.len(), *selected)
@@ -1240,11 +1400,11 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     match crate::hoster::library::import(&path) {
                         Ok(id) => {
                             let files = crate::hoster::library::list();
-                            // Selection space has 2 action rows on top.
+                            // Selection space has 3 action rows on top.
                             let selected = files
                                 .iter()
                                 .position(|f| f.id == id)
-                                .map(|i| i + 2)
+                                .map(|i| i + 3)
                                 .unwrap_or(0);
                             app.screen = Screen::AddService {
                                 files,
@@ -1258,6 +1418,39 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 }
             }
             // Raw char: paths must be typed verbatim on any layout.
+            KeyCode::Char(c) => buffer.push(c),
+            _ => {}
+        },
+        Screen::DetectInput {
+            buffer,
+            error,
+            busy,
+        } => match key {
+            KeyCode::Esc => {
+                app.screen = Screen::AddService {
+                    files: crate::hoster::library::list(),
+                    selected: 0,
+                    message: None,
+                    armed_delete: None,
+                }
+            }
+            _ if *busy => {}
+            KeyCode::Backspace => {
+                buffer.pop();
+            }
+            KeyCode::Enter => {
+                if buffer.trim().is_empty() {
+                    *error = Some("enter a GitHub URL to detect".into());
+                } else if crate::hoster::github::parse_github_url(buffer.trim()).is_none() {
+                    *error =
+                        Some("must be https://github.com/<owner>/<repo> (optional .git)".into());
+                } else {
+                    *error = None;
+                    *busy = true;
+                    workers::spawn_detect(app.tx.clone(), buffer.trim().to_string());
+                }
+            }
+            // Raw char: URLs must be typed verbatim on any layout.
             KeyCode::Char(c) => buffer.push(c),
             _ => {}
         },
@@ -1330,10 +1523,186 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             .collect();
                         *message = Some("refreshed".into());
                     }
+                    Some('e') if count > 0 => {
+                        if let Some(f) = files.get(*selected).cloned() {
+                            return Flow::EditFile(f.path);
+                        }
+                    }
                     _ => {}
                 },
             }
         }
+        Screen::Egress {
+            files,
+            deployed,
+            counters,
+            verdicts: _,
+            checking,
+            selected,
+            message,
+        } => {
+            let count = files.len();
+            match key {
+                KeyCode::Esc => app.screen = Screen::Main { selected: 5 },
+                KeyCode::Up if count > 0 => {
+                    *selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down if count > 0 => {
+                    *selected = (*selected + 1).min(count - 1);
+                }
+                KeyCode::Enter if count > 0 => {
+                    if let Some(f) = files.get(*selected) {
+                        match crate::hoster::library::load(&f.id) {
+                            Ok(m) => {
+                                let id = f.id.clone();
+                                app.screen = Screen::EgressHosts {
+                                    id,
+                                    hosts: m.egress.allow,
+                                    selected: 0,
+                                    buffer: String::new(),
+                                    editing: false,
+                                    armed: false,
+                                    error: None,
+                                    message: None,
+                                };
+                            }
+                            Err(e) => {
+                                *message = Some(workers::short_error_for(&e));
+                            }
+                        }
+                    }
+                }
+                _ => match cmd {
+                    Some('q') => app.screen = Screen::Main { selected: 5 },
+                    Some('k') if count > 0 => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    Some('j') if count > 0 => {
+                        *selected = (*selected + 1).min(count - 1);
+                    }
+                    Some('r') => {
+                        let snap = workers::egress_snapshot();
+                        *files = snap.files;
+                        *deployed = snap.deployed;
+                        *counters = snap.counters;
+                        if *selected >= files.len() {
+                            *selected = files.len().saturating_sub(1);
+                        }
+                        *message = Some("refreshed".into());
+                    }
+                    Some('v') => {
+                        if checking.is_none()
+                            && let Some(f) = files.get(*selected).cloned()
+                        {
+                            *checking = Some(f.id.clone());
+                            *message = Some(format!("checking {}…", f.id));
+                            workers::spawn_egress_check(app.tx.clone(), f.id);
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
+        Screen::EgressHosts {
+            id,
+            hosts,
+            selected,
+            buffer,
+            editing,
+            armed,
+            error,
+            message,
+        } => match key {
+            KeyCode::Esc if *editing => {
+                *editing = false;
+                *error = None;
+            }
+            KeyCode::Esc => {
+                let snap = workers::egress_snapshot();
+                app.screen = Screen::Egress {
+                    files: snap.files,
+                    deployed: snap.deployed,
+                    counters: snap.counters,
+                    verdicts: HashMap::new(),
+                    checking: None,
+                    selected: 0,
+                    message: None,
+                };
+            }
+            KeyCode::Up if !*editing && !hosts.is_empty() => {
+                *selected = selected.saturating_sub(1);
+                *armed = false;
+            }
+            KeyCode::Down if !*editing && !hosts.is_empty() => {
+                *selected = (*selected + 1).min(hosts.len() - 1);
+                *armed = false;
+            }
+            KeyCode::Backspace if *editing => {
+                buffer.pop();
+            }
+            KeyCode::Enter if *editing => {
+                if buffer.trim().is_empty() {
+                    *error = Some("enter a hostname (e.g. api.telegram.org)".into());
+                } else {
+                    let mut next = hosts.clone();
+                    next.push(buffer.trim().to_string());
+                    match crate::hoster::library::set_egress_allow(id, &next) {
+                        Ok(()) => {
+                            *hosts = next;
+                            buffer.clear();
+                            *editing = false;
+                            *error = None;
+                            *message = Some("saved — applies on next deploy".into());
+                        }
+                        Err(e) => *error = Some(workers::short_error_for(&e)),
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                *editing = true;
+                *error = None;
+            }
+            KeyCode::Char(c) if *editing => buffer.push(c),
+            _ => match cmd {
+                Some('q') => {
+                    let snap = workers::egress_snapshot();
+                    app.screen = Screen::Egress {
+                        files: snap.files,
+                        deployed: snap.deployed,
+                        counters: snap.counters,
+                        verdicts: HashMap::new(),
+                        checking: None,
+                        selected: 0,
+                        message: None,
+                    };
+                }
+                Some('a') => {
+                    *editing = true;
+                    *error = None;
+                }
+                Some('d') if !*editing && !hosts.is_empty() => {
+                    if *armed {
+                        let mut next = hosts.clone();
+                        next.remove((*selected).min(hosts.len() - 1));
+                        match crate::hoster::library::set_egress_allow(id, &next) {
+                            Ok(()) => {
+                                *hosts = next;
+                                if *selected >= hosts.len() {
+                                    *selected = hosts.len().saturating_sub(1);
+                                }
+                                *message = Some("saved — applies on next deploy".into());
+                            }
+                            Err(e) => *error = Some(workers::short_error_for(&e)),
+                        }
+                        *armed = false;
+                    } else {
+                        *armed = true;
+                        *message = Some("press d again to delete this host".into());
+                    }
+                }
+                _ => {}
+            },
+        },
         Screen::WzId {
             buffer,
             error,
@@ -1423,7 +1792,13 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 match wizard::check_commit(buffer) {
                     Ok(()) => {
                         draft.commit = buffer.trim().to_string();
-                        app.screen = Screen::WzProfile { selected: 0, draft };
+                        // Detection pre-selects its profile; manual flow starts at 0.
+                        let selected = wizard::PROFILES
+                            .iter()
+                            .position(|(id, _)| *id == draft.profile)
+                            .filter(|_| draft.detected)
+                            .unwrap_or(0);
+                        app.screen = Screen::WzProfile { selected, draft };
                     }
                     Err(e) => *error = Some(e),
                 }
@@ -1450,8 +1825,14 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 }
                 KeyCode::Enter => {
                     let mut draft = std::mem::take(draft);
-                    let profile = wizard::PROFILES[*selected].0;
-                    wizard::apply_profile_defaults(&mut draft, profile);
+                    // Detected steps survive when the highlighted profile is
+                    // the detected one; picking another profile resets
+                    // everything below to that profile's defaults (said so on
+                    // screen). apply_profile_defaults also clears the flag.
+                    if !(draft.detected && wizard::PROFILES[*selected].0 == draft.profile) {
+                        let profile = wizard::PROFILES[*selected].0;
+                        wizard::apply_profile_defaults(&mut draft, profile);
+                    }
                     let editor = wizard::StepEditor::new(draft.prefetch.clone());
                     app.screen = Screen::WzPrefetch { editor, draft };
                 }
@@ -1678,12 +2059,12 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             match crate::hoster::library::save(&manifest, &text) {
                                 Ok(id) => {
                                     let files = crate::hoster::library::list();
-                                    // Selection space has 2 action rows on top.
+                                    // Selection space has 3 action rows on top.
                                     let selected = files
                                         .iter()
                                         .position(|f| f.id == id)
-                                        .map(|i| i + 2)
-                                        .unwrap_or(2);
+                                        .map(|i| i + 3)
+                                        .unwrap_or(3);
                                     app.screen = Screen::AddService {
                                         files,
                                         selected,
@@ -1763,6 +2144,18 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
             };
         }
         5 => {
+            let snap = workers::egress_snapshot();
+            app.screen = Screen::Egress {
+                files: snap.files,
+                deployed: snap.deployed,
+                counters: snap.counters,
+                verdicts: HashMap::new(),
+                checking: None,
+                selected: 0,
+                message: None,
+            };
+        }
+        6 => {
             // Deploy logs: single shared file is the source of truth so every
             // window streams the same live deploy. File survives across processes.
             let mut deploy_lines = workers::read_deploy_log();
@@ -2087,6 +2480,13 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Screen::Import { buffer, error } => {
             draw_import(f, chunks[1], buffer, error.as_deref(), app.tick);
         }
+        Screen::DetectInput {
+            buffer,
+            error,
+            busy,
+        } => {
+            draw_detect_input(f, chunks[1], buffer, error.as_deref(), *busy, app.tick);
+        }
         Screen::UserServices {
             files,
             deployed,
@@ -2094,6 +2494,51 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             message,
         } => {
             draw_user_services(f, chunks[1], files, deployed, *selected, message.as_deref());
+        }
+        Screen::Egress {
+            files,
+            deployed,
+            counters,
+            verdicts,
+            checking,
+            selected,
+            message,
+        } => {
+            draw_egress(
+                f,
+                chunks[1],
+                files,
+                deployed,
+                counters,
+                verdicts,
+                checking.as_deref(),
+                *selected,
+                message.as_deref(),
+            );
+        }
+        Screen::EgressHosts {
+            id,
+            hosts,
+            selected,
+            buffer,
+            editing,
+            armed,
+            error,
+            message,
+        } => {
+            draw_egress_hosts(
+                f,
+                chunks[1],
+                id,
+                hosts,
+                *selected,
+                buffer,
+                *editing,
+                *armed,
+                error.as_deref(),
+                message.as_deref(),
+                app.tick,
+            );
         }
         Screen::WzId { buffer, error, .. } => {
             draw_wz_input(
@@ -2138,8 +2583,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 app.tick,
             );
         }
-        Screen::WzProfile { selected, .. } => {
-            draw_wz_profile(f, chunks[1], *selected);
+        Screen::WzProfile { selected, draft } => {
+            draw_wz_profile(f, chunks[1], *selected, draft);
         }
         Screen::WzPrefetch { editor, .. } => {
             draw_wz_steps(
@@ -2707,16 +3152,19 @@ fn draw_confirm_clear(
 enum LibRow {
     CreateNew,
     ImportFile,
+    DetectUrl,
     Entry(usize),
 }
 
-/// Map a selection index to a row: 0 = create, 1 = import, 2.. = files.
+/// Map a selection index to a row: 0 = create, 1 = import, 2 = detect,
+/// 3.. = files.
 fn lib_row(file_count: usize, selected: usize) -> Option<LibRow> {
     match selected {
         0 => Some(LibRow::CreateNew),
         1 => Some(LibRow::ImportFile),
+        2 => Some(LibRow::DetectUrl),
         n => {
-            let i = n - 2;
+            let i = n - 3;
             if i < file_count {
                 Some(LibRow::Entry(i))
             } else {
@@ -2728,7 +3176,7 @@ fn lib_row(file_count: usize, selected: usize) -> Option<LibRow> {
 
 /// Total selectable rows for a given library size.
 fn lib_row_count(file_count: usize) -> usize {
-    file_count + 2
+    file_count + 3
 }
 
 // --- add service (manifest library) -----------------------------------------
@@ -2768,6 +3216,11 @@ fn draw_add_service(
             "⇪ Import existing file",
             "copy from disk into the library",
             LibRow::ImportFile,
+        ),
+        action_row(
+            "⇄ Detect from GitHub URL",
+            "clone, detect stack, prefill wizard",
+            LibRow::DetectUrl,
         ),
     ];
     if !files.is_empty() {
@@ -2920,6 +3373,250 @@ fn draw_user_services(
     f.render_widget(List::new(items).block(block_widget), area);
 }
 
+/// Human byte counter for the Egress matrix (unit IP accounting).
+fn human_bytes(n: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    if n >= MB {
+        format!("{:.1} MB", n as f64 / MB as f64)
+    } else if n >= KB {
+        format!("{:.1} KB", n as f64 / KB as f64)
+    } else {
+        format!("{n} B")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_egress(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    files: &[crate::hoster::library::LibraryEntry],
+    deployed: &[String],
+    counters: &HashMap<String, (u64, u64)>,
+    verdicts: &HashMap<String, String>,
+    checking: Option<&str>,
+    selected: usize,
+    message: Option<&str>,
+) {
+    if files.is_empty() {
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    " No services added yet.",
+                    Style::default().fg(BODY),
+                )),
+                Line::from(Span::styled(
+                    " Use “Add Service” from the menu to import or create one.",
+                    Style::default().fg(DIM),
+                )),
+            ])
+            .wrap(Wrap { trim: false })
+            .block(block("Egress", ERR_RED)),
+            area,
+        );
+        return;
+    }
+    let mut items: Vec<ListItem> = Vec::new();
+    for (i, e) in files.iter().enumerate() {
+        let sel = i == selected;
+        let marker = Span::styled(
+            if sel { " » " } else { "   " },
+            Style::default().fg(ERR_RED),
+        );
+        // Allow list, re-read from the validated file (cheap, always fresh).
+        let allow: Vec<String> = crate::hoster::library::load(&e.id)
+            .map(|m| m.egress.allow)
+            .unwrap_or_default();
+        let policy = if allow.is_empty() {
+            "deny-all (loopback only)".to_string()
+        } else {
+            format!("allow: {}", allow.join(", "))
+        };
+        let traffic = match counters.get(&e.id) {
+            Some((out, inn)) => {
+                format!(" · ↑ {} ↓ {}", human_bytes(*out), human_bytes(*inn))
+            }
+            None if deployed.iter().any(|d| d == &e.id) => " · counters n/a".to_string(),
+            None => String::new(),
+        };
+        items.push(ListItem::new(Line::from(vec![
+            marker,
+            Span::styled(
+                e.id.clone(),
+                Style::default()
+                    .fg(if sel { Color::White } else { BODY })
+                    .add_modifier(if sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Span::styled(format!("  {policy}{traffic}"), Style::default().fg(DIM)),
+        ])));
+        // Latest verification verdict under the row (first line: the
+        // verdict itself; details re-appear on the next check).
+        if checking == Some(e.id.as_str()) {
+            items.push(ListItem::new(Line::from(Span::styled(
+                "     checking…",
+                Style::default().fg(WARN_YELLOW),
+            ))));
+        } else if let Some(v) = verdicts.get(&e.id)
+            && let Some(first) = v.lines().next()
+        {
+            let hue = if first.contains("BLOCKED") {
+                OK_GREEN
+            } else if first.contains("OPEN") {
+                ERR_RED
+            } else {
+                WARN_YELLOW
+            };
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("     {first}"),
+                Style::default().fg(hue),
+            ))));
+        }
+    }
+    let mut block_widget = block("Egress", ERR_RED);
+    if let Some(m) = message {
+        block_widget = block_widget.title_bottom(Span::styled(
+            format!(" {m} "),
+            Style::default().fg(WARN_YELLOW),
+        ));
+    }
+    f.render_widget(List::new(items).block(block_widget), area);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_egress_hosts(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    id: &str,
+    hosts: &[String],
+    selected: usize,
+    buffer: &str,
+    editing: bool,
+    armed: bool,
+    error: Option<&str>,
+    message: Option<&str>,
+    tick: u64,
+) {
+    let mut text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " Hostnames this service may reach (besides loopback). Saved on",
+            Style::default().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            " every change — a redeploy renders the new unit filter.",
+            Style::default().fg(DIM),
+        )),
+        Line::from(""),
+    ];
+    if hosts.is_empty() {
+        text.push(Line::from(Span::styled(
+            " (none — deny-all, loopback only)",
+            Style::default().fg(DIM),
+        )));
+    }
+    for (i, h) in hosts.iter().enumerate() {
+        let sel = i == selected;
+        text.push(Line::from(vec![
+            Span::styled(
+                if sel { " » " } else { "   " },
+                Style::default().fg(ERR_RED),
+            ),
+            Span::styled(
+                h.clone(),
+                Style::default().fg(if sel { Color::White } else { BODY }),
+            ),
+        ]));
+    }
+    if armed {
+        text.push(Line::from(Span::styled(
+            " ← press d again to delete the highlighted host",
+            Style::default().fg(ERR_RED).add_modifier(Modifier::BOLD),
+        )));
+    }
+    text.push(Line::from(""));
+    if editing {
+        text.push(Line::from(vec![
+            Span::styled(" Add host: ", Style::default().fg(ERR_RED)),
+            Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
+            cursor_span(tick),
+        ]));
+    }
+    if let Some(e) = error {
+        text.push(Line::from(Span::styled(
+            format!(" x {e}"),
+            Style::default().fg(ERR_RED),
+        )));
+    }
+    if let Some(m) = message {
+        text.push(Line::from(Span::styled(
+            format!(" {m}"),
+            Style::default().fg(WARN_YELLOW),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block(&format!("Egress · {id}"), ERR_RED)),
+        area,
+    );
+}
+
+fn draw_detect_input(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    buffer: &str,
+    error: Option<&str>,
+    busy: bool,
+    tick: u64,
+) {
+    let mut text = vec![
+        Line::from(Span::styled(
+            " Paste a GitHub URL: it is cloned shallowly into a temp dir,",
+            Style::default().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            " the stack is detected, and the wizard opens prefilled.",
+            Style::default().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            " Nothing is stored until you save at step 9/9.",
+            Style::default().fg(DIM),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" GitHub URL: ", Style::default().fg(VIOLET)),
+            Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
+            cursor_span(tick),
+        ]),
+    ];
+    if let Some(e) = error {
+        text.push(Line::from(Span::styled(
+            format!(" x {e}"),
+            Style::default().fg(ERR_RED),
+        )));
+    }
+    if busy {
+        text.push(Line::from(vec![
+            Span::styled(spinner_char(tick), spinner_style(tick)),
+            Span::styled(
+                " fetching source and detecting stack...",
+                Style::default().fg(WARN_YELLOW),
+            ),
+        ]));
+    }
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block("Detect from GitHub URL", VIOLET)),
+        area,
+    );
+}
+
 fn draw_import(
     f: &mut ratatui::Frame,
     area: ratatui::prelude::Rect,
@@ -3005,7 +3702,12 @@ fn draw_wz_input(
     );
 }
 
-fn draw_wz_profile(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected: usize) {
+fn draw_wz_profile(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    selected: usize,
+    draft: &wizard::Draft,
+) {
     let mut text = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -3034,6 +3736,21 @@ fn draw_wz_profile(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selecte
             ),
             Span::styled(format!("— {about}"), Style::default().fg(DIM)),
         ]));
+    }
+    // Detection notes: what was guessed and what must be verified. They
+    // travel with the draft until a profile switch replaces them.
+    if draft.detected && !draft.notes.is_empty() {
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            " Detected — verify on the next steps:",
+            Style::default().fg(WARN_YELLOW),
+        )));
+        for note in &draft.notes {
+            text.push(Line::from(Span::styled(
+                format!("  ⚠ {note}"),
+                Style::default().fg(WARN_YELLOW),
+            )));
+        }
     }
     f.render_widget(
         Paragraph::new(text)
@@ -3704,14 +4421,34 @@ fn hint_line(screen: &Screen) -> Line<'static> {
         ],
         Screen::AddService { .. } => vec![
             ("Enter choose", OK_GREEN),
+            ("e edit", VIOLET),
             ("d delete", ERR_RED),
             ("r refresh", BLUE),
             ("Esc back", WARN_YELLOW),
         ],
         Screen::Import { .. } => vec![("Enter import", OK_GREEN), ("Esc back", WARN_YELLOW)],
+        Screen::DetectInput { busy, .. } => {
+            if *busy {
+                vec![("working…", WARN_YELLOW)]
+            } else {
+                vec![("Enter detect", OK_GREEN), ("Esc back", WARN_YELLOW)]
+            }
+        }
         Screen::UserServices { .. } => vec![
             ("Enter open", OK_GREEN),
+            ("e edit", VIOLET),
             ("r refresh", BLUE),
+            ("Esc back", WARN_YELLOW),
+        ],
+        Screen::Egress { .. } => vec![
+            ("Enter edit", OK_GREEN),
+            ("v verify", VIOLET),
+            ("r refresh", BLUE),
+            ("Esc back", WARN_YELLOW),
+        ],
+        Screen::EgressHosts { .. } => vec![
+            ("Enter add", OK_GREEN),
+            ("d delete", ERR_RED),
             ("Esc back", WARN_YELLOW),
         ],
         Screen::WzId { .. } | Screen::WzGit { .. } | Screen::WzCommit { .. } => {
@@ -3770,21 +4507,23 @@ mod tests {
     fn lib_rows_map_selection_to_actions_and_files() {
         assert_eq!(lib_row(0, 0), Some(LibRow::CreateNew));
         assert_eq!(lib_row(0, 1), Some(LibRow::ImportFile));
-        assert_eq!(lib_row(0, 2), None);
+        assert_eq!(lib_row(0, 2), Some(LibRow::DetectUrl));
+        assert_eq!(lib_row(0, 3), None);
         assert_eq!(lib_row(2, 0), Some(LibRow::CreateNew));
         assert_eq!(lib_row(2, 1), Some(LibRow::ImportFile));
-        assert_eq!(lib_row(2, 2), Some(LibRow::Entry(0)));
-        assert_eq!(lib_row(2, 3), Some(LibRow::Entry(1)));
-        assert_eq!(lib_row(2, 4), None);
-        assert_eq!(lib_row_count(0), 2);
-        assert_eq!(lib_row_count(3), 5);
+        assert_eq!(lib_row(2, 2), Some(LibRow::DetectUrl));
+        assert_eq!(lib_row(2, 3), Some(LibRow::Entry(0)));
+        assert_eq!(lib_row(2, 4), Some(LibRow::Entry(1)));
+        assert_eq!(lib_row(2, 5), None);
+        assert_eq!(lib_row_count(0), 3);
+        assert_eq!(lib_row_count(3), 6);
     }
 
     /// The menu is the single source of truth: Self-hosting manages units,
     /// My Services lists the user's own added services. Navigation caps derive
     /// from MAIN_MENU so this guards desync.
     #[test]
-    fn main_menu_lists_six_items_with_self_hosting_and_my_services() {
+    fn main_menu_lists_seven_items_ending_with_egress_and_logs() {
         let titles: Vec<&str> = MAIN_MENU.iter().map(|(_, t, _, _)| *t).collect();
         assert_eq!(
             titles,
@@ -3794,9 +4533,18 @@ mod tests {
                 "Deploy Service",
                 "Add Service",
                 "My Services",
+                "Egress",
                 "Logs"
             ]
         );
+    }
+
+    #[test]
+    fn human_bytes_uses_binary_units() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(999), "999 B");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MB");
     }
 
     /// ←/→ walk the Logs tabs in opposite directions (left must not act as

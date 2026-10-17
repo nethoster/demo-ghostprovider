@@ -845,6 +845,21 @@ pub fn deploy_service(
     let env_map: BTreeMap<String, String> = BTreeMap::new();
     let env_file = write_env_file(recipe.service_name, &env_map).ok().flatten();
 
+    // IPAddressAllow= takes bare addresses only — hostnames would refuse
+    // the whole unit — so the manifest's egress hosts resolve here, before
+    // any unit file is written (fail closed: one unresolvable name aborts
+    // the deploy and rolls the project back; a redeploy re-resolves, which
+    // is also how DNS drift is corrected).
+    let egress_ips = match crate::hoster::egress::resolve_egress_hosts(recipe.egress_allow) {
+        Ok(ips) => ips,
+        Err(e) => {
+            report_err(&mut result, format!("egress host resolution failed: {e}"));
+            rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
+            return result;
+        }
+    };
+    let egress_refs: Vec<&str> = egress_ips.iter().map(String::as_str).collect();
+
     let spec = UnitSpec {
         service_name: recipe.service_name,
         working_dir: &project_dir,
@@ -853,6 +868,7 @@ pub fn deploy_service(
         env_file: env_file.as_deref(),
         extra_env: &[],
         res: recipe.res,
+        egress_allow: &egress_refs,
     };
     if let Err(e) = create_unit(&spec) {
         report_err(&mut result, format!("unit creation failed: {e:#}"));

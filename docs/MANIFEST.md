@@ -31,6 +31,8 @@ resources:
   memory_high: "256M"
   cpu_quota: "100%"
 tools: ["bun"]
+# egress:                   # optional: runtime network exceptions
+#   allow: [api.example.com] # ≤8 bare hostnames or IPv4; default = deny-all
 ```
 
 ## Rules
@@ -53,6 +55,20 @@ tools: ["bun"]
   port is injected via `settings.yml`) and bind loopback (`__serve-static`
   or `127.0.0.1`).
 * `resources.memory_max` + `resources.tasks_max` are required.
+* `egress.allow` (optional, top level) is the per-service runtime egress
+  allowlist: at most 8 bare hostnames or IPv4 addresses, normalized
+  (trimmed, lowercased), duplicates rejected. `localhost`, ranges, wildcards,
+  ports and numeric TLDs are rejected — loopback is always allowed anyway.
+  Empty (the default) means deny-all: the rendered unit carries
+  `IPAddressDeny=any` + `IPAddressAllow=127.0.0.1 ::1`. Because systemd's
+  `IPAddressAllow=` accepts bare addresses only (never hostnames), the deploy
+  resolves each listed name to its A/AAAA records just before writing the
+  unit and appends the literal addresses; resolution fails closed — one
+  unresolvable host aborts the deploy. Redeploying re-resolves, which is how
+  DNS drift is corrected. `IPAccounting=yes` records the per-service byte
+  counters the Egress screen shows. The list affects the *runtime* unit only:
+  the build sandbox stays offline and host prefetch stays on its own
+  downloader allowlist.
 * `plugins` (bun only) pin `https://cdn.jsdelivr.net/npm/@inlang/plugin-*`
   modules by SHA-256, like the built-in VERT manifest.
 * Secrets never go in the manifest (see `secrets.rs`).
@@ -65,14 +81,23 @@ demo-ghostprovider __deploy --manifest service.yaml
 ```
 
 `__check-manifest` validates and prints the plan without side effects:
-source/revision, host-prefetch vs offline-build steps, run command, port
-and limits.
+source/revision, host-prefetch vs offline-build steps, run command, port,
+limits and the egress allowlist.
+
+```bash
+demo-ghostprovider __egress-probe --hosts api.example.com,1.1.1.1
+```
+
+`__egress-probe` is the same live check the Egress screen runs: a loopback
+beat plus one TCP beat per host, printed as `host <h>: open|blocked|failed(…)`
+lines (open = the host was reachable, blocked = filtered, failed = timeout /
+no route). It only reads state; nothing is changed.
 
 ## Library (Add Service screen, menu item 4)
 
 The panel's 4th menu item keeps your own manifests in
 `~/.local/share/demo-ghostprovider/manifests/<service-id>.yaml`. The top of
-the list holds two clickable rows (↑↓ + Enter, hotkeys in brackets):
+the list holds three clickable rows (↑↓ + Enter, hotkeys in brackets):
 
 * `+ Create new service.yaml` (`n`) — the built-in wizard: 9 plain questions
   (name → git URL → commit pin → build profile → download steps → build
@@ -80,12 +105,18 @@ the list holds two clickable rows (↑↓ + Enter, hotkeys in brackets):
   Enter saves the file into the library,
 * `⇪ Import existing file` (`a`) — copy a file from disk (validated before
   copying; duplicates are refused — delete the stored one first to replace
-  it).
+  it),
+* `⇄ Detect from GitHub URL` (Enter) — clone the repo shallowly into a temp
+  dir, detect the stack (bun/pnpm/python/go/npm …), wipe the tree, and open
+  the wizard prefilled. Nothing is stored until you save at step 9/9.
 
 Below them, every stored file (re-validated on each listing):
 
 * `Enter` deploys the selected file through the same Confirm gate and the
   same sandbox + loopback + cleanup pipeline as everything else,
+* `e` edits the stored YAML in `$VISUAL`/`$EDITOR` (the process suspends the
+  TUI around the editor; the file is re-validated on the next listing — same
+  mechanism as `__recipe-edit <id>`, which runs the editor without the panel),
 * `d` twice deletes the stored file (the deployed service, if any, is
   untouched — remove it separately from My Services),
 * `r` refreshes the list.
@@ -97,6 +128,33 @@ annotated with deploy status (`● deployed` / `○ not deployed`). Enter on a
 ready service deploys it through the usual Confirm gate; Enter on a deployed
 one jumps to Self-hosting with the cursor on its unit. Importing, creating
 and deleting stay in Add Service.
+
+## Egress (menu item 6)
+
+Menu item 6 is the runtime egress matrix: one row per library service with
+its policy (`deny-all (loopback only)` or `allow: …`), the `IPAccounting`
+byte counters of the deployed unit (`↑ … ↓ …`) and, after a check, the last
+verdict under the row (`BLOCKED` = the filter held, `OPEN` = the host was
+reachable, `checking…` while a probe runs):
+
+* `Enter` opens the host editor for the selected service — `a` (or Enter at
+  the prompt) appends the typed hostname through full manifest validation,
+  `d` twice deletes the highlighted host. Every change is saved to the
+  stored `service.yaml` immediately; the new `IPAddressAllow` line takes
+  effect on the next deploy (the unit must be recreated, not just reloaded —
+  and the deploy re-resolves the hostnames to literal addresses, so DNS
+  drift is corrected on every redeploy),
+* `v` runs the live check for the selected service (async; loopback beat +
+  one TCP beat per allowed host — the same probe as `__egress-probe`),
+* `r` refreshes files, deploy status and counters.
+
+Threat model: this is *egress* control for already-deployed services, not a
+substitute for the sandbox. The build phase never sees this list (offline),
+host prefetch stays on its own downloader allowlist, and the runtime default
+is deny-all — a compromised app starts with zero network until the manifest
+explicitly names a host. The check is honest about its limits: TCP beats can
+report `open` through any network path the unit actually has, so treat
+`OPEN` on a deny-all service as a finding, not a probe error.
 
 ## Built-ins
 
