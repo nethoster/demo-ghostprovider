@@ -126,7 +126,7 @@ Below them, every stored file (re-validated on each listing):
 Menu item 5 is the overview of the services you added: the same library
 annotated with deploy status (`● deployed` / `○ not deployed`). Enter on a
 ready service deploys it through the usual Confirm gate; Enter on a deployed
-one jumps to Self-hosting with the cursor on its unit. Importing, creating
+one jumps to Self-Hosting with the cursor on its unit. Importing, creating
 and deleting stay in Add Service.
 
 ## Egress (menu item 6)

@@ -1,8 +1,10 @@
 //! System probing: prerequisite checks and a bare map of occupied ports.
 //!
 //! Privacy policy: this report must stay useless to attackers. No VPN
-//! interface detection, no HTTP probing of local services — the port table
-//! names only what `ss` itself already shows to the local user.
+//! status details (the one exception is the boolean presence of the
+//! `tailscale` binary — no login state, no peers), no HTTP probing of local
+//! services — the port table names only what `ss` itself already shows to
+//! the local user.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::process::Command;
@@ -143,6 +145,9 @@ pub fn run_analysis() -> AnalysisResult {
         // Everything this tool fetches lives behind github.com, so a
         // reachable github.com is the honest definition of "network".
         network: https_probe_ok(),
+        // Presence only — the scan never reports login state or peers; that
+        // detail lives in the local Self-Hosting screen (hoster::tailscale).
+        tailscale: which("tailscale"),
         interfaces,
         listening_ports: ports,
         gateway: get_gateway(),

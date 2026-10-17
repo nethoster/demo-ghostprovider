@@ -156,7 +156,7 @@ pub(crate) fn spawn_scan(tx: Sender<Msg>, seq: u64) {
         ));
         let mark = |ok: bool| if ok { "[x]" } else { "[ ]" };
         out.push_str(&format!(
-            "{} systemd          {}\n{} systemd-nspawn   {}\n{} git              {}\n{} python3 / node   {} / {}\n{} network          {}\n",
+            "{} systemd          {}\n{} systemd-nspawn   {}\n{} git              {}\n{} python3 / node   {} / {}\n{} network          {}\n{} tailscale         {}\n",
             mark(result.systemd),
             yesno(result.systemd, "found", "MISSING"),
             mark(result.systemd_nspawn),
@@ -168,6 +168,8 @@ pub(crate) fn spawn_scan(tx: Sender<Msg>, seq: u64) {
             found("node"),
             mark(result.network),
             yesno(result.network, "online", "offline"),
+            mark(result.tailscale),
+            yesno(result.tailscale, "found", "MISSING"),
         ));
 
         if !result.interfaces.is_empty() {
@@ -573,20 +575,72 @@ pub(crate) fn wait_deploy_worker(timeout: std::time::Duration) {
     let _ = handle.join();
 }
 
-/// (unit name, status, url) rows for the services screen.
-pub(crate) fn service_rows() -> Vec<(String, String, String)> {
-    crate::state::list()
+/// One row of the Self-Hosting screen.
+///
+/// `managed` marks panel-deployed units (state.json): the s/t/d/r keys act on
+/// them. Rows with `managed: false` (the tailscale status row) are read-only
+/// status lines — never routed through systemctl.
+pub(crate) struct ServiceRow {
+    pub name: String,
+    pub status: String,
+    pub url: String,
+    pub managed: bool,
+}
+
+/// Rows for the services screen: panel-deployed units, then — when the
+/// tailscaled daemon is up — a status row for tailscale itself (running /
+/// stopped / needs login). The daemon-down case shows nothing here: binary
+/// presence alone is a System Scan fact, not a Self-Hosting one.
+pub(crate) fn service_rows() -> Vec<ServiceRow> {
+    build_rows(
+        crate::state::list()
+            .into_iter()
+            .map(|(name, entry)| {
+                let active = std::process::Command::new("systemctl")
+                    .args(["--user", "is-active", &entry.unit_name])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_else(|_| "unknown".into());
+                let url = entry.urls.first().cloned().unwrap_or_default();
+                (name, active, url)
+            })
+            .collect(),
+        crate::hoster::tailscale::probe(),
+    )
+}
+
+/// Pure row assembly: unit rows (managed) plus the tailscale status row from
+/// a pre-probed [`crate::hoster::tailscale::TailscaleState`]. Split out so
+/// the mapping is testable without touching the live daemon.
+pub(crate) fn build_rows(
+    units: Vec<(String, String, String)>,
+    tailscale: crate::hoster::tailscale::TailscaleState,
+) -> Vec<ServiceRow> {
+    use crate::hoster::tailscale::TailscaleState as Ts;
+    let mut rows: Vec<ServiceRow> = units
         .into_iter()
-        .map(|(name, entry)| {
-            let active = std::process::Command::new("systemctl")
-                .args(["--user", "is-active", &entry.unit_name])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_else(|_| "unknown".into());
-            let url = entry.urls.first().cloned().unwrap_or_default();
-            (name, active, url)
+        .map(|(name, status, url)| ServiceRow {
+            name,
+            status,
+            url,
+            managed: true,
         })
-        .collect()
+        .collect();
+    let (status, url) = match tailscale {
+        Ts::Running { dns_name } => ("running".to_string(), format!("https://{dns_name}")),
+        Ts::Stopped => ("stopped".to_string(), String::new()),
+        Ts::NeedsLogin => ("needs login".to_string(), String::new()),
+        // Not installed / daemon down: no row — the screen only lists what
+        // is actually up.
+        Ts::NotInstalled | Ts::DaemonDown => return rows,
+    };
+    rows.push(ServiceRow {
+        name: "tailscale".into(),
+        status,
+        url,
+        managed: false,
+    });
+    rows
 }
 
 pub(crate) fn service_action(name: &str, action: &str) -> String {
@@ -769,5 +823,57 @@ mod tests {
             other => panic!("expected Manifest, got {other:?}"),
         }
         assert!(classify_deploy_input("/tmp/does-not-exist-xyz.yaml").is_err());
+    }
+
+    fn unit_row(name: &str) -> (String, String, String) {
+        (
+            name.to_string(),
+            "active".to_string(),
+            format!("http://localhost:1/{name}"),
+        )
+    }
+
+    #[test]
+    fn build_rows_appends_running_tailscale_as_unmanaged_row() {
+        let rows = build_rows(
+            vec![unit_row("demo-searxng")],
+            crate::hoster::tailscale::TailscaleState::Running {
+                dns_name: "devbox.tailnet-abc.ts.net".into(),
+            },
+        );
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].managed);
+        let ts = &rows[1];
+        assert_eq!(ts.name, "tailscale");
+        assert_eq!(ts.status, "running");
+        assert_eq!(ts.url, "https://devbox.tailnet-abc.ts.net");
+        assert!(!ts.managed);
+    }
+
+    #[test]
+    fn build_rows_maps_stopped_and_needs_login_without_url() {
+        let stopped = build_rows(
+            vec![unit_row("demo-searxng")],
+            crate::hoster::tailscale::TailscaleState::Stopped,
+        );
+        assert_eq!(stopped.last().unwrap().status, "stopped");
+        assert_eq!(stopped.last().unwrap().url, "");
+        let login = build_rows(
+            vec![unit_row("demo-searxng")],
+            crate::hoster::tailscale::TailscaleState::NeedsLogin,
+        );
+        assert_eq!(login.last().unwrap().status, "needs login");
+    }
+
+    #[test]
+    fn build_rows_omits_tailscale_row_when_daemon_down_or_absent() {
+        for ts in [
+            crate::hoster::tailscale::TailscaleState::NotInstalled,
+            crate::hoster::tailscale::TailscaleState::DaemonDown,
+        ] {
+            let rows = build_rows(vec![unit_row("demo-searxng")], ts);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].managed);
+        }
     }
 }

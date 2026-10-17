@@ -1122,7 +1122,7 @@ fn wipe_project_dir(project_dir: &str) -> bool {
 
 /// Stop, delete the unit, wipe the cloned project directory (including the
 /// `.ghost-cache` living inside it), release the announced port and forget
-/// the service. Used by "Self-hosting" → delete.
+/// the service. Used by "Self-Hosting" → delete.
 ///
 /// GhostProvider cleans up the resources it manages; applications may still
 /// leave their own state (databases, external sockets) elsewhere.

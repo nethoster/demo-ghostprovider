@@ -14,7 +14,7 @@
 //! [recovered]    leftovers of a deploy whose process died out-of-band
 //!                (SIGKILL, power loss, shutdown/reboot) were found later —
 //!                on the next launch or by the background sweep — and removed.
-//! [removed]      a deliberate full removal (Self-hosting → delete).
+//! [removed]      a deliberate full removal (Self-Hosting → delete).
 //! [ghost]        orphaned `ghost-build-*` / `ghost-egress-*` transient units
 //!                left by a dead deploy, stopped by the background sweep.
 //! ```
@@ -99,7 +99,7 @@ pub fn recovered(service: &str, url: &str, had_artifacts: bool) {
     }
 }
 
-/// A deliberate full removal from "Self-hosting" → delete.
+/// A deliberate full removal from "Self-Hosting" → delete.
 pub fn removed(service: &str, url: &str) {
     record(
         "removed",

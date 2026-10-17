@@ -1,7 +1,7 @@
 //! Interactive panel — ratatui port of the Textual UI.
 //!
 //! Screen flow mirrors the Python version:
-//! Main menu → System Scan / Deploy (URL input) / Self-hosting.
+//! Main menu → System Scan / Deploy (URL input) / Self-Hosting.
 //! Long operations run on worker threads reporting through a channel.
 //!
 //! Visual language: neon-on-black maxicolor theme. Every data type owns a
@@ -60,7 +60,7 @@ pub(crate) const MAIN_MENU: &[(&str, &str, &str, Color)] = &[
         "probe interfaces and occupied ports",
         ACCENT,
     ),
-    ("#", "Self-hosting", "manage deployed units", OK_GREEN),
+    ("#", "Self-Hosting", "manage deployed units", OK_GREEN),
     (
         "^",
         "Deploy Service",
@@ -155,7 +155,7 @@ pub(crate) enum Screen {
         done: Option<bool>,
     },
     Services {
-        rows: Vec<(String, String, String)>,
+        rows: Vec<workers::ServiceRow>,
         selected: usize,
         message: Option<String>,
     },
@@ -278,7 +278,7 @@ pub(crate) enum Screen {
     },
     /// Overview of the user's own added services (menu "My Services"): the
     /// manifest library annotated with deploy status. Read-mostly: Enter
-    /// deploys (or jumps to Self-hosting when already deployed); managing
+    /// deploys (or jumps to Self-Hosting when already deployed); managing
     /// (import/delete) stays in Add Service.
     UserServices {
         files: Vec<crate::hoster::library::LibraryEntry>,
@@ -1003,11 +1003,18 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     Some('r') if count > 0 => {
                         // [r] restarts the selected service and re-reads the
                         // rows so the status shown reflects the restart.
-                        if let Some((name, _, _)) = rows.get(*selected) {
-                            let name = name.clone();
-                            let msg = workers::service_action(&name, "restart");
-                            *rows = workers::service_rows();
-                            *message = Some(msg);
+                        // The tailscale row is read-only status: refresh it
+                        // instead of acting on it.
+                        let selected_row = rows.get(*selected).map(|r| (r.managed, r.name.clone()));
+                        if let Some((managed, name)) = selected_row {
+                            if managed {
+                                let msg = workers::service_action(&name, "restart");
+                                *rows = workers::service_rows();
+                                *message = Some(msg);
+                            } else {
+                                *rows = workers::service_rows();
+                                *message = Some("tailscale is not managed by the panel".into());
+                            }
                         }
                     }
                     Some('r') => {
@@ -1015,26 +1022,33 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                         *message = Some("refreshed".into());
                     }
                     Some(action @ ('s' | 't' | 'd')) if count > 0 => {
-                        if let Some((name, _, _)) = rows.get(*selected) {
-                            let name = name.clone();
-                            match action {
-                                's' => {
-                                    let msg = workers::service_action(&name, "stop");
-                                    *rows = workers::service_rows();
-                                    *message = Some(msg);
-                                }
-                                't' => {
-                                    let msg = workers::service_action(&name, "start");
-                                    *rows = workers::service_rows();
-                                    *message = Some(msg);
-                                }
-                                // Deletion is destructive (unit + clone +
-                                // caches): gate it behind an explicit YES/NO
-                                // that defaults to No.
-                                _ => {
-                                    app.screen = Screen::ConfirmDelete {
-                                        name,
-                                        yes_selected: false,
+                        let selected_row = rows.get(*selected).map(|r| (r.managed, r.name.clone()));
+                        if let Some((managed, name)) = selected_row {
+                            if !managed {
+                                // Read-only status row (tailscale): no
+                                // systemctl actions on it, ever.
+                                *rows = workers::service_rows();
+                                *message = Some("tailscale is not managed by the panel".into());
+                            } else {
+                                match action {
+                                    's' => {
+                                        let msg = workers::service_action(&name, "stop");
+                                        *rows = workers::service_rows();
+                                        *message = Some(msg);
+                                    }
+                                    't' => {
+                                        let msg = workers::service_action(&name, "start");
+                                        *rows = workers::service_rows();
+                                        *message = Some(msg);
+                                    }
+                                    // Deletion is destructive (unit + clone +
+                                    // caches): gate it behind an explicit YES/NO
+                                    // that defaults to No.
+                                    _ => {
+                                        app.screen = Screen::ConfirmDelete {
+                                            name,
+                                            yes_selected: false,
+                                        }
                                     }
                                 }
                             }
@@ -1478,13 +1492,10 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                                 .map(|e| format!("invalid manifest: {e}"))
                                 .or_else(|| Some("invalid manifest".into()));
                         } else if deployed.iter().any(|d| d == &f.id) {
-                            // Already deployed: jump to Self-hosting with the
+                            // Already deployed: jump to Self-Hosting with the
                             // cursor on this unit instead of redeploying.
                             let rows = workers::service_rows();
-                            let at = rows
-                                .iter()
-                                .position(|(name, _, _)| name == &f.id)
-                                .unwrap_or(0);
+                            let at = rows.iter().position(|row| row.name == f.id).unwrap_or(0);
                             app.screen = Screen::Services {
                                 rows,
                                 selected: at,
@@ -4173,12 +4184,12 @@ fn doctor_lines(body: &str) -> Option<Vec<Line<'static>>> {
 fn draw_services(
     f: &mut ratatui::Frame,
     area: ratatui::prelude::Rect,
-    rows: &[(String, String, String)],
+    rows: &[workers::ServiceRow],
     selected: usize,
     message: Option<&str>,
 ) {
     let mut title = Line::from(vec![
-        Span::styled(" Self-hosting ", Style::default().fg(BLUE)),
+        Span::styled(" Self-Hosting ", Style::default().fg(BLUE)),
         Span::styled("[", Style::default().fg(DIM)),
         Span::styled("s", Style::default().fg(WARN_YELLOW)),
         Span::styled("]top ", Style::default().fg(DIM)),
@@ -4222,22 +4233,31 @@ fn draw_services(
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .map(|(i, (name, status, url))| {
+        .map(|(i, row)| {
             let sel = i == selected;
             // No background fills — selection is arrow + bold + white,
             // zebra alternates text shades only.
             let name_fg = if sel {
                 Color::White
+            } else if !row.managed {
+                DIM
             } else if i % 2 == 1 {
                 BODY_ALT
             } else {
                 BODY
             };
             let url_fg = DIM;
-            let status_color = match status.as_str() {
-                "active" => OK_GREEN,
-                "activating" | "reloading" => WARN_YELLOW,
+            let status_color = match row.status.as_str() {
+                "active" | "running" => OK_GREEN,
+                "activating" | "reloading" | "stopped" | "needs login" => WARN_YELLOW,
                 _ => ERR_RED,
+            };
+            // Read-only status rows (tailscale) carry a [vpn] tag instead of
+            // the plain managed-unit name column.
+            let name_col = if row.managed {
+                format!("{:<16}", row.name)
+            } else {
+                format!("[vpn] {:<10}", row.name)
             };
             ListItem::new(Line::from(vec![
                 Span::styled(
@@ -4249,7 +4269,7 @@ fn draw_services(
                     }),
                 ),
                 Span::styled(
-                    format!("{name:<16}"),
+                    name_col,
                     Style::default().fg(name_fg).add_modifier(if sel {
                         Modifier::BOLD
                     } else {
@@ -4258,8 +4278,8 @@ fn draw_services(
                 ),
                 format!("{:<12}", "").into(),
                 Span::styled("● ", Style::default().fg(status_color)),
-                Span::styled(status.clone(), Style::default().fg(status_color)),
-                Span::styled(format!("  {url}"), Style::default().fg(url_fg)),
+                Span::styled(row.status.clone(), Style::default().fg(status_color)),
+                Span::styled(format!("  {}", row.url), Style::default().fg(url_fg)),
             ]))
         })
         .collect();
@@ -4519,7 +4539,7 @@ mod tests {
         assert_eq!(lib_row_count(3), 6);
     }
 
-    /// The menu is the single source of truth: Self-hosting manages units,
+    /// The menu is the single source of truth: Self-Hosting manages units,
     /// My Services lists the user's own added services. Navigation caps derive
     /// from MAIN_MENU so this guards desync.
     #[test]
@@ -4529,7 +4549,7 @@ mod tests {
             titles,
             vec![
                 "System Scan",
-                "Self-hosting",
+                "Self-Hosting",
                 "Deploy Service",
                 "Add Service",
                 "My Services",

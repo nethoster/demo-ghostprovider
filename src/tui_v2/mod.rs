@@ -79,7 +79,7 @@ pub(crate) enum Screen {
         done: Option<bool>,
     },
     Services {
-        rows: Vec<(String, String, String)>,
+        rows: Vec<crate::tui::workers::ServiceRow>,
         selected: usize,
         message: Option<String>,
     },
@@ -493,23 +493,32 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                         *message = Some("refreshed".into());
                     }
                     Some(action @ ('s' | 't' | 'd')) if count > 0 => {
-                        if let Some((name, _, _)) = rows.get(*selected) {
-                            let name = name.clone();
-                            match action {
-                                's' => {
-                                    let msg = crate::tui::workers::service_action(&name, "stop");
-                                    *rows = crate::tui::workers::service_rows();
-                                    *message = Some(msg);
-                                }
-                                't' => {
-                                    let msg = crate::tui::workers::service_action(&name, "start");
-                                    *rows = crate::tui::workers::service_rows();
-                                    *message = Some(msg);
-                                }
-                                _ => {
-                                    app.screen = Screen::ConfirmDelete {
-                                        name,
-                                        yes_selected: false,
+                        let selected_row = rows.get(*selected).map(|r| (r.managed, r.name.clone()));
+                        if let Some((managed, name)) = selected_row {
+                            if !managed {
+                                // Read-only status row (tailscale): no
+                                // systemctl actions on it, ever.
+                                *rows = crate::tui::workers::service_rows();
+                                *message = Some("tailscale is not managed by the panel".into());
+                            } else {
+                                match action {
+                                    's' => {
+                                        let msg =
+                                            crate::tui::workers::service_action(&name, "stop");
+                                        *rows = crate::tui::workers::service_rows();
+                                        *message = Some(msg);
+                                    }
+                                    't' => {
+                                        let msg =
+                                            crate::tui::workers::service_action(&name, "start");
+                                        *rows = crate::tui::workers::service_rows();
+                                        *message = Some(msg);
+                                    }
+                                    _ => {
+                                        app.screen = Screen::ConfirmDelete {
+                                            name,
+                                            yes_selected: false,
+                                        }
                                     }
                                 }
                             }
@@ -1325,7 +1334,7 @@ fn doctor_lines(body: &str) -> Option<Vec<Line<'static>>> {
 fn draw_services(
     f: &mut ratatui::Frame,
     area: Rect,
-    rows: &[(String, String, String)],
+    rows: &[crate::tui::workers::ServiceRow],
     selected: usize,
     message: Option<&str>,
 ) {
@@ -1379,13 +1388,26 @@ fn draw_services(
     let items: Vec<ListItem> = rows
         .iter()
         .enumerate()
-        .map(|(i, (name, status, url))| {
+        .map(|(i, row)| {
             let sel = i == selected;
-            let name_fg = if sel { RED } else { BODY };
-            let status_color = match status.as_str() {
-                "active" => RED,
-                "activating" | "reloading" => DIM_RED,
+            let name_fg = if sel {
+                RED
+            } else if !row.managed {
+                DIM
+            } else {
+                BODY
+            };
+            let status_color = match row.status.as_str() {
+                "active" | "running" => RED,
+                "activating" | "reloading" | "stopped" | "needs login" => DIM_RED,
                 _ => BRIGHT_RED,
+            };
+            // Read-only status rows (tailscale) carry a [vpn] tag instead of
+            // the plain managed-unit name column.
+            let name_col = if row.managed {
+                format!("{:<16}", row.name)
+            } else {
+                format!("[vpn] {:<10}", row.name)
             };
             ListItem::new(Line::from(vec![
                 Span::styled(
@@ -1397,7 +1419,7 @@ fn draw_services(
                     }),
                 ),
                 Span::styled(
-                    format!("{name:<16}"),
+                    name_col,
                     Style::default().fg(name_fg).add_modifier(if sel {
                         Modifier::BOLD
                     } else {
@@ -1406,8 +1428,8 @@ fn draw_services(
                 ),
                 format!("{:<12}", "").into(),
                 Span::styled("● ", Style::default().fg(status_color)),
-                Span::styled(status.clone(), Style::default().fg(status_color)),
-                Span::styled(format!("  {url}"), Style::default().fg(DIM)),
+                Span::styled(row.status.clone(), Style::default().fg(status_color)),
+                Span::styled(format!("  {}", row.url), Style::default().fg(DIM)),
             ]))
         })
         .collect();

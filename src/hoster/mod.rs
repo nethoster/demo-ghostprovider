@@ -21,6 +21,7 @@ pub mod recipes;
 pub mod resolver;
 pub mod sandbox;
 pub mod secrets;
+pub mod tailscale;
 pub mod toolbox;
 pub mod toolcheck;
 pub mod units;

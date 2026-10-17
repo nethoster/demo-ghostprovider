@@ -101,7 +101,7 @@ Here is the security module that Ghost Provider uses, this is the necessary arch
 
 ## System Scan
 
-Scans your machine for prerequisites and maps occupied ports with their owning processes — nothing more. Deliberately: no VPN detection, no service fingerprinting, so the report stays useless to anyone but you. "Network" is measured with the same allowlisted, net.log-recorded HTTPS GET to github.com the fetches use — never ICMP ping or raw DNS.
+Scans your machine for prerequisites and maps occupied ports with their owning processes — nothing more. Deliberately: no VPN status details (the one exception is the boolean presence of the `tailscale` binary — no login state, no peers), no service fingerprinting, so the report stays useless to anyone but you. "Network" is measured with the same allowlisted, net.log-recorded HTTPS GET to github.com the fetches use — never ICMP ping or raw DNS.
 
 ### Why System Scan?
 
@@ -109,12 +109,13 @@ Before deploying a new service, demo-ghostprovider checks what's already running
 - **Prerequisites** — do you have cargo, systemd, git installed?
 - **Listening ports** — which ports are already in use?
 - **Known services** — is SearXNG, Memos, or VERT already running?
+- **Tailscale** — is the `tailscale` binary present? (Presence only; the tunnel state itself is shown in the Self-Hosting panel.)
 
 This avoids port conflicts and helps GhostProvider choose the right deployment strategy. All data stays on your machine — nothing is sent anywhere.
 
 ## Control panel
 
-Full dashboard for all deployed services. Start, stop, restart, or remove — one click cleans the service, unit file, cloned repo, secrets file, and lingering ports. GhostProvider cleans up the resources it manages; applications may still leave their own state (databases, caches, external sockets) elsewhere.
+Full dashboard for all deployed services. Start, stop, restart, or remove — one click cleans the service, unit file, cloned repo, secrets file, and lingering ports. GhostProvider cleans up the resources it manages; applications may still leave their own state (databases, caches, external sockets) elsewhere. When the tailscaled daemon is up, the panel also shows a read-only tailscale status row (`running` / `stopped` / `needs login`) — the tunnel itself is never touched by the panel.
 
 ## Service support
 
@@ -133,7 +134,7 @@ or walks you through writing one with the built-in 9-step wizard (first row);
 the third row detects the stack of a GitHub URL and prefills the wizard.
 Menu item 5 (My Services) lists your added services with deploy status;
 item 6 (Egress) shows each service's runtime network allowlist with live
-verification; item 2 (Self-hosting) manages the actually deployed units.
+verification; item 2 (Self-Hosting) manages the actually deployed units.
 
 ## Install
 
