@@ -2826,7 +2826,7 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
     // Vertical rhythm: free rows split into thirds — above the brand block,
     // between brand and menu (which pushes the menu down), and below the
     // menu before the bottom description.
-    let brand_h = art.len() as u16 + 2; // art + subtitle + mark
+    let brand_h = art.len() as u16 + 3; // art + subtitle + mark + version
     let content_h = brand_h + 2 + MAIN_MENU.len() as u16; // gap + menu
     let slack = area.height.saturating_sub(content_h + 2); // + gap/desc rows
     let mut y = area.y + slack / 3;
@@ -2856,21 +2856,19 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
         );
         y += 1;
     }
-    centered(
-        f,
-        y,
-        Line::from(Span::styled(
+    let version_line = format!("v{}", env!("CARGO_PKG_VERSION"));
+    for (text, style) in [
+        (
             "SYSTEM FOR AUTOMATED SELF-HOSTING",
             Style::default().fg(BODY).add_modifier(Modifier::BOLD),
-        )),
-    );
-    y += 1;
-    centered(
-        f,
-        y,
-        Line::from(Span::styled("demo panel", Style::default().fg(DIM))),
-    );
-    y += 2 + slack / 3; // gap: a third of the slack lands between brand and menu
+        ),
+        ("demo panel", Style::default().fg(DIM)),
+        (version_line.as_str(), Style::default().fg(BLUE)),
+    ] {
+        centered(f, y, Line::from(Span::styled(text, style)));
+        y += 1;
+    }
+    y += 1 + slack / 3; // one blank row + a third of the slack before the menu
 
     // Menu items share one left edge — the block gets centered, not each
     // line — so the list never straggles. Descriptions moved to the bottom.
@@ -4941,10 +4939,12 @@ mod tests {
             text.push_str(&row);
             text.push('\n');
         }
+        let version_line = format!("v{}", env!("CARGO_PKG_VERSION"));
         for expected in [
             MAIN_ART[0],
             "SYSTEM FOR AUTOMATED SELF-HOSTING",
             "demo panel",
+            version_line.as_str(),
             "System Scan",
             "Deploy Service",
             "Logs",
