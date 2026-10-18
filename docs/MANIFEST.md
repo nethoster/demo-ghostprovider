@@ -101,8 +101,11 @@ the list holds three clickable rows (↑↓ + Enter, hotkeys in brackets):
 
 * `+ Create new service.yaml` (`n`) — the built-in wizard: 9 plain questions
   (name → git URL → commit pin → build profile → download steps → build
-  steps → run command and port → memory/task limits → YAML review), then
-  Enter saves the file into the library,
+  steps → run command and port → memory/task limits → YAML review). Every
+  screen carries a progress chain (`✓ done · » current · upcoming`) and the
+  hint bar names what Enter opens next; on the two step-list screens `e`
+  edits the selected line (`a`/`d` add/delete). Enter at 9/9 saves the file
+  into the library,
 * `⇪ Import existing file` (`a`) — copy a file from disk (validated before
   copying; duplicates are refused — delete the stored one first to replace
   it),

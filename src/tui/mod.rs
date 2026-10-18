@@ -654,16 +654,18 @@ fn event_loop(
 }
 
 /// Progress of one editor interaction: used by both step-list screens.
-#[derive(PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 enum WzStepsFlow {
     Next,
     Back,
     Stay,
 }
 
-/// Shared keys for the prefetch/build step editors: navigate, inline-edit,
-/// add/delete lines, Tab = next screen, Esc/q = back. The draft is untouched
-/// until the screen is left (lines are taken, never borrowed out).
+/// Shared keys for the prefetch/build step editors: Enter/Tab = next screen
+/// (same contract as every other wizard step — Enter must never look dead),
+/// `e` inline-edits the selected line (Enter confirms, Esc cancels inside),
+/// a/d add/delete lines, Esc/q = back. The draft is untouched until the
+/// screen is left (lines are taken, never borrowed out).
 fn wz_steps_key(editor: &mut wizard::StepEditor, key: KeyCode, cmd: Option<char>) -> WzStepsFlow {
     use WzStepsFlow as Flow;
     if editor.editing.is_some() {
@@ -687,18 +689,12 @@ fn wz_steps_key(editor: &mut wizard::StepEditor, key: KeyCode, cmd: Option<char>
     match key {
         KeyCode::Up => editor.move_up(),
         KeyCode::Down => editor.move_down(),
-        KeyCode::Tab => return Flow::Next,
-        KeyCode::Enter => {
-            if editor.lines.is_empty() {
-                editor.add_line();
-            } else {
-                editor.start_edit();
-            }
-        }
+        KeyCode::Tab | KeyCode::Enter => return Flow::Next,
         KeyCode::Esc => return Flow::Back,
         _ => match cmd {
             Some('k') => editor.move_up(),
             Some('j') => editor.move_down(),
+            Some('e') => editor.start_edit(),
             Some('a') => editor.add_line(),
             Some('d') => editor.delete_line(),
             Some('q') => return Flow::Back,
@@ -2429,6 +2425,15 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         }
     }
 
+    // Wizard screens open with the step chain, so the next screen — and
+    // therefore what Enter will do — is visible before the key is pressed.
+    let mut body = chunks[1];
+    if let Some(step) = wizard_step(&app.screen) {
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(chunks[1]);
+        f.render_widget(Paragraph::new(wizard_progress(step)), parts[0]);
+        body = parts[1];
+    }
+
     match &app.screen {
         Screen::Main { selected } => {
             draw_main_menu(f, chunks[1], *selected);
@@ -2568,7 +2573,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Screen::WzId { buffer, error, .. } => {
             draw_wz_input(
                 f,
-                chunks[1],
+                body,
                 "New Service 1/9 · name",
                 &[
                     "Give the service a short id: lowercase letters, digits, dashes.",
@@ -2583,7 +2588,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Screen::WzGit { buffer, error, .. } => {
             draw_wz_input(
                 f,
-                chunks[1],
+                body,
                 "New Service 2/9 · source",
                 &["Where does the code live? Paste the GitHub repository URL."],
                 " Git URL: ",
@@ -2595,7 +2600,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Screen::WzCommit { buffer, error, .. } => {
             draw_wz_input(
                 f,
-                chunks[1],
+                body,
                 "New Service 3/9 · version pin",
                 &[
                     "Which exact version to deploy? Paste the full 40-character commit SHA.",
@@ -2609,12 +2614,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             );
         }
         Screen::WzProfile { selected, draft } => {
-            draw_wz_profile(f, chunks[1], *selected, draft);
+            draw_wz_profile(f, body, *selected, draft);
         }
         Screen::WzPrefetch { editor, .. } => {
             draw_wz_steps(
                 f,
-                chunks[1],
+                body,
                 "New Service 5/9 · download dependencies",
                 &[
                     "These run ONCE on your machine with network (before the offline build).",
@@ -2627,7 +2632,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         Screen::WzBuild { editor, .. } => {
             draw_wz_steps(
                 f,
-                chunks[1],
+                body,
                 "New Service 6/9 · build offline",
                 &[
                     "These run inside the sandbox with NO network.",
@@ -2646,7 +2651,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         } => {
             draw_wz_run(
                 f,
-                chunks[1],
+                body,
                 run_cmd,
                 port,
                 *focus_port,
@@ -2663,7 +2668,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         } => {
             draw_wz_res(
                 f,
-                chunks[1],
+                body,
                 memory,
                 tasks,
                 *focus_tasks,
@@ -2672,7 +2677,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             );
         }
         Screen::WzReview { yaml, error, .. } => {
-            draw_wz_review(f, chunks[1], yaml.as_deref(), error.as_deref());
+            draw_wz_review(f, body, yaml.as_deref(), error.as_deref());
         }
     }
 
@@ -3810,7 +3815,7 @@ fn draw_wz_steps(
     text.push(Line::from(""));
     if editor.lines.is_empty() {
         text.push(Line::from(Span::styled(
-            " (no steps — press a to add one, Tab when done)",
+            " (no steps — press a to add one, Enter when done)",
             Style::default().fg(DIM),
         )));
     }
@@ -3837,6 +3842,15 @@ fn draw_wz_steps(
         text.push(Line::from(""));
         text.push(Line::from(Span::styled(
             format!(" {m}"),
+            Style::default().fg(WARN_YELLOW),
+        )));
+    }
+    // Inline-edit mode is entered with `e`, not Enter — say so while it is
+    // on, otherwise the cursor looks like a dead keypress.
+    if editor.editing.is_some() {
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            " editing — Enter confirms the line, Esc cancels",
             Style::default().fg(WARN_YELLOW),
         )));
     }
@@ -4407,6 +4421,55 @@ fn draw_logs(
     );
 }
 
+// --- wizard progress chain --------------------------------------------------
+
+/// The nine New Service wizard screens in order — one short label each,
+/// rendered at the top of every wizard body as `✓ done · » current · next`.
+const WIZARD_STEPS: &[&str] = &[
+    "name", "src", "pin", "profile", "deps", "build", "run", "limits", "review",
+];
+
+/// Position of `screen` in [`WIZARD_STEPS`]; None outside the wizard.
+fn wizard_step(screen: &Screen) -> Option<usize> {
+    Some(match screen {
+        Screen::WzId { .. } => 0,
+        Screen::WzGit { .. } => 1,
+        Screen::WzCommit { .. } => 2,
+        Screen::WzProfile { .. } => 3,
+        Screen::WzPrefetch { .. } => 4,
+        Screen::WzBuild { .. } => 5,
+        Screen::WzRun { .. } => 6,
+        Screen::WzRes { .. } => 7,
+        Screen::WzReview { .. } => 8,
+        _ => return None,
+    })
+}
+
+fn wizard_progress(current: usize) -> Line<'static> {
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    for (i, label) in WIZARD_STEPS.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(DIM)));
+        }
+        if i == current {
+            spans.push(Span::styled(
+                format!("» {label}"),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if i < current {
+            spans.push(Span::styled(
+                format!("✓ {label}"),
+                Style::default().fg(OK_GREEN),
+            ));
+        } else {
+            spans.push(Span::styled((*label).to_string(), Style::default().fg(DIM)));
+        }
+    }
+    Line::from(spans)
+}
+
 // --- hint bar ---------------------------------------------------------------
 
 fn hint_line(screen: &Screen) -> Line<'static> {
@@ -4492,28 +4555,56 @@ fn hint_line(screen: &Screen) -> Line<'static> {
             ("d delete", ERR_RED),
             ("Esc back", WARN_YELLOW),
         ],
-        Screen::WzId { .. } | Screen::WzGit { .. } | Screen::WzCommit { .. } => {
-            vec![("Enter next", OK_GREEN), ("Esc back", WARN_YELLOW)]
-        }
+        // Wizard hints name their destination: after Enter the next screen
+        // must be predictable, not a surprise.
+        Screen::WzId { .. } => vec![("Enter → source", OK_GREEN), ("Esc back", WARN_YELLOW)],
+        Screen::WzGit { .. } => vec![("Enter → version pin", OK_GREEN), ("Esc back", WARN_YELLOW)],
+        Screen::WzCommit { .. } => vec![("Enter → profile", OK_GREEN), ("Esc back", WARN_YELLOW)],
         Screen::WzProfile { .. } => vec![
             ("↑↓ select", VIOLET),
-            ("Enter next", OK_GREEN),
+            ("Enter → download steps", OK_GREEN),
             ("Esc back", WARN_YELLOW),
         ],
-        Screen::WzPrefetch { .. } | Screen::WzBuild { .. } => vec![
-            ("Enter edit", OK_GREEN),
-            ("a add d del", VIOLET),
-            ("Tab next", ACCENT),
-            ("Esc back", WARN_YELLOW),
-        ],
-        Screen::WzRun { .. } | Screen::WzRes { .. } => {
-            vec![
-                ("Tab field", ACCENT),
-                ("Enter next", OK_GREEN),
-                ("Esc back", WARN_YELLOW),
-            ]
+        Screen::WzPrefetch { editor, .. } => {
+            if editor.editing.is_some() {
+                vec![("Enter confirm", OK_GREEN), ("Esc cancel", WARN_YELLOW)]
+            } else {
+                vec![
+                    ("Enter → build offline", OK_GREEN),
+                    ("e edit", VIOLET),
+                    ("a add", VIOLET),
+                    ("d del", VIOLET),
+                    ("Esc back", WARN_YELLOW),
+                ]
+            }
         }
-        Screen::WzReview { .. } => vec![("Enter save", OK_GREEN), ("Esc back", WARN_YELLOW)],
+        Screen::WzBuild { editor, .. } => {
+            if editor.editing.is_some() {
+                vec![("Enter confirm", OK_GREEN), ("Esc cancel", WARN_YELLOW)]
+            } else {
+                vec![
+                    ("Enter → run", OK_GREEN),
+                    ("e edit", VIOLET),
+                    ("a add", VIOLET),
+                    ("d del", VIOLET),
+                    ("Esc back", WARN_YELLOW),
+                ]
+            }
+        }
+        Screen::WzRun { .. } => vec![
+            ("Tab field", ACCENT),
+            ("Enter → limits", OK_GREEN),
+            ("Esc back", WARN_YELLOW),
+        ],
+        Screen::WzRes { .. } => vec![
+            ("Tab field", ACCENT),
+            ("Enter → review", OK_GREEN),
+            ("Esc back", WARN_YELLOW),
+        ],
+        Screen::WzReview { .. } => vec![
+            ("Enter save → library", OK_GREEN),
+            ("Esc back", WARN_YELLOW),
+        ],
     };
     let mut spans: Vec<Span> = Vec::new();
     for (i, (text, color)) in pairs.iter().enumerate() {
@@ -4578,6 +4669,197 @@ mod tests {
                 "Logs"
             ]
         );
+    }
+
+    /// Enter on the step-list screens advances (it used to open the inline
+    /// editor, which read as a dead key); `e` opens the editor instead.
+    #[test]
+    fn step_lists_advance_on_enter_and_edit_on_e() {
+        let mut ed = wizard::StepEditor::new(vec!["bun install --frozen-lockfile".into()]);
+        assert_eq!(
+            wz_steps_key(&mut ed, KeyCode::Enter, None),
+            WzStepsFlow::Next
+        );
+        assert_eq!(wz_steps_key(&mut ed, KeyCode::Tab, None), WzStepsFlow::Next);
+
+        // `e` opens the line, typing goes into it, Enter commits and stays.
+        assert_eq!(
+            wz_steps_key(&mut ed, KeyCode::Char('e'), Some('e')),
+            WzStepsFlow::Stay
+        );
+        assert!(ed.editing.is_some());
+        assert_eq!(
+            wz_steps_key(&mut ed, KeyCode::Char('x'), Some('x')),
+            WzStepsFlow::Stay
+        );
+        assert_eq!(
+            wz_steps_key(&mut ed, KeyCode::Enter, None),
+            WzStepsFlow::Stay
+        );
+        assert!(ed.editing.is_none());
+        assert!(ed.lines[0].ends_with('x'));
+
+        // Esc still walks back out of the screen.
+        assert_eq!(wz_steps_key(&mut ed, KeyCode::Esc, None), WzStepsFlow::Back);
+    }
+
+    /// Every wizard screen maps to its place in the progress chain; screens
+    /// outside the wizard render no chain at all.
+    #[test]
+    fn wizard_step_positions_and_non_wizard_screens() {
+        let d = wizard::Draft::default();
+        let screens = [
+            (
+                Screen::WzId {
+                    buffer: String::new(),
+                    error: None,
+                    draft: d.clone(),
+                },
+                0,
+            ),
+            (
+                Screen::WzGit {
+                    buffer: String::new(),
+                    error: None,
+                    draft: d.clone(),
+                },
+                1,
+            ),
+            (
+                Screen::WzCommit {
+                    buffer: String::new(),
+                    error: None,
+                    draft: d.clone(),
+                },
+                2,
+            ),
+            (
+                Screen::WzProfile {
+                    selected: 0,
+                    draft: d.clone(),
+                },
+                3,
+            ),
+            (
+                Screen::WzPrefetch {
+                    editor: wizard::StepEditor::new(vec![]),
+                    draft: d.clone(),
+                },
+                4,
+            ),
+            (
+                Screen::WzBuild {
+                    editor: wizard::StepEditor::new(vec![]),
+                    draft: d.clone(),
+                },
+                5,
+            ),
+            (
+                Screen::WzRun {
+                    cmd: String::new(),
+                    port: "0".into(),
+                    focus_port: false,
+                    error: None,
+                    draft: d.clone(),
+                },
+                6,
+            ),
+            (
+                Screen::WzRes {
+                    memory: "384M".into(),
+                    tasks: "300".into(),
+                    focus_tasks: false,
+                    error: None,
+                    draft: d.clone(),
+                },
+                7,
+            ),
+            (
+                Screen::WzReview {
+                    draft: d,
+                    yaml: None,
+                    error: None,
+                },
+                8,
+            ),
+        ];
+        for (screen, want) in screens {
+            assert_eq!(wizard_step(&screen), Some(want));
+        }
+        assert_eq!(wizard_step(&Screen::Main { selected: 0 }), None);
+        assert_eq!(
+            wizard_step(&Screen::AddService {
+                files: vec![],
+                selected: 0,
+                message: None,
+                armed_delete: None,
+            }),
+            None
+        );
+    }
+
+    /// The chain marks past steps ✓, the current one »bold, the rest dim —
+    /// so where Enter leads is visible before the key is pressed.
+    #[test]
+    fn wizard_progress_shows_done_current_and_upcoming() {
+        let line = wizard_progress(4); // deps = step 5/9
+        let texts: Vec<String> = line.spans.iter().map(|s| s.content.to_string()).collect();
+        let joined = texts.concat();
+        assert!(joined.contains("✓ name"), "done steps marked: {joined}");
+        assert!(joined.contains("» deps"), "current step marked: {joined}");
+        assert!(joined.contains("review"), "chain lists the end: {joined}");
+
+        let cur = texts.iter().position(|t| t.starts_with('»')).unwrap();
+        assert_eq!(line.spans[cur].style.fg, Some(Color::White));
+        assert!(line.spans[cur].style.add_modifier.contains(Modifier::BOLD));
+
+        let done = texts.iter().position(|t| t.starts_with('✓')).unwrap();
+        assert_eq!(line.spans[done].style.fg, Some(OK_GREEN));
+
+        let todo = texts.iter().position(|t| t == "build").unwrap();
+        assert_eq!(line.spans[todo].style.fg, Some(DIM));
+    }
+
+    /// The hint bar must name where Enter goes — the whole point of the
+    /// "Enter looked dead" complaint — and switch to edit keys while a
+    /// step-list line is being edited.
+    #[test]
+    fn wizard_hints_name_their_destination() {
+        let text = |s: &Screen| -> String {
+            hint_line(s)
+                .spans
+                .iter()
+                .map(|sp| sp.content.to_string())
+                .collect()
+        };
+        let d = wizard::Draft::default();
+
+        let prefetch = Screen::WzPrefetch {
+            editor: wizard::StepEditor::new(vec!["bun install".into()]),
+            draft: d.clone(),
+        };
+        assert!(text(&prefetch).contains("Enter → build offline"));
+
+        let build = Screen::WzBuild {
+            editor: wizard::StepEditor::new(vec!["bun run build".into()]),
+            draft: d.clone(),
+        };
+        assert!(text(&build).contains("Enter → run"));
+
+        let mut editor = wizard::StepEditor::new(vec!["bun install".into()]);
+        editor.start_edit();
+        let editing = Screen::WzPrefetch {
+            editor,
+            draft: d.clone(),
+        };
+        assert!(text(&editing).contains("Enter confirm"));
+
+        let review = Screen::WzReview {
+            draft: d,
+            yaml: None,
+            error: None,
+        };
+        assert!(text(&review).contains("Enter save → library"));
     }
 
     #[test]
