@@ -92,27 +92,38 @@ const MAIN_ART: [&str; 3] = [
     "░▀▀▀░▀░▀░▀▀▀░▀▀▀░░▀░░░░▀░░░▀░▀░▀▀▀░░▀░░▀▀▀░▀▀░░▀▀▀░▀░▀",
 ];
 
-/// The doubled art is 2× the longest line wide; below this width the panel
-/// falls back to the original size.
-const ART_2X_MIN_WIDTH: u16 = 114;
+/// The maximum art scale: 4× turns the 57-cell Pagga into 228 columns,
+/// which fills an ultrawide terminal without outgrowing typical heights.
+const ART_MAX_SCALE: u16 = 4;
 
-/// Double each Pagga cell (2×2 terminal cells per source glyph): the exact
-/// same letterforms the user picked, twice the size.
-fn expand_art_2x(art: &[&str; 3]) -> [String; 6] {
-    let mut out = [
-        String::new(),
-        String::new(),
-        String::new(),
-        String::new(),
-        String::new(),
-        String::new(),
-    ];
-    for (i, line) in art.iter().enumerate() {
-        let doubled: String = line.chars().flat_map(|c| [c, c]).collect();
-        out[i * 2] = doubled.clone();
-        out[i * 2 + 1] = doubled;
+/// Repeat each Pagga cell n×n terminal cells: the same letterforms the
+/// user picked, at any scale.
+fn expand_art(art: &[&str; 3], n: u16) -> Vec<String> {
+    let n = n.max(1) as usize;
+    let mut out = Vec::with_capacity(3 * n);
+    for line in art {
+        let scaled: String = line
+            .chars()
+            .flat_map(|c| std::iter::repeat_n(c, n))
+            .collect();
+        for _ in 0..n {
+            out.push(scaled.clone());
+        }
     }
     out
+}
+
+/// Largest scale (1..=ART_MAX_SCALE) whose art fits the terminal both ways:
+/// width must hold `base × n`, and height must hold the whole composition
+/// (art 3n + subtitle 3 + gap/menu 2+7 + gap/description 2).
+fn art_scale(area: ratatui::prelude::Rect) -> u16 {
+    let base_w = MAIN_ART[0].chars().count() as u16;
+    let mut n = (area.width / base_w).clamp(1, ART_MAX_SCALE);
+    let content_h = |n: u16| 3 * n + 3 + 2 + MAIN_MENU.len() as u16 + 2;
+    while n > 1 && content_h(n) > area.height {
+        n -= 1;
+    }
+    n
 }
 
 // Hard bound on the deploy log held in memory. A heavy build (a SvelteKit +
@@ -2812,13 +2823,9 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
     }
     let selected = selected.min(MAIN_MENU.len() - 1);
 
-    // Double-scale the Pagga art when the terminal is wide enough for the
-    // 2× width; otherwise the original size still reads fine.
-    let art: Vec<String> = if area.width >= ART_2X_MIN_WIDTH {
-        expand_art_2x(&MAIN_ART).to_vec()
-    } else {
-        MAIN_ART.iter().map(|s| (*s).to_string()).collect()
-    };
+    // Scale the Pagga art to the terminal (1×–4×): the largest size whose
+    // width and the whole composition's height still fit.
+    let art = expand_art(&MAIN_ART, art_scale(area));
 
     // The whole composition — art, subtitle, mark, menu — is one block,
     // centered in the body both ways; the selected description anchors the
@@ -4921,17 +4928,30 @@ mod tests {
         assert_eq!(last, MAIN_MENU.len() - 1, "down clamps at the last item");
     }
 
-    /// The doubled art is the same letterforms at 2×2 cells per glyph.
+    /// The scaled art is the same letterforms at n×n cells per glyph.
     #[test]
-    fn pagga_art_doubles_to_twice_the_size() {
-        let big = expand_art_2x(&MAIN_ART);
-        assert_eq!(big.len(), 6);
-        let w = MAIN_ART[0].chars().count();
-        assert_eq!(big[0].chars().count(), w * 2);
-        assert_eq!(big[0], big[1], "each source line is emitted twice");
-        assert_eq!(big[2], big[3]);
-        assert_eq!(big[4], big[5]);
-        assert!(big[0].starts_with("░░██▀▀"), "G doubled");
+    fn pagga_art_scales_to_n_times_the_size() {
+        for n in 1..=4u16 {
+            let big = expand_art(&MAIN_ART, n);
+            assert_eq!(big.len(), 3 * n as usize);
+            let w = MAIN_ART[0].chars().count() * n as usize;
+            assert_eq!(big[0].chars().count(), w);
+            assert_eq!(big[0], big[n as usize - 1], "each line repeats n times");
+            assert!(big[0].starts_with(&"░".repeat(n as usize)), "G scaled");
+        }
+    }
+
+    /// The scale follows the terminal: wider gets bigger (up to 4×), but a
+    /// short terminal caps the art so the menu still fits.
+    #[test]
+    fn art_scale_grows_with_width_and_shrinks_with_height() {
+        let s = |w, h| art_scale(ratatui::prelude::Rect::new(0, 0, w, h));
+        assert_eq!(s(80, 40), 1, "narrow: 1x");
+        assert_eq!(s(114, 40), 2, "2x width fits at 114");
+        assert_eq!(s(200, 50), 3, "3x width fits at 171+");
+        assert_eq!(s(250, 60), 4, "wide: 4x");
+        assert_eq!(s(250, 18), 1, "short: 1x even when wide");
+        assert_eq!(s(50, 10), 1, "tiny: never below 1x");
     }
 
     /// The main screen renders the Pagga art and subtitle as one block with
@@ -5007,12 +5027,12 @@ mod tests {
         // The selected description is anchored to the bottom row.
         assert_eq!(desc_row, Some(buf.area.height - 1));
         // Narrow terminals keep the original art size.
-        assert!(!text.contains(&expand_art_2x(&MAIN_ART)[0]));
+        assert!(!text.contains(&expand_art(&MAIN_ART, 2)[0]));
     }
 
-    /// A wide terminal switches to the doubled brand art.
+    /// A wide terminal scales the brand art up.
     #[test]
-    fn wide_main_menu_screen_uses_the_doubled_art() {
+    fn wide_main_menu_screen_scales_the_art_up() {
         use ratatui::backend::TestBackend;
         let mut term = Terminal::new(TestBackend::new(120, 36)).unwrap();
         term.draw(|f| draw_main_menu(f, f.area(), 0)).unwrap();
@@ -5025,10 +5045,30 @@ mod tests {
             text.push('\n');
         }
         assert!(
-            text.contains(&expand_art_2x(&MAIN_ART)[0]),
+            text.contains(&expand_art(&MAIN_ART, 2)[0]),
             "2x art on 120 cols"
         );
         assert!(!text.contains(MAIN_ART[0]), "1x art replaced");
+    }
+
+    /// An ultrawide terminal uses the largest scale the height allows.
+    #[test]
+    fn ultrawide_main_menu_scales_art_to_the_max() {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(250, 50)).unwrap();
+        term.draw(|f| draw_main_menu(f, f.area(), 0)).unwrap();
+        let buf = term.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains(&expand_art(&MAIN_ART, 4)[0]),
+            "4x art on 250x50"
+        );
     }
 
     /// Two consecutive frozen heartbeat windows fire the stall exit;
