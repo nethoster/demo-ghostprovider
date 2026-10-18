@@ -2933,6 +2933,12 @@ fn menu_block_width() -> u16 {
 
 // --- system scan ------------------------------------------------------------
 
+/// Two columns when the terminal is wide enough: facts + interfaces on the
+/// left, the listening-ports list on the right — a long port list would
+/// otherwise push the screen past the bottom of the window. Narrow
+/// terminals keep the old stacked layout.
+const SCAN_SIDEBYSIDE_MIN_WIDTH: u16 = 70;
+
 fn draw_scan(
     f: &mut ratatui::Frame,
     area: ratatui::prelude::Rect,
@@ -2940,27 +2946,55 @@ fn draw_scan(
     running: bool,
     tick: u64,
 ) {
-    let mut lines: Vec<Line> = Vec::new();
+    let blk = block("System Scan", VIOLET);
+    let inner = blk.inner(area);
+    f.render_widget(blk, area);
     match (report, running) {
-        (Some(r), _) => lines.extend(colorize_scan(r)),
+        (Some(r), _) => {
+            // The ports section always starts on its own line; everything
+            // before it (freshness stamp, tools, interfaces) stays left.
+            let split = r
+                .find("Listening ports:")
+                .map(|i| r[..i].rfind('\n').map(|n| n + 1).unwrap_or(0));
+            match split {
+                Some(i) if inner.width >= SCAN_SIDEBYSIDE_MIN_WIDTH => {
+                    let cols = Layout::horizontal([
+                        Constraint::Percentage(60),
+                        Constraint::Percentage(40),
+                    ])
+                    .split(inner);
+                    f.render_widget(
+                        Paragraph::new(colorize_scan(&r[..i])).wrap(Wrap { trim: false }),
+                        cols[0],
+                    );
+                    f.render_widget(
+                        Paragraph::new(colorize_scan(&r[i..])).wrap(Wrap { trim: false }),
+                        cols[1],
+                    );
+                }
+                _ => {
+                    f.render_widget(
+                        Paragraph::new(colorize_scan(r)).wrap(Wrap { trim: false }),
+                        inner,
+                    );
+                }
+            }
+        }
         (None, true) => {
-            lines.push(Line::from(vec![
-                Span::styled(spinner_char(tick), spinner_style(tick)),
-                Span::styled(" scanning local system...", Style::default().fg(DIM)),
-            ]));
-            lines.push(Line::from(Span::styled(
-                "  (this lists interfaces and occupied ports)",
-                Style::default().fg(DIM),
-            )));
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled(spinner_char(tick), spinner_style(tick)),
+                    Span::styled(" scanning local system...", Style::default().fg(DIM)),
+                ]),
+                Line::from(Span::styled(
+                    "  (this lists interfaces and occupied ports)",
+                    Style::default().fg(DIM),
+                )),
+            ];
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
         (None, false) => {}
     }
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(block("System Scan", VIOLET)),
-        area,
-    );
 }
 
 fn spinner_char(tick: u64) -> &'static str {
@@ -5272,6 +5306,88 @@ mod tests {
                 .map(|s| s.style.fg)
                 .collect::<Vec<_>>()
         );
+    }
+
+    fn scan_report_fixture(ports: usize) -> String {
+        let mut r = String::from(
+            "  scanned at 2026-10-18T11:22:37.706Z\n\
+             [x] systemd          found\n\
+             [x] network          online\n\
+             \nInterfaces:\n  lo              127.0.0.1           up\n",
+        );
+        r.push_str("\nListening ports:\n  PORT   SERVICE\n");
+        for p in 0..ports {
+            r.push_str(&format!("  {:<6}\n", 8000 + p));
+        }
+        r
+    }
+
+    /// A wide terminal puts the port list in a right-hand column beside the
+    /// facts and interfaces, so a long list no longer runs past the bottom.
+    #[test]
+    fn scan_screen_splits_ports_into_a_right_column_when_wide() {
+        use ratatui::backend::TestBackend;
+        let report = scan_report_fixture(15);
+        // 24 rows: stacked, the 15 ports plus the header block would need
+        // ~23 rows of content and get clipped; side-by-side must not clip.
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw_scan(f, f.area(), Some(&report), false, 0))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let mut ports_col = None;
+        let mut ifaces_col = None;
+        let mut last_port_row = 0;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if let Some(col) = row.find("Listening ports:") {
+                ports_col = Some(col);
+            }
+            if let Some(col) = row.find("Interfaces:") {
+                ifaces_col = Some(col);
+            }
+            if let Some(col) = row.find("8014") {
+                last_port_row = y;
+                assert!(col > 40, "ports live in the right half, col={col}");
+            }
+        }
+        let ports_col = ports_col.expect("ports header rendered");
+        assert!(ports_col > 40, "ports header on the right, col={ports_col}");
+        // The header rows share the top of the screen: the ports column sits
+        // beside the facts, not below them.
+        if let Some(ifaces_col) = ifaces_col {
+            assert!(ports_col > ifaces_col, "ports right of interfaces");
+        }
+        // Every port row fits: the deepest one is inside the block.
+        assert!(
+            last_port_row < buf.area.height.saturating_sub(2),
+            "last port row {last_port_row} must fit in {} rows",
+            buf.area.height
+        );
+    }
+
+    /// A narrow terminal keeps the old stacked layout (ports below).
+    #[test]
+    fn scan_screen_stacks_ports_below_on_a_narrow_terminal() {
+        use ratatui::backend::TestBackend;
+        let report = scan_report_fixture(2);
+        let mut term = Terminal::new(TestBackend::new(50, 30)).unwrap();
+        term.draw(|f| draw_scan(f, f.area(), Some(&report), false, 0))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let mut ports_row = None;
+        let mut ifaces_row = None;
+        for y in 0..buf.area.height {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if row.contains("Listening ports:") {
+                ports_row = Some(y);
+            }
+            if row.contains("Interfaces:") {
+                ifaces_row = Some(y);
+            }
+        }
+        let ports_row = ports_row.expect("ports header rendered");
+        let ifaces_row = ifaces_row.expect("interfaces header rendered");
+        assert!(ports_row > ifaces_row, "stacked: ports below interfaces");
     }
 
     #[test]

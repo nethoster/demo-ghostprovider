@@ -1027,24 +1027,60 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: Rect, selected: usize) {
 
 // ── system scan ──────────────────────────────────────────────────────────────
 
+/// Two columns when the terminal is wide enough: facts + interfaces on the
+/// left, the listening-ports list on the right — a long port list would
+/// otherwise push the screen past the bottom of the window. Narrow
+/// terminals keep the old stacked layout.
+const SCAN_SIDEBYSIDE_MIN_WIDTH: u16 = 70;
+
 fn draw_scan(f: &mut ratatui::Frame, area: Rect, report: Option<&str>, running: bool, tick: u64) {
-    let mut lines: Vec<Line> = Vec::new();
+    let blk = block("System Scan", RED);
+    let inner = blk.inner(area);
+    f.render_widget(blk, area);
     match (report, running) {
-        (Some(r), _) => lines.extend(colorize_scan(r)),
+        (Some(r), _) => {
+            let split = r
+                .find("Listening ports:")
+                .map(|i| r[..i].rfind('\n').map(|n| n + 1).unwrap_or(0));
+            match split {
+                Some(i) if inner.width >= SCAN_SIDEBYSIDE_MIN_WIDTH => {
+                    let cols = Layout::horizontal([
+                        Constraint::Percentage(60),
+                        Constraint::Percentage(40),
+                    ])
+                    .split(inner);
+                    f.render_widget(
+                        Paragraph::new(colorize_scan(&r[..i])).wrap(Wrap { trim: false }),
+                        cols[0],
+                    );
+                    f.render_widget(
+                        Paragraph::new(colorize_scan(&r[i..])).wrap(Wrap { trim: false }),
+                        cols[1],
+                    );
+                }
+                _ => {
+                    f.render_widget(
+                        Paragraph::new(colorize_scan(r)).wrap(Wrap { trim: false }),
+                        inner,
+                    );
+                }
+            }
+        }
         (None, true) => {
-            lines.push(Line::from(vec![
-                Span::styled(spinner_char(tick), spinner_style(tick)),
-                Span::styled(" scanning local system...", Style::default().fg(DIM)),
-            ]));
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled(spinner_char(tick), spinner_style(tick)),
+                    Span::styled(" scanning local system...", Style::default().fg(DIM)),
+                ]),
+                Line::from(Span::styled(
+                    "  (this lists interfaces and occupied ports)",
+                    Style::default().fg(DIM),
+                )),
+            ];
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
         }
         (None, false) => {}
     }
-    f.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(block("System Scan", RED)),
-        area,
-    );
 }
 
 // ── url input ────────────────────────────────────────────────────────────────
