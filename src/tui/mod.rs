@@ -15,7 +15,7 @@ pub mod workers;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Stdout};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{
     Arc,
     mpsc::{self, Receiver, Sender},
@@ -32,7 +32,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
 // --- palette (truecolor; terminals without RGB get the nearest ANSI match) ---
 pub(crate) const ACCENT: Color = Color::Rgb(64, 220, 255); // electric cyan — chrome/menu
@@ -92,9 +92,28 @@ const MAIN_ART: [&str; 3] = [
     "░▀▀▀░▀░▀░▀▀▀░▀▀▀░░▀░░░░▀░░░▀░▀░▀▀▀░░▀░░▀▀▀░▀▀░░▀▀▀░▀░▀",
 ];
 
-/// The main menu is a launcher grid: this many button cells per row, with
-/// each item's name centered under its button. Arrow up/down jumps by a row.
-const MENU_COLS: usize = 4;
+/// The doubled art is 2× the longest line wide; below this width the panel
+/// falls back to the original size.
+const ART_2X_MIN_WIDTH: u16 = 114;
+
+/// Double each Pagga cell (2×2 terminal cells per source glyph): the exact
+/// same letterforms the user picked, twice the size.
+fn expand_art_2x(art: &[&str; 3]) -> [String; 6] {
+    let mut out = [
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+        String::new(),
+    ];
+    for (i, line) in art.iter().enumerate() {
+        let doubled: String = line.chars().flat_map(|c| [c, c]).collect();
+        out[i * 2] = doubled.clone();
+        out[i * 2 + 1] = doubled;
+    }
+    out
+}
 
 // Hard bound on the deploy log held in memory. A heavy build (a SvelteKit +
 // wasm app, a large Python project) can emit tens of thousands of lines; the
@@ -387,6 +406,40 @@ pub(crate) struct App {
     exit_notices: Vec<String>,
 }
 
+/// Progress counter for the stall watchdog: bumped once per event-loop
+/// iteration. The loop wedges forever inside crossterm when the terminal
+/// vanishes (see `tty_hangup`), and a wedged loop never drains the channel —
+/// the watchdog thread is the only thing that can still notice and exit.
+static LOOP_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Set while the loop is *legitimately* blocked (external $EDITOR session,
+/// shutdown reconcile): the watchdog must not treat those as a stall.
+static WATCHDOG_PAUSE: AtomicBool = AtomicBool::new(false);
+
+/// Two consecutive frozen heartbeat windows fire the stall exit. Paused
+/// windows re-baseline instead, so long legitimate blocks never trip it.
+struct StallWatchdog {
+    last: u64,
+}
+
+impl StallWatchdog {
+    fn new() -> Self {
+        Self { last: 0 }
+    }
+
+    /// Feed one heartbeat sample; true = the loop stalled, kill the process.
+    /// Ticks of 0 are exempt: the very first iteration can sit in a 2s
+    /// cursor-query wait (unanswered DSR), which is boot, not a stall.
+    fn watch(&mut self, now: u64, paused: bool) -> bool {
+        if paused || now == 0 {
+            self.last = now;
+            return false;
+        }
+        let fired = now == self.last;
+        self.last = now;
+        fired
+    }
+}
+
 /// Entry point: sets up the terminal, runs the loop, restores the terminal.
 pub fn run() -> anyhow::Result<()> {
     enable_raw_mode()?;
@@ -414,6 +467,23 @@ pub fn run() -> anyhow::Result<()> {
             }
         });
     }
+    // Last-resort net: if the loop stops heartbeating (crossterm wedged on a
+    // vanished tty — its read retries EIO forever, so Terminate is never
+    // drained), restore what we can and die instead of pegging a core.
+    std::thread::spawn(|| {
+        let mut watchdog = StallWatchdog::new();
+        loop {
+            std::thread::sleep(Duration::from_secs(2));
+            let ticks = LOOP_TICKS.load(Ordering::Relaxed);
+            let paused = WATCHDOG_PAUSE.load(Ordering::Relaxed);
+            if watchdog.watch(ticks, paused) {
+                let _ = crossterm::terminal::disable_raw_mode();
+                let _ = io::stdout().execute(crossterm::terminal::LeaveAlternateScreen);
+                eprintln!("ghostprovider: event loop stalled (terminal gone?) — exiting");
+                std::process::exit(1);
+            }
+        }
+    });
     let mut app = App {
         screen: Screen::Main { selected: 0 },
         rx,
@@ -445,13 +515,11 @@ pub fn run() -> anyhow::Result<()> {
     res
 }
 
-/// True when the controlling terminal vanished (deleted pts, crashed
-/// multiplexer, dead tmux pane). crossterm 0.28/0.29 fall into a 100% CPU
-/// spin when the tty read returns EIO — its error arm only special-cases
-/// WouldBlock/Interrupted and retries forever — so the loop notices the
-/// hangup itself: once the ctty's master side is gone, /dev/tty no longer
-/// opens (ENXIO). A healthy interactive session opens it every tick, which
-/// is one cheap open/close against an 80ms cadence.
+/// True when there is no controlling terminal at all (nohup'd run, broken
+/// session): /dev/tty fails to open. Note the *deleted pty* case does NOT
+/// trip this — Linux keeps the ctty object openable while a session holds
+/// it — that case wedges crossterm's read and is caught by the stall
+/// watchdog instead.
 fn tty_hangup() -> bool {
     std::fs::File::open("/dev/tty").is_err()
 }
@@ -678,7 +746,12 @@ fn event_loop(
                             Flow::Continue => {}
                             Flow::Exit => return exit_with_reconcile(app),
                             Flow::EditFile(path) => {
+                                WATCHDOG_PAUSE.store(true, Ordering::Relaxed);
                                 edit_file_suspended(terminal, app, &path);
+                                WATCHDOG_PAUSE.store(false, Ordering::Relaxed);
+                                // Prove progress immediately: the resume must
+                                // not race the watchdog's next sample.
+                                LOOP_TICKS.fetch_add(1, Ordering::Relaxed);
                                 last_repaint = Some(Instant::now());
                             }
                         }
@@ -697,6 +770,7 @@ fn event_loop(
                 _ => {}
             }
         }
+        LOOP_TICKS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -824,6 +898,9 @@ fn command_char(key: KeyCode) -> Option<char> {
 /// deferred to the next launch. Safe to call when no deploy is running —
 /// `reconcile_stale` is a no-op then.
 fn exit_with_reconcile(app: &mut App) -> anyhow::Result<()> {
+    // Reconcile may run systemctl commands for seconds — tell the stall
+    // watchdog this block is legitimate (see `WATCHDOG_PAUSE`).
+    WATCHDOG_PAUSE.store(true, Ordering::Relaxed);
     // A just-spawned worker may not have set `deploy_in_flight` yet; the Deploy
     // screen (still `done: None`) is the reliable "a worker exists" signal, and
     // it is set by the UI thread before any exit key can be read. Asking for an
@@ -2159,10 +2236,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
 
 fn move_main_selection(selected: &mut usize, key: KeyCode) {
     match key {
-        // Grid semantics: up/down jump a whole row, left/right step one cell.
-        KeyCode::Up => *selected = selected.saturating_sub(MENU_COLS),
-        KeyCode::Down => *selected = (*selected + MENU_COLS).min(MAIN_MENU.len() - 1),
-        KeyCode::Left => *selected = selected.saturating_sub(1),
+        KeyCode::Up | KeyCode::Left => *selected = selected.saturating_sub(1),
         _ => *selected = (*selected + 1).min(MAIN_MENU.len() - 1),
     }
 }
@@ -2452,22 +2526,15 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         );
         return;
     }
-    let chunks = Layout::vertical([
-        Constraint::Length(4),
-        Constraint::Min(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
-
-    draw_header(f, chunks[0]);
+    let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
 
     // Force-clean the body area in THIS frame's buffer so the diff engine
     // emits overwrites for stale glyphs left by longer previous frames
     // (ratatui only rewrites cells it believes changed).
     {
         let buf = f.buffer_mut();
-        for y in chunks[1].top()..chunks[1].bottom() {
-            for x in chunks[1].left()..chunks[1].right() {
+        for y in chunks[0].top()..chunks[0].bottom() {
+            for x in chunks[0].left()..chunks[0].right() {
                 if let Some(cell) = buf.cell_mut((x, y)) {
                     cell.reset();
                 }
@@ -2477,47 +2544,47 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
     // Wizard screens open with the step chain, so the next screen — and
     // therefore what Enter will do — is visible before the key is pressed.
-    let mut body = chunks[1];
+    let mut body = chunks[0];
     if let Some(step) = wizard_step(&app.screen) {
-        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(chunks[1]);
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(chunks[0]);
         f.render_widget(Paragraph::new(wizard_progress(step)), parts[0]);
         body = parts[1];
     }
 
     match &app.screen {
         Screen::Main { selected } => {
-            draw_main_menu(f, chunks[1], *selected);
+            draw_main_menu(f, chunks[0], *selected);
         }
         Screen::Scan {
             report, running, ..
         } => {
-            draw_scan(f, chunks[1], report.as_deref(), *running, app.tick);
+            draw_scan(f, chunks[0], report.as_deref(), *running, app.tick);
         }
         Screen::UrlInput {
             buffer,
             error,
             busy,
         } => {
-            draw_url_input(f, chunks[1], buffer, error.as_deref(), *busy, app.tick);
+            draw_url_input(f, chunks[0], buffer, error.as_deref(), *busy, app.tick);
         }
         Screen::Confirm {
             target,
             yes_selected,
         } => {
-            draw_confirm(f, chunks[1], target, *yes_selected);
+            draw_confirm(f, chunks[0], target, *yes_selected);
         }
         Screen::Deploy { lines, done } => {
-            draw_deploy(f, chunks[1], lines, *done, crate::netstatus::summary());
+            draw_deploy(f, chunks[0], lines, *done, crate::netstatus::summary());
         }
         Screen::Services {
             rows,
             selected,
             message,
         } => {
-            draw_services(f, chunks[1], rows, *selected, message.as_deref());
+            draw_services(f, chunks[0], rows, *selected, message.as_deref());
         }
         Screen::ConfirmDelete { name, yes_selected } => {
-            draw_confirm_delete(f, chunks[1], name, *yes_selected);
+            draw_confirm_delete(f, chunks[0], name, *yes_selected);
         }
         Screen::Logs {
             view,
@@ -2528,7 +2595,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         } => {
             draw_logs(
                 f,
-                chunks[1],
+                chunks[0],
                 *view,
                 deploy_lines,
                 software_lines,
@@ -2540,7 +2607,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             target,
             yes_selected,
         } => {
-            draw_confirm_clear(f, chunks[1], *target, *yes_selected);
+            draw_confirm_clear(f, chunks[0], *target, *yes_selected);
         }
         Screen::AddService {
             files,
@@ -2550,7 +2617,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         } => {
             draw_add_service(
                 f,
-                chunks[1],
+                chunks[0],
                 files,
                 *selected,
                 message.as_deref(),
@@ -2558,14 +2625,14 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             );
         }
         Screen::Import { buffer, error } => {
-            draw_import(f, chunks[1], buffer, error.as_deref(), app.tick);
+            draw_import(f, chunks[0], buffer, error.as_deref(), app.tick);
         }
         Screen::DetectInput {
             buffer,
             error,
             busy,
         } => {
-            draw_detect_input(f, chunks[1], buffer, error.as_deref(), *busy, app.tick);
+            draw_detect_input(f, chunks[0], buffer, error.as_deref(), *busy, app.tick);
         }
         Screen::UserServices {
             files,
@@ -2573,7 +2640,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             selected,
             message,
         } => {
-            draw_user_services(f, chunks[1], files, deployed, *selected, message.as_deref());
+            draw_user_services(f, chunks[0], files, deployed, *selected, message.as_deref());
         }
         Screen::Egress {
             files,
@@ -2586,7 +2653,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         } => {
             draw_egress(
                 f,
-                chunks[1],
+                chunks[0],
                 files,
                 deployed,
                 counters,
@@ -2608,7 +2675,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         } => {
             draw_egress_hosts(
                 f,
-                chunks[1],
+                chunks[0],
                 id,
                 hosts,
                 *selected,
@@ -2731,34 +2798,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         }
     }
 
-    f.render_widget(Paragraph::new(hint_line(&app.screen)), chunks[2]);
-}
-
-// --- header -----------------------------------------------------------------
-
-fn draw_header(f: &mut ratatui::Frame, area: ratatui::prelude::Rect) {
-    let top = vec![
-        Span::from(" "),
-        Span::styled(
-            "GHOSTPROVIDER",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ),
-    ];
-
-    let version = env!("CARGO_PKG_VERSION");
-    let bottom = Line::from(vec![
-        Span::styled(" self-hosting · local-only", Style::default().fg(DIM)),
-        Span::styled(format!(" · v{version} "), Style::default().fg(BLUE)),
-    ]);
-
-    f.render_widget(
-        Paragraph::new(vec![Line::from(top), bottom]).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(ACCENT)),
-        ),
-        area,
-    );
+    f.render_widget(Paragraph::new(hint_line(&app.screen)), chunks[1]);
 }
 
 // --- main menu --------------------------------------------------------------
@@ -2768,15 +2808,14 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
         return;
     }
     let selected = selected.min(MAIN_MENU.len() - 1);
-    let (_, _, desc, hue) = MAIN_MENU[selected];
 
-    // Vertical budget: the button grid is mandatory; the brand block above
-    // and the selected-item description below degrade gracefully on short
-    // terminals.
-    let grid_h = 9u16; // box(3) + name(1) + gap(1) + box(3) + name(1)
-    let desc_room = area.height >= grid_h + 2; // one gap + one centered line
-    let grid_y = area.y + area.height - grid_h - if desc_room { 2 } else { 0 };
-    let top_room = grid_y.saturating_sub(area.y);
+    // Double-scale the Pagga art when the terminal is wide enough for the
+    // 2× width; otherwise the original size still reads fine.
+    let art: Vec<String> = if area.width >= ART_2X_MIN_WIDTH {
+        expand_art_2x(&MAIN_ART).to_vec()
+    } else {
+        MAIN_ART.iter().map(|s| (*s).to_string()).collect()
+    };
 
     let mut y = area.y;
     let centered = |f: &mut ratatui::Frame, y: u16, line: Line| {
@@ -2790,140 +2829,67 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
             },
         );
     };
-    if top_room >= 6 {
-        for art in MAIN_ART {
-            centered(
-                f,
-                y,
-                Line::from(Span::styled(
-                    art,
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                )),
-            );
-            y += 1;
+    for line in &art {
+        if y >= area.bottom() {
+            return;
         }
         centered(
             f,
             y,
             Line::from(Span::styled(
-                "SYSTEM FOR AUTOMATED SELF-HOSTING",
-                Style::default().fg(BODY).add_modifier(Modifier::BOLD),
-            )),
-        );
-        y += 1;
-        centered(
-            f,
-            y,
-            Line::from(Span::styled("demo panel", Style::default().fg(DIM))),
-        );
-    } else if top_room >= 2 {
-        // Short screen: one brand line still says what this is.
-        centered(
-            f,
-            y,
-            Line::from(Span::styled(
-                "GHOST PROVIDER — SYSTEM FOR AUTOMATED SELF-HOSTING",
+                line.as_str(),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             )),
         );
         y += 1;
-        centered(
-            f,
-            y,
-            Line::from(Span::styled("demo panel", Style::default().fg(DIM))),
-        );
-    } else if top_room == 1 {
-        centered(
-            f,
-            y,
-            Line::from(Span::styled(
-                "GHOST PROVIDER",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            )),
-        );
     }
-
-    // Launcher grid: rounded buttons, icon inside, the item name centered
-    // under the button. The selected cell fills with its own hue.
-    let gap = 2u16;
-    let cell_w = (area.width.saturating_sub(3 * gap) / MENU_COLS as u16).clamp(10, 18);
-    let last_row = (MAIN_MENU.len() - 1) / MENU_COLS;
-    for (i, (icon, title, _, item_hue)) in MAIN_MENU.iter().enumerate() {
-        let row = i / MENU_COLS;
-        let col = i % MENU_COLS;
-        let in_row = if row == last_row {
-            MAIN_MENU.len() - last_row * MENU_COLS
+    for text in ["SYSTEM FOR AUTOMATED SELF-HOSTING", "demo panel"] {
+        if y >= area.bottom() {
+            return;
+        }
+        let style = if text.starts_with("SYSTEM") {
+            Style::default().fg(BODY).add_modifier(Modifier::BOLD)
         } else {
-            MENU_COLS
+            Style::default().fg(DIM)
         };
-        // A partial last row centers under the full rows above it.
-        let row_w = in_row as u16 * cell_w + (in_row as u16 - 1) * gap;
-        let rx = area.x + area.width.saturating_sub(row_w) / 2;
-        let bx = rx + col as u16 * (cell_w + gap);
-        let by = grid_y + row as u16 * 5;
-        let sel = i == selected;
-        let btn = ratatui::prelude::Rect {
-            x: bx,
-            y: by,
-            width: cell_w,
-            height: 3,
-        };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(*item_hue).add_modifier(if sel {
-                Modifier::BOLD
-            } else {
-                Modifier::empty()
-            }))
-            .style(if sel {
-                Style::default().bg(*item_hue).fg(Color::Black)
-            } else {
-                Style::default()
-            });
-        let inner = block.inner(btn);
-        f.render_widget(block, btn);
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                *icon,
-                Style::default()
-                    .fg(if sel { Color::Black } else { *item_hue })
-                    .add_modifier(Modifier::BOLD),
-            ))
-            .alignment(Alignment::Center),
-            inner,
-        );
-        // The name under the button may borrow half the gutter each side so
-        // long titles ("Deploy Service") stay on one line.
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                *title,
-                Style::default()
-                    .fg(if sel { Color::White } else { BODY })
-                    .add_modifier(if sel {
-                        Modifier::BOLD
-                    } else {
-                        Modifier::empty()
-                    }),
-            )))
-            .alignment(Alignment::Center),
-            ratatui::prelude::Rect {
-                x: bx.saturating_sub(gap / 2),
-                y: by + 3,
-                width: cell_w + gap,
-                height: 1,
-            },
-        );
+        centered(f, y, Line::from(Span::styled(text, style)));
+        y += 1;
     }
-    if desc_room {
+    y += 1; // breathing room before the menu
+
+    // The classic list format — icon, title, description — centered.
+    for (i, (icon, title, desc, hue)) in MAIN_MENU.iter().enumerate() {
+        if y >= area.bottom() {
+            return;
+        }
+        let sel = i == selected;
+        let marker = if sel { "» " } else { "" };
         centered(
             f,
-            area.y + area.height - 1,
-            Line::from(Span::styled(
-                format!(" {desc} "),
-                Style::default().fg(hue).add_modifier(Modifier::BOLD),
-            )),
+            y,
+            Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default().fg(*hue).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{icon} "), Style::default().fg(*hue)),
+                Span::styled(
+                    format!("{title} "),
+                    Style::default()
+                        .fg(if sel { Color::White } else { BODY })
+                        .add_modifier(if sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(
+                    format!("— {desc}"),
+                    Style::default().fg(if sel { *hue } else { DIM }),
+                ),
+            ]),
         );
+        y += 1;
     }
 }
 
@@ -4654,7 +4620,7 @@ fn wizard_progress(current: usize) -> Line<'static> {
 fn hint_line(screen: &Screen) -> Line<'static> {
     let pairs: Vec<(&str, Color)> = match screen {
         Screen::Main { .. } => vec![
-            ("↑↓←→ select", ACCENT),
+            ("↑↓ select", ACCENT),
             ("Enter choose", OK_GREEN),
             ("q quit", MAGENTA),
         ],
@@ -4864,32 +4830,42 @@ mod tests {
         assert!(MAIN_ART[0].ends_with("█▀▄"), "ends with R");
     }
 
-    /// Arrows drive the launcher grid: up/down jump a row of MENU_COLS,
-    /// left/right step one cell; the last row clamps to the final item.
+    /// Arrows step through the centered list one item at a time.
     #[test]
-    fn main_menu_arrows_drive_the_button_grid() {
+    fn main_menu_arrows_move_linearly() {
         let mut s = 0usize;
         move_main_selection(&mut s, KeyCode::Down);
-        assert_eq!(s, 4);
-        move_main_selection(&mut s, KeyCode::Up);
-        assert_eq!(s, 0);
+        assert_eq!(s, 1);
         move_main_selection(&mut s, KeyCode::Right);
+        assert_eq!(s, 2);
+        move_main_selection(&mut s, KeyCode::Up);
         assert_eq!(s, 1);
         move_main_selection(&mut s, KeyCode::Left);
         assert_eq!(s, 0);
         move_main_selection(&mut s, KeyCode::Left);
-        assert_eq!(s, 0, "left saturates at the first cell");
+        assert_eq!(s, 0, "left saturates at the first item");
         let mut last = MAIN_MENU.len() - 1;
         move_main_selection(&mut last, KeyCode::Down);
-        assert_eq!(last, MAIN_MENU.len() - 1, "down clamps on the last row");
-        move_main_selection(&mut last, KeyCode::Up);
-        assert_eq!(last, MAIN_MENU.len() - 1 - MENU_COLS);
+        assert_eq!(last, MAIN_MENU.len() - 1, "down clamps at the last item");
+    }
+
+    /// The doubled art is the same letterforms at 2×2 cells per glyph.
+    #[test]
+    fn pagga_art_doubles_to_twice_the_size() {
+        let big = expand_art_2x(&MAIN_ART);
+        assert_eq!(big.len(), 6);
+        let w = MAIN_ART[0].chars().count();
+        assert_eq!(big[0].chars().count(), w * 2);
+        assert_eq!(big[0], big[1], "each source line is emitted twice");
+        assert_eq!(big[2], big[3]);
+        assert_eq!(big[4], big[5]);
+        assert!(big[0].starts_with("░░██▀▀"), "G doubled");
     }
 
     /// The main screen really renders the Pagga art, the English subtitle,
-    /// the demo-panel mark, the button labels and the selected description.
+    /// the demo-panel mark and the classic centered list lines.
     #[test]
-    fn main_menu_screen_renders_art_subtitles_and_buttons() {
+    fn main_menu_screen_renders_art_subtitles_and_list() {
         use ratatui::backend::TestBackend;
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
         term.draw(|f| draw_main_menu(f, f.area(), 2)).unwrap();
@@ -4905,17 +4881,54 @@ mod tests {
             MAIN_ART[0],
             "SYSTEM FOR AUTOMATED SELF-HOSTING",
             "demo panel",
-            "System Scan",
-            "Deploy Service",
-            "My Services",
-            "Logs",
-            "deploy via GitHub URL or service.yaml", // selected item (2) description
+            "System Scan — probe interfaces and occupied ports",
+            "Deploy Service — deploy via GitHub URL or service.yaml",
+            "Logs — deploy + software + crash logs (3 screens)",
         ] {
             assert!(
                 text.contains(expected),
                 "screen should contain {expected:?}"
             );
         }
+        // Narrow terminals keep the original art size.
+        assert!(!text.contains(&expand_art_2x(&MAIN_ART)[0]));
+    }
+
+    /// A wide terminal switches to the doubled brand art.
+    #[test]
+    fn wide_main_menu_screen_uses_the_doubled_art() {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        term.draw(|f| draw_main_menu(f, f.area(), 0)).unwrap();
+        let buf = term.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(
+            text.contains(&expand_art_2x(&MAIN_ART)[0]),
+            "2x art on 120 cols"
+        );
+        assert!(!text.contains(MAIN_ART[0]), "1x art replaced");
+    }
+
+    /// Two consecutive frozen heartbeat windows fire the stall exit;
+    /// progress, pause windows and pre-first-tick boot samples re-baseline.
+    #[test]
+    fn stall_watchdog_fires_only_on_repeated_freeze() {
+        let mut wd = StallWatchdog::new();
+        assert!(!wd.watch(0, false), "boot (no ticks yet) never fires");
+        assert!(!wd.watch(0, false), "…even across windows");
+        assert!(!wd.watch(10, false), "first real sample only baselines");
+        assert!(wd.watch(10, false), "frozen second window fires");
+        assert!(!wd.watch(11, false), "progress resets the baseline");
+        assert!(!wd.watch(11, true), "paused windows never fire");
+        assert!(!wd.watch(11, true), "…even when frozen while paused");
+        assert!(!wd.watch(12, false), "resume re-baselines");
+        assert!(wd.watch(12, false), "a fresh freeze still fires");
     }
 
     /// Enter on the step-list screens advances (it used to open the inline
