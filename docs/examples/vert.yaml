@@ -7,8 +7,6 @@ service:
 source:
   git: https://github.com/VERT-sh/VERT.git
   commit: "cc7b5a54d5e9c797b377db47b9bdfbb561707783"
-pre_build:
-  - "if [ -f .env.example ] && [ ! -f .env ]; then cp .env.example .env; fi"
 prefetch:
   - ["bun", "install", "--frozen-lockfile", "--ignore-scripts"]
 plugins:
@@ -20,6 +18,19 @@ plugins:
     sha256: "a7e6c41307afc64b3f34116f220e925f0ad3aca47231e849f080051a2fb459a8"
 build:
   profile: bun
+  # VERT imports eight PUB_* names from $env/static/public; SvelteKit
+  # fails the offline vite build when any of them is unset. Values mirror
+  # upstream .env.example with analytics/vertd disabled (loopback-only
+  # runtime can never reach them anyway).
+  env:
+    PUB_ENV: production
+    PUB_HOSTNAME: localhost
+    PUB_PLAUSIBLE_URL: ''
+    PUB_VERTD_URL: https://vertd.vert.sh
+    PUB_DISABLE_ALL_EXTERNAL_REQUESTS: 'true'
+    PUB_DISABLE_FAILURE_BLOCKS: 'true'
+    PUB_DONATION_URL: https://donations.vert.sh
+    PUB_STRIPE_KEY: pk_live_51TlrPaFTPjkhEGBSu5Kwy5jJQYxcX5yUUHXiH5g7Xzvb0NKzDqbooc126HjlW35uUkfAgQN2ruEoCuyQynoxpKaA00ojFgQ116
   steps:
     - ["bun", "run", "build"]
 run:

@@ -22,6 +22,12 @@ build:
   profile: bun              # bun | python | python-searxng | go | node
   steps:
     - ["bun", "run", "build"]
+  # env:                    # optional: build-time env for every sandboxed
+  #   PUB_ENV: production   # build step (e.g. SvelteKit's PUB_* public env,
+  #   # ...                # without which $env/static/public imports fail).
+  #   # Keys: [A-Za-z_][A-Za-z0-9_], ≤64 vars, values ≤4096 chars, no
+  #   # NUL/newlines. Runtime units never see these; PATH always wins.
+  #   # (The built-in vert.yaml sets the eight PUB_* VERT imports here.)
 run:
   command: ["{self}", "__serve-static", "{project}/build", "{port}"]
   port: 0                   # 0 = random free port, else 1024..65535

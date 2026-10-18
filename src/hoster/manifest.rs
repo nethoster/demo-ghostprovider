@@ -17,6 +17,7 @@
 //!   commands that never execute fetched code on the host are accepted.
 //!   Anything else is rejected at validation, before any side effect.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -112,6 +113,12 @@ pub struct BuildSpec {
     pub profile: String,
     #[serde(default)]
     pub steps: Vec<Step>,
+    /// Build-time environment variables (e.g. SvelteKit's `PUB_*` public
+    /// env, without which `$env/static/public` imports fail the offline
+    /// vite build). Injected into every sandboxed build step; runtime
+    /// units never see these.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -400,6 +407,33 @@ impl ServiceManifest {
                 anyhow::anyhow!("{}", at(&format!("build step rejected: {r}: {s}")))
             })?;
         }
+        // ── build.env: names are POSIX-ish (no '=', no NUL/newlines in
+        // values — systemd Environment= lines would break) ──
+        if self.build.env.len() > 64 {
+            anyhow::bail!("{}", at("build.env holds at most 64 variables"));
+        }
+        for (k, v) in &self.build.env {
+            if k.is_empty()
+                || k.len() > 128
+                || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                || k.starts_with(|c: char| c.is_ascii_digit())
+            {
+                anyhow::bail!(
+                    "{}",
+                    at(&format!(
+                        "build.env key must be [A-Za-z_][A-Za-z0-9_] (got {k:?})"
+                    ))
+                );
+            }
+            if v.len() > 4096 || v.contains('\0') || v.contains('\n') {
+                anyhow::bail!(
+                    "{}",
+                    at(&format!(
+                        "build.env value for {k} must be ≤4096 chars without NUL/newlines"
+                    ))
+                );
+            }
+        }
         // ── plugins (VERT-style content pins) ──
         if self.plugins.len() > 8 {
             anyhow::bail!("{}", at("too many plugin pins (max 8)"));
@@ -532,6 +566,12 @@ impl ServiceManifest {
         ));
         for s in self.pre_build.iter().chain(self.build.steps.iter()) {
             out.push_str(&format!("  + {}\n", s.to_shell()));
+        }
+        if !self.build.env.is_empty() {
+            out.push_str(&format!("build env ({} var(s)):\n", self.build.env.len()));
+            for (k, v) in &self.build.env {
+                out.push_str(&format!("  + {k}={v}\n"));
+            }
         }
         out.push_str(&format!("run:      {}\n", self.run.command.join(" ")));
         out.push_str(&format!(
@@ -699,6 +739,12 @@ pub fn to_leaked_recipe(m: &ServiceManifest) -> super::recipes::DemoRecipe {
         .iter()
         .map(|p| (leak_str(&p.url), leak_str(&p.sha256)))
         .collect();
+    let build_env: Vec<(&'static str, &'static str)> = m
+        .build
+        .env
+        .iter()
+        .map(|(k, v)| (leak_str(k), leak_str(v)))
+        .collect();
     let tools: Vec<&'static str> = m.tools.iter().map(|t| leak_str(t)).collect();
     let egress: Vec<&'static str> = m
         .egress
@@ -730,6 +776,7 @@ pub fn to_leaked_recipe(m: &ServiceManifest) -> super::recipes::DemoRecipe {
         commit: leak_str(&m.source.commit),
         pre_build: leak_slice(pre_build),
         build_steps: leak_slice(build),
+        build_env: Box::leak(build_env.into_boxed_slice()),
         prefetch_steps: leak_slice(prefetch),
         plugins: Box::leak(plugins.into_boxed_slice()),
         start_cmd,
@@ -1034,5 +1081,41 @@ mod tests {
                 "{id}: {joined}"
             );
         }
+    }
+
+    /// `build.env` travels from the manifest into the recipe (and from there
+    /// into every sandboxed build step); keys/values are validated up front.
+    #[test]
+    fn build_env_validates_keys_and_reaches_the_recipe() {
+        let mut m = sample();
+        m.build.env.insert("PUB_ENV".into(), "production".into());
+        m.build
+            .env
+            .insert("PUB_DISABLE_ALL_EXTERNAL_REQUESTS".into(), "true".into());
+        m.validate("t").expect("valid build.env");
+        let r = to_leaked_recipe(&m);
+        assert!(r.build_env.contains(&("PUB_ENV", "production")));
+        assert!(
+            r.build_env
+                .contains(&("PUB_DISABLE_ALL_EXTERNAL_REQUESTS", "true"))
+        );
+
+        // Bad keys: digits first, dashes, empty.
+        for bad in ["1PUBLIC", "PUB-ENV", ""] {
+            let mut m = sample();
+            m.build.env.insert(bad.into(), "x".into());
+            assert!(m.validate("t").is_err(), "key {bad:?} must be rejected");
+        }
+        // Newlines would break the unit's Environment= line.
+        let mut m = sample();
+        m.build.env.insert("PUB_ENV".into(), "a\nb".into());
+        assert!(m.validate("t").is_err());
+        // The built-in VERT example carries the eight PUB_* imports VERT
+        // needs for its offline vite build.
+        let vert = example("demo-vert");
+        assert!(
+            vert.build.env.contains_key("PUB_ENV"),
+            "vert example must set PUB_ENV"
+        );
     }
 }

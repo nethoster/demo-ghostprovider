@@ -551,6 +551,12 @@ pub fn deploy_service(
     // phase) and its failure is fatal: with PrivateNetwork=yes the sandboxed
     // `go build` could not fetch the toolchain itself.
     let mut build_env: Vec<(String, String)> = Vec::new();
+    // Manifest-declared build-time env (e.g. SvelteKit's PUB_* public env):
+    // must land before PATH pinning below so a hostile manifest can never
+    // shadow the pinned toolbox PATH.
+    for (k, v) in recipe.build_env {
+        build_env.push((k.to_string(), v.to_string()));
+    }
     // Pinned toolbox tools lead PATH inside the sandbox too: the offline
     // build steps must invoke exactly the pinned bun/pnpm/go, never an
     // ambient binary. `run_sandboxed` gives extra_env precedence over the
@@ -1356,12 +1362,14 @@ pub fn cleanup_cmd() -> anyhow::Result<()> {
 /// The END of a step's output — that is where the actual failure reason
 /// lives. The head is dominated by the command echo and early chatter (a
 /// paraglide CDN warning once ate the first 300 chars and hid the vite
-/// error behind it, leaving the deploy reason-less).
+/// error behind it, leaving the deploy reason-less). The window is sized
+/// for a rollup/vite stack trace: the error message sits ~12 frames above
+/// the bun exit line, so 15 lines once cut it off.
 fn short(s: &str) -> String {
-    let mut lines: Vec<&str> = s.lines().rev().take(15).collect();
+    let mut lines: Vec<&str> = s.lines().rev().take(30).collect();
     lines.reverse();
     let joined = lines.join("\n");
-    let skip = joined.chars().count().saturating_sub(1500);
+    let skip = joined.chars().count().saturating_sub(3000);
     joined.chars().skip(skip).collect()
 }
 
@@ -1406,6 +1414,30 @@ mod tests {
         assert!(!s.contains("noise line 0"), "head dropped: {s:?}");
         // A short body is returned whole.
         assert_eq!(short("only line\n"), "only line");
+    }
+
+    /// A rollup/vite failure prints the error message ~12 stack frames above
+    /// the bun exit line; the window must be deep enough to keep the message
+    /// itself, not just the frames.
+    #[test]
+    fn short_keeps_a_vite_error_above_its_stack_frames() {
+        let mut out = String::new();
+        for i in 0..20 {
+            out.push_str(&format!("early chatter line {i}\n"));
+        }
+        out.push_str(
+            "src/lib/util/consts.ts (1:44): \"PUB_ENV\" is not exported by \"virtual:env/static/public\"\n",
+        );
+        for i in 0..14 {
+            out.push_str(&format!("    at Frame.bind (rollup/node-entry.js:{i})\n"));
+        }
+        out.push_str("error: script \"build\" exited with code 1\n");
+        let s = short(&out);
+        assert!(
+            s.contains("PUB_ENV\" is not exported"),
+            "error message survives the stack frames: {s:?}"
+        );
+        assert!(!s.contains("early chatter line 0"), "head dropped: {s:?}");
     }
 
     /// An empty section must add no header; a non-empty one is labeled.

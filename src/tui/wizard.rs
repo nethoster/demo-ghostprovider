@@ -256,6 +256,7 @@ pub fn build_manifest(draft: &Draft) -> Result<ServiceManifest, String> {
                 .iter()
                 .map(|s| Step::Shell(s.clone()))
                 .collect(),
+            env: std::collections::BTreeMap::new(),
         },
         run: crate::hoster::manifest::RunSpec {
             command: run_argv,

@@ -23,6 +23,11 @@ pub struct DemoRecipe {
     pub commit: &'static str,
     pub pre_build: &'static [&'static str],
     pub build_steps: &'static [&'static str],
+    /// Build-time environment variables (`build.env` in the manifest),
+    /// injected into every sandboxed build step — e.g. SvelteKit's `PUB_*`
+    /// public env, without which `$env/static/public` imports fail the
+    /// offline vite build. Runtime units never see these.
+    pub build_env: &'static [(&'static str, &'static str)],
     /// Host-phase dependency pre-fetch steps, run BEFORE the sandboxed build
     /// with network available (see `prefetch.rs`). These fill the tool caches
     /// so each sandboxed build step below runs fully offline. They are
