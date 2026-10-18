@@ -1044,19 +1044,41 @@ fn draw_scan(f: &mut ratatui::Frame, area: Rect, report: Option<&str>, running: 
                 .map(|i| r[..i].rfind('\n').map(|n| n + 1).unwrap_or(0));
             match split {
                 Some(i) if inner.width >= SCAN_SIDEBYSIDE_MIN_WIDTH => {
-                    let cols = Layout::horizontal([
-                        Constraint::Percentage(60),
-                        Constraint::Percentage(40),
-                    ])
-                    .split(inner);
-                    f.render_widget(
-                        Paragraph::new(colorize_scan(&r[..i])).wrap(Wrap { trim: false }),
-                        cols[0],
-                    );
-                    f.render_widget(
-                        Paragraph::new(colorize_scan(&r[i..])).wrap(Wrap { trim: false }),
-                        cols[1],
-                    );
+                    // Columns hug the content: the ports list starts a few
+                    // cells after the widest left line, not at some far-away
+                    // percentage of the terminal.
+                    let left = colorize_scan(&r[..i]);
+                    let right = colorize_scan(&r[i..]);
+                    let left_w = left.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+                    let gap = 3u16;
+                    if left_w + gap + 12 <= inner.width {
+                        let right_x = inner.x + left_w + gap;
+                        let right_w = inner.width.saturating_sub(left_w + gap);
+                        f.render_widget(
+                            Paragraph::new(left).wrap(Wrap { trim: false }),
+                            Rect {
+                                x: inner.x,
+                                y: inner.y,
+                                width: left_w,
+                                height: inner.height,
+                            },
+                        );
+                        f.render_widget(
+                            Paragraph::new(right).wrap(Wrap { trim: false }),
+                            Rect {
+                                x: right_x,
+                                y: inner.y,
+                                width: right_w,
+                                height: inner.height,
+                            },
+                        );
+                    } else {
+                        f.render_widget(
+                            Paragraph::new(left.into_iter().chain(right).collect::<Vec<_>>())
+                                .wrap(Wrap { trim: false }),
+                            inner,
+                        );
+                    }
                 }
                 _ => {
                     f.render_widget(

@@ -2965,19 +2965,41 @@ fn draw_scan(
                 .map(|i| r[..i].rfind('\n').map(|n| n + 1).unwrap_or(0));
             match split {
                 Some(i) if inner.width >= SCAN_SIDEBYSIDE_MIN_WIDTH => {
-                    let cols = Layout::horizontal([
-                        Constraint::Percentage(60),
-                        Constraint::Percentage(40),
-                    ])
-                    .split(inner);
-                    f.render_widget(
-                        Paragraph::new(colorize_scan(&r[..i])).wrap(Wrap { trim: false }),
-                        cols[0],
-                    );
-                    f.render_widget(
-                        Paragraph::new(colorize_scan(&r[i..])).wrap(Wrap { trim: false }),
-                        cols[1],
-                    );
+                    // Columns hug the content: the ports list starts a few
+                    // cells after the widest left line, not at some far-away
+                    // percentage of the terminal.
+                    let left = colorize_scan(&r[..i]);
+                    let right = colorize_scan(&r[i..]);
+                    let left_w = left.iter().map(|l| l.width() as u16).max().unwrap_or(0);
+                    let gap = 3u16;
+                    if left_w + gap + 12 <= inner.width {
+                        let right_x = inner.x + left_w + gap;
+                        let right_w = inner.width.saturating_sub(left_w + gap);
+                        f.render_widget(
+                            Paragraph::new(left).wrap(Wrap { trim: false }),
+                            ratatui::prelude::Rect {
+                                x: inner.x,
+                                y: inner.y,
+                                width: left_w,
+                                height: inner.height,
+                            },
+                        );
+                        f.render_widget(
+                            Paragraph::new(right).wrap(Wrap { trim: false }),
+                            ratatui::prelude::Rect {
+                                x: right_x,
+                                y: inner.y,
+                                width: right_w,
+                                height: inner.height,
+                            },
+                        );
+                    } else {
+                        f.render_widget(
+                            Paragraph::new(left.into_iter().chain(right).collect::<Vec<_>>())
+                                .wrap(Wrap { trim: false }),
+                            inner,
+                        );
+                    }
                 }
                 _ => {
                     f.render_widget(
@@ -5377,6 +5399,7 @@ mod tests {
         let mut ports_col = None;
         let mut ifaces_col = None;
         let mut last_port_row = 0;
+        let mut port_row_col = None;
         for y in 0..buf.area.height {
             let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
             if let Some(col) = row.find("Listening ports:") {
@@ -5387,11 +5410,23 @@ mod tests {
             }
             if let Some(col) = row.find("8014") {
                 last_port_row = y;
-                assert!(col > 40, "ports live in the right half, col={col}");
+                port_row_col = Some(col);
             }
         }
         let ports_col = ports_col.expect("ports header rendered");
-        assert!(ports_col > 40, "ports header on the right, col={ports_col}");
+        // The column hugs the left content: a few cells after the widest
+        // fact line, never pinned to the far side of a wide terminal.
+        assert!(
+            (30..=50).contains(&ports_col),
+            "ports column right next to the facts, col={ports_col}"
+        );
+        // Port rows align under their header (one cell of indent).
+        if let Some(c) = port_row_col {
+            assert!(
+                c.abs_diff(ports_col) <= 2,
+                "port rows under the header: {c} vs {ports_col}"
+            );
+        }
         // The header rows share the top of the screen: the ports column sits
         // beside the facts, not below them.
         if let Some(ifaces_col) = ifaces_col {
