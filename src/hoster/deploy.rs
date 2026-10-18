@@ -645,8 +645,9 @@ pub fn deploy_service(
                 report_err(
                     &mut result,
                     format!(
-                        "Build step failed ({resolved}):\n{}{}",
-                        short(&r.stderr),
+                        "Build step failed ({resolved}):\nstatus: {}\n{}{}",
+                        r.status,
+                        section("stderr (tail)", &short(&r.stderr)),
                         tail(&r.stdout),
                     ),
                 );
@@ -1352,8 +1353,26 @@ pub fn cleanup_cmd() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The END of a step's output — that is where the actual failure reason
+/// lives. The head is dominated by the command echo and early chatter (a
+/// paraglide CDN warning once ate the first 300 chars and hid the vite
+/// error behind it, leaving the deploy reason-less).
 fn short(s: &str) -> String {
-    s.chars().take(300).collect()
+    let mut lines: Vec<&str> = s.lines().rev().take(15).collect();
+    lines.reverse();
+    let joined = lines.join("\n");
+    let skip = joined.chars().count().saturating_sub(1500);
+    joined.chars().skip(skip).collect()
+}
+
+/// A labeled output section for failure reports; an empty body adds nothing.
+fn section(name: &str, body: &str) -> String {
+    let body = body.trim_end();
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("\n--- {name} ---\n{body}")
+    }
 }
 
 /// The last few lines of a step's stdout, so a `pnpm`/`go` failure that
@@ -1362,18 +1381,43 @@ fn short(s: &str) -> String {
 fn tail(s: &str) -> String {
     let mut lines: Vec<&str> = s.lines().rev().take(12).collect();
     lines.reverse();
-    let tail = lines.join("\n");
-    let tail = tail.chars().take(600).collect::<String>();
-    if tail.trim().is_empty() {
-        String::new()
-    } else {
-        format!("\n--- stdout (tail) ---\n{tail}")
-    }
+    let joined = lines.join("\n");
+    let skip = joined.chars().count().saturating_sub(600);
+    let tail: String = joined.chars().skip(skip).collect();
+    section("stdout (tail)", &tail)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Failure reports quote the END of a step's output: the head is echo
+    /// and early chatter, the reason (e.g. the real vite error behind a
+    /// long paraglide CDN warning) is at the tail.
+    #[test]
+    fn short_keeps_the_tail_where_the_error_lives() {
+        let mut out = String::new();
+        for i in 0..40 {
+            out.push_str(&format!("noise line {i}\n"));
+        }
+        out.push_str("real vite error\n");
+        let s = short(&out);
+        assert!(s.ends_with("real vite error"), "tail kept: {s:?}");
+        assert!(!s.contains("noise line 0"), "head dropped: {s:?}");
+        // A short body is returned whole.
+        assert_eq!(short("only line\n"), "only line");
+    }
+
+    /// An empty section must add no header; a non-empty one is labeled.
+    #[test]
+    fn section_labels_non_empty_bodies_only() {
+        assert_eq!(section("stderr (tail)", ""), "");
+        assert_eq!(section("stderr (tail)", " \n"), "");
+        assert_eq!(
+            section("stderr (tail)", "boom\n"),
+            "\n--- stderr (tail) ---\nboom"
+        );
+    }
 
     #[test]
     fn screen_line_keeps_verdicts_and_warnings_only() {

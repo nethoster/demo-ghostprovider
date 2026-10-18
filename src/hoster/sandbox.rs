@@ -145,6 +145,10 @@ pub struct CmdResult {
     pub success: bool,
     pub stdout: String,
     pub stderr: String,
+    /// How the step ended, e.g. `exit 1` / `signal 9 (killed)` — failure
+    /// reports must tell a tool's own error apart from a hard kill, which
+    /// prints nothing to stdout/stderr.
+    pub status: String,
 }
 
 /// Whether the hardened isolation is actually in effect for build steps.
@@ -571,6 +575,7 @@ pub fn run_sandboxed(
                 success: status.map(|s| s.success()).unwrap_or(false),
                 stdout,
                 stderr,
+                status: status.map(status_desc).unwrap_or_else(|| "unknown".into()),
             })
         }
         // An explicit timeout is a hard failure — do NOT fall back to plain
@@ -589,6 +594,21 @@ pub fn run_sandboxed(
 fn is_timeout_result(stderr: &str) -> bool {
     let lower = stderr.to_lowercase();
     lower.contains("result: timeout") || lower.contains("result 'timeout'")
+}
+
+/// Human-readable outcome of a waited process: `exit 1`, `signal 9 (killed)`,
+/// or `unknown`. A normal exit carries the tool's own verdict in the exit
+/// code; a signal kill (OOM, sandbox reaper) prints nothing, and without this
+/// line the two look identically silent.
+fn status_desc(s: std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = s.code() {
+        format!("exit {code}")
+    } else if let Some(sig) = s.signal() {
+        format!("signal {sig} (killed)")
+    } else {
+        "unknown".into()
+    }
 }
 
 /// Run a shell snippet (`sh -c`) after the heuristic validation pass.
@@ -701,6 +721,23 @@ fn strip_status_preamble(err: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failure report must distinguish the step's own error code from a
+    /// hard kill (OOM/reaper) that prints nothing — the two read as silence
+    /// otherwise.
+    #[test]
+    fn status_desc_distinguishes_exit_codes_from_signal_kills() {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status_desc(std::process::ExitStatus::from_raw(256)), // exit(1)
+            "exit 1"
+        );
+        assert_eq!(
+            status_desc(std::process::ExitStatus::from_raw(9)), // SIGKILL
+            "signal 9 (killed)"
+        );
+        assert_eq!(status_desc(std::process::ExitStatus::from_raw(0)), "exit 0");
+    }
 
     #[test]
     fn scrub_removes_all_credential_vars() {
