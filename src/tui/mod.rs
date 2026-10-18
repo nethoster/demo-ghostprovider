@@ -2823,8 +2823,13 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
     // The whole composition — art, subtitle, mark, menu — is one block,
     // centered in the body both ways; the selected description anchors the
     // bottom line above the hint bar.
-    let content_h = art.len() as u16 + 2 + 1 + MAIN_MENU.len() as u16;
-    let mut y = area.y + area.height.saturating_sub(content_h + 2) / 2;
+    // Vertical rhythm: free rows split into thirds — above the brand block,
+    // between brand and menu (which pushes the menu down), and below the
+    // menu before the bottom description.
+    let brand_h = art.len() as u16 + 2; // art + subtitle + mark
+    let content_h = brand_h + 2 + MAIN_MENU.len() as u16; // gap + menu
+    let slack = area.height.saturating_sub(content_h + 2); // + gap/desc rows
+    let mut y = area.y + slack / 3;
 
     let centered = |f: &mut ratatui::Frame, y: u16, line: Line| {
         f.render_widget(
@@ -2865,7 +2870,7 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
         y,
         Line::from(Span::styled("demo panel", Style::default().fg(DIM))),
     );
-    y += 2; // gap before the menu
+    y += 2 + slack / 3; // gap: a third of the slack lands between brand and menu
 
     // Menu items share one left edge — the block gets centered, not each
     // line — so the list never straggles. Descriptions moved to the bottom.
@@ -4897,8 +4902,9 @@ mod tests {
         assert!(big[0].starts_with("░░██▀▀"), "G doubled");
     }
 
-    /// The main screen renders the Pagga art and subtitle as one vertically
-    /// centered block; menu items share a common left edge (the block is
+    /// The main screen renders the Pagga art and subtitle as one block with
+    /// the free space split into thirds (above brand / between brand and
+    /// menu / below menu); menu items share a common left edge (the block is
     /// centered, not each line); the selected description sits on the very
     /// bottom row.
     #[test]
@@ -4909,7 +4915,9 @@ mod tests {
         let buf = term.backend().buffer();
         let mut text = String::new();
         let mut art_row = None;
+        let mut demo_row = None;
         let mut scan_col = None;
+        let mut scan_row = None;
         let mut deploy_col = None;
         let mut desc_row = None;
         for y in 0..buf.area.height {
@@ -4917,8 +4925,12 @@ mod tests {
             if art_row.is_none() && row.contains(MAIN_ART[0]) {
                 art_row = Some(y);
             }
+            if row.contains("demo panel") {
+                demo_row = Some(y);
+            }
             if let Some(col) = row.find("@ System Scan") {
                 scan_col = Some(col);
+                scan_row = Some(y);
             }
             if let Some(col) = row.find("^ Deploy Service") {
                 deploy_col = Some(col);
@@ -4949,6 +4961,13 @@ mod tests {
         );
         // The composition hangs below the top edge, not glued to it.
         assert!(art_row.unwrap_or(0) > 0, "art is vertically centered");
+        // A third of the free space lands between brand and menu: the list
+        // sits noticeably below the demo-panel mark, not glued to it.
+        let brand_menu_gap = scan_row.unwrap() - demo_row.unwrap();
+        assert!(
+            brand_menu_gap >= 3,
+            "menu hangs below the brand: {brand_menu_gap}"
+        );
         // The menu block shares one left edge: icons align across rows.
         assert_eq!(scan_col, deploy_col, "menu items align as a block");
         // The selected description is anchored to the bottom row.
