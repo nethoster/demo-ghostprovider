@@ -2798,7 +2798,10 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         }
     }
 
-    f.render_widget(Paragraph::new(hint_line(&app.screen)), chunks[1]);
+    f.render_widget(
+        Paragraph::new(hint_line(&app.screen)).alignment(Alignment::Center),
+        chunks[1],
+    );
 }
 
 // --- main menu --------------------------------------------------------------
@@ -5438,5 +5441,44 @@ mod tests {
             Some(now - Duration::from_millis(10)),
             now
         ));
+    }
+
+    /// The bottom hint bar centers horizontally on every screen.
+    #[test]
+    fn hint_bar_is_centered_at_the_bottom() {
+        use ratatui::backend::TestBackend;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app = App {
+            screen: Screen::Main { selected: 0 },
+            rx,
+            tx,
+            tick: 0,
+            scan_seq: 0,
+            deploy_history: Vec::new(),
+            software_history: Vec::new(),
+            crash_history: Vec::new(),
+            deploy_tail_keep: None,
+            software_tail_keep: None,
+            crash_tail_keep: None,
+            exit_notices: Vec::new(),
+        };
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        let last = buf.area.height - 1;
+        let row: String = (0..buf.area.width)
+            .map(|x| buf[(x, last)].symbol())
+            .collect();
+        assert!(
+            row.contains("Enter choose"),
+            "hint on the last row: {row:?}"
+        );
+        let left = row.len() - row.trim_start().len();
+        let right = row.len() - row.trim_end().len();
+        assert!(left > 0 && right > 0, "padding both sides: {left}/{right}");
+        assert!(
+            (left as i64 - right as i64).abs() <= 2,
+            "roughly centered: left={left} right={right}"
+        );
     }
 }
