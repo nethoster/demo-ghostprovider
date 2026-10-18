@@ -40,18 +40,33 @@ fn push_deploy_line(lines: &mut Vec<String>, line: String) {
     }
 }
 
-fn compress_done(lines: &mut Vec<String>) {
-    lines.retain(|l| {
+/// Same contract as the main panel's `compress_done`: on failure keep the
+/// whole tail from the last `! …` report — that block is the reason.
+fn compress_done(lines: &mut Vec<String>, ok: bool) {
+    let failure_from = if ok {
+        usize::MAX
+    } else {
+        lines
+            .iter()
+            .rposition(|l| l.trim_start().starts_with('!'))
+            .unwrap_or(usize::MAX)
+    };
+    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
+    for (i, l) in lines.iter().enumerate() {
         let t = l.trim_start();
-        t.starts_with('!')
+        let verdict = t.starts_with('!')
             || t.starts_with("warn: ")
             || t.starts_with("sandbox: ")
             || t.starts_with("provision: ")
             || t.starts_with("✔")
             || t.contains("listening on ")
             || t.contains("deployment failed")
-            || t.is_empty()
-    });
+            || t.is_empty();
+        if i >= failure_from || verdict {
+            kept.push(l.clone());
+        }
+    }
+    *lines = kept;
 }
 
 // ── screens ──────────────────────────────────────────────────────────────────
@@ -223,7 +238,7 @@ fn event_loop(
                         if !ok {
                             push_deploy_line(lines, "deployment failed".into());
                         }
-                        compress_done(lines);
+                        compress_done(lines, ok);
                         *done = Some(ok);
                     }
                     if let Screen::Logs { deploy_lines, .. } = &mut app.screen

@@ -111,18 +111,36 @@ fn push_deploy_line(lines: &mut Vec<String>, line: String) {
 /// full log already streamed past the user as it happened; keeping a compact
 /// tail makes the finished state last, which is exactly what a brittle
 /// terminal wants to preserve.
-fn compress_done(lines: &mut Vec<String>) {
-    lines.retain(|l| {
+///
+/// A failed deploy keeps one more thing: everything from the last `! …`
+/// report to the end — that block IS the reason, and dropping it (which this
+/// compression used to do) leaves the user staring at "deployment failed"
+/// with no cause on screen.
+fn compress_done(lines: &mut Vec<String>, ok: bool) {
+    let failure_from = if ok {
+        usize::MAX
+    } else {
+        lines
+            .iter()
+            .rposition(|l| l.trim_start().starts_with('!'))
+            .unwrap_or(usize::MAX)
+    };
+    let mut kept: Vec<String> = Vec::with_capacity(lines.len());
+    for (i, l) in lines.iter().enumerate() {
         let t = l.trim_start();
-        t.starts_with('!')
+        let verdict = t.starts_with('!')
             || t.starts_with("warn: ")
             || t.starts_with("sandbox: ")
             || t.starts_with("provision: ")
             || t.starts_with("✔")
             || t.contains("listening on ")
             || t.contains("deployment failed")
-            || t.is_empty()
-    });
+            || t.is_empty();
+        if i >= failure_from || verdict {
+            kept.push(l.clone());
+        }
+    }
+    *lines = kept;
 }
 
 pub(crate) enum Screen {
@@ -504,7 +522,7 @@ fn event_loop(
                         if !ok {
                             push_deploy_line(lines, "deployment failed".into());
                         }
-                        compress_done(lines);
+                        compress_done(lines, ok);
                         *done = Some(ok);
                     }
                     // Logs deploy view is file-tailed; file already contains "== deploy done ==".
@@ -2698,7 +2716,7 @@ fn draw_header(f: &mut ratatui::Frame, area: ratatui::prelude::Rect) {
 
     let version = env!("CARGO_PKG_VERSION");
     let bottom = Line::from(vec![
-        Span::styled(" self-hosting demo · local-only", Style::default().fg(DIM)),
+        Span::styled(" self-hosting · local-only", Style::default().fg(DIM)),
         Span::styled(format!(" · v{version} "), Style::default().fg(BLUE)),
     ]);
 
@@ -5029,6 +5047,80 @@ mod tests {
         assert_eq!(
             lines.last().map(String::as_str),
             Some(expected_last.as_str())
+        );
+    }
+
+    /// A finished deploy keeps only verdict lines — except when it failed:
+    /// then the whole tail from the last `! …` report survives, because that
+    /// block is the reason. (The old filter dropped `[warn]`/`[error]` detail
+    /// lines, leaving the screen reason-less on a build failure.)
+    #[test]
+    fn compress_done_on_failure_keeps_the_report_block() {
+        let mut lines: Vec<String> = [
+            "cloning repository…",
+            "! Build step failed (bun run build):",
+            "status: exit 1",
+            "--- stderr (tail) ---",
+            "[warn] https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format",
+            "[error] The command \"vite build\" exited with code: 1",
+            "deployment failed",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        compress_done(&mut lines, false);
+        let text = lines.join("\n");
+        assert!(
+            text.contains("[error] The command \"vite build\""),
+            "{text}"
+        );
+        assert!(text.contains("status: exit 1"), "{text}");
+        assert!(text.contains("deployment failed"), "{text}");
+        assert!(!text.contains("cloning repository"), "{text}");
+    }
+
+    #[test]
+    fn compress_done_on_success_keeps_only_verdicts() {
+        let mut lines: Vec<String> = [
+            "cloning repository…",
+            "sandbox: PrivateTmp=true",
+            "✔ listening on http://127.0.0.1:4173",
+            "chatty progress line",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        compress_done(&mut lines, true);
+        let kept: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "sandbox: PrivateTmp=true",
+                "✔ listening on http://127.0.0.1:4173"
+            ]
+        );
+    }
+
+    /// A deploy that failed without any `! …` report still falls back to the
+    /// verdict filter rather than keeping the full log.
+    #[test]
+    fn compress_done_on_failure_without_report_falls_back_to_verdicts() {
+        let mut lines: Vec<String> = [
+            "cloning repository…",
+            "warn: host prefetch missed, continuing offline",
+            "deployment failed",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        compress_done(&mut lines, false);
+        let kept: Vec<&str> = lines.iter().map(String::as_str).collect();
+        assert_eq!(
+            kept,
+            vec![
+                "warn: host prefetch missed, continuing offline",
+                "deployment failed"
+            ]
         );
     }
 
