@@ -2817,7 +2817,12 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
         MAIN_ART.iter().map(|s| (*s).to_string()).collect()
     };
 
-    let mut y = area.y;
+    // The whole composition — art, subtitle, mark, menu — is one block,
+    // centered in the body both ways; the selected description anchors the
+    // bottom line above the hint bar.
+    let content_h = art.len() as u16 + 2 + 1 + MAIN_MENU.len() as u16;
+    let mut y = area.y + area.height.saturating_sub(content_h + 2) / 2;
+
     let centered = |f: &mut ratatui::Frame, y: u16, line: Line| {
         f.render_widget(
             Paragraph::new(line).alignment(Alignment::Center),
@@ -2843,38 +2848,43 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
         );
         y += 1;
     }
-    for text in ["SYSTEM FOR AUTOMATED SELF-HOSTING", "demo panel"] {
-        if y >= area.bottom() {
-            return;
-        }
-        let style = if text.starts_with("SYSTEM") {
-            Style::default().fg(BODY).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(DIM)
-        };
-        centered(f, y, Line::from(Span::styled(text, style)));
-        y += 1;
-    }
-    y += 1; // breathing room before the menu
+    centered(
+        f,
+        y,
+        Line::from(Span::styled(
+            "SYSTEM FOR AUTOMATED SELF-HOSTING",
+            Style::default().fg(BODY).add_modifier(Modifier::BOLD),
+        )),
+    );
+    y += 1;
+    centered(
+        f,
+        y,
+        Line::from(Span::styled("demo panel", Style::default().fg(DIM))),
+    );
+    y += 2; // gap before the menu
 
-    // The classic list format — icon, title, description — centered.
-    for (i, (icon, title, desc, hue)) in MAIN_MENU.iter().enumerate() {
+    // Menu items share one left edge — the block gets centered, not each
+    // line — so the list never straggles. Descriptions moved to the bottom.
+    let block_w = menu_block_width();
+    let bx = area.x + area.width.saturating_sub(block_w) / 2;
+    for (i, (icon, title, _, hue)) in MAIN_MENU.iter().enumerate() {
         if y >= area.bottom() {
-            return;
+            break;
         }
         let sel = i == selected;
-        let marker = if sel { "» " } else { "" };
-        centered(
-            f,
-            y,
-            Line::from(vec![
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
                 Span::styled(
-                    marker,
+                    // ASCII marker: U+00BB is East-Asian-ambiguous and
+                    // renders double-width in some backends, shifting the
+                    // whole block by one column.
+                    if sel { "> " } else { "  " },
                     Style::default().fg(*hue).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!("{icon} "), Style::default().fg(*hue)),
                 Span::styled(
-                    format!("{title} "),
+                    *title,
                     Style::default()
                         .fg(if sel { Color::White } else { BODY })
                         .add_modifier(if sel {
@@ -2883,14 +2893,36 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
                             Modifier::empty()
                         }),
                 ),
-                Span::styled(
-                    format!("— {desc}"),
-                    Style::default().fg(if sel { *hue } else { DIM }),
-                ),
-            ]),
+            ])),
+            ratatui::prelude::Rect {
+                x: bx,
+                y,
+                width: block_w,
+                height: 1,
+            },
         );
         y += 1;
     }
+
+    // The selected item's description: bottom-anchored, centered.
+    let (_, _, desc, hue) = MAIN_MENU[selected];
+    centered(
+        f,
+        area.bottom() - 1,
+        Line::from(Span::styled(
+            desc,
+            Style::default().fg(hue).add_modifier(Modifier::BOLD),
+        )),
+    );
+}
+
+/// Width of the menu block: marker column + icon + widest title.
+fn menu_block_width() -> u16 {
+    MAIN_MENU
+        .iter()
+        .map(|(_, title, _, _)| 4 + title.chars().count() as u16)
+        .max()
+        .unwrap_or(10)
 }
 
 // --- system scan ------------------------------------------------------------
@@ -4862,8 +4894,10 @@ mod tests {
         assert!(big[0].starts_with("░░██▀▀"), "G doubled");
     }
 
-    /// The main screen really renders the Pagga art, the English subtitle,
-    /// the demo-panel mark and the classic centered list lines.
+    /// The main screen renders the Pagga art and subtitle as one vertically
+    /// centered block; menu items share a common left edge (the block is
+    /// centered, not each line); the selected description sits on the very
+    /// bottom row.
     #[test]
     fn main_menu_screen_renders_art_subtitles_and_list() {
         use ratatui::backend::TestBackend;
@@ -4871,25 +4905,51 @@ mod tests {
         term.draw(|f| draw_main_menu(f, f.area(), 2)).unwrap();
         let buf = term.backend().buffer();
         let mut text = String::new();
+        let mut art_row = None;
+        let mut scan_col = None;
+        let mut deploy_col = None;
+        let mut desc_row = None;
         for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                text.push_str(buf[(x, y)].symbol());
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if art_row.is_none() && row.contains(MAIN_ART[0]) {
+                art_row = Some(y);
             }
+            if let Some(col) = row.find("@ System Scan") {
+                scan_col = Some(col);
+            }
+            if let Some(col) = row.find("^ Deploy Service") {
+                deploy_col = Some(col);
+            }
+            if row.contains("deploy via GitHub URL or service.yaml") {
+                desc_row = Some(y);
+            }
+            text.push_str(&row);
             text.push('\n');
         }
         for expected in [
             MAIN_ART[0],
             "SYSTEM FOR AUTOMATED SELF-HOSTING",
             "demo panel",
-            "System Scan — probe interfaces and occupied ports",
-            "Deploy Service — deploy via GitHub URL or service.yaml",
-            "Logs — deploy + software + crash logs (3 screens)",
+            "System Scan",
+            "Deploy Service",
+            "Logs",
         ] {
             assert!(
                 text.contains(expected),
                 "screen should contain {expected:?}"
             );
         }
+        // No inline descriptions next to the titles any more.
+        assert!(
+            !text.contains("System Scan —"),
+            "descriptions left the rows"
+        );
+        // The composition hangs below the top edge, not glued to it.
+        assert!(art_row.unwrap_or(0) > 0, "art is vertically centered");
+        // The menu block shares one left edge: icons align across rows.
+        assert_eq!(scan_col, deploy_col, "menu items align as a block");
+        // The selected description is anchored to the bottom row.
+        assert_eq!(desc_row, Some(buf.area.height - 1));
         // Narrow terminals keep the original art size.
         assert!(!text.contains(&expand_art_2x(&MAIN_ART)[0]));
     }
