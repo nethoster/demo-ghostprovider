@@ -29,10 +29,10 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
 
 // --- palette (truecolor; terminals without RGB get the nearest ANSI match) ---
 pub(crate) const ACCENT: Color = Color::Rgb(64, 220, 255); // electric cyan — chrome/menu
@@ -82,6 +82,19 @@ pub(crate) const MAIN_MENU: &[(&str, &str, &str, Color)] = &[
         WARN_YELLOW,
     ),
 ];
+
+/// "GHOST PROVIDER" in the Pagga font — the exact three-line art the user
+/// picked in ~/Documents/style. Rendered verbatim: the "░" grid is part of
+/// the glyph layout, never trim or reflow it.
+const MAIN_ART: [&str; 3] = [
+    "░█▀▀░█░█░█▀█░█▀▀░▀█▀░░░█▀█░█▀▄░█▀█░█░█░▀█▀░█▀▄░█▀▀░█▀▄",
+    "░█░█░█▀█░█░█░▀▀█░░█░░░░█▀▀░█▀▄░█░█░▀▄▀░░█░░█░█░█▀▀░█▀▄",
+    "░▀▀▀░▀░▀░▀▀▀░▀▀▀░░▀░░░░▀░░░▀░▀░▀▀▀░░▀░░▀▀▀░▀▀░░▀▀▀░▀░▀",
+];
+
+/// The main menu is a launcher grid: this many button cells per row, with
+/// each item's name centered under its button. Arrow up/down jumps by a row.
+const MENU_COLS: usize = 4;
 
 // Hard bound on the deploy log held in memory. A heavy build (a SvelteKit +
 // wasm app, a large Python project) can emit tens of thousands of lines; the
@@ -432,6 +445,17 @@ pub fn run() -> anyhow::Result<()> {
     res
 }
 
+/// True when the controlling terminal vanished (deleted pts, crashed
+/// multiplexer, dead tmux pane). crossterm 0.28/0.29 fall into a 100% CPU
+/// spin when the tty read returns EIO — its error arm only special-cases
+/// WouldBlock/Interrupted and retries forever — so the loop notices the
+/// hangup itself: once the ctty's master side is gone, /dev/tty no longer
+/// opens (ENXIO). A healthy interactive session opens it every tick, which
+/// is one cheap open/close against an 80ms cadence.
+fn tty_hangup() -> bool {
+    std::fs::File::open("/dev/tty").is_err()
+}
+
 /// Minimum gap between expensive full repaints while the window is being
 /// resized. Dragging an edge emits dozens of Resize events per second; the
 /// 80ms draw loop already picks up the new size via autoresize, so one full
@@ -468,6 +492,11 @@ fn event_loop(
     // Last full repaint time (None = none yet this run).
     let mut last_repaint: Option<Instant> = None;
     loop {
+        // The terminal may have vanished under us; entering crossterm's read
+        // path on a dead tty pegs the CPU forever (see `tty_hangup`).
+        if tty_hangup() {
+            return exit_with_reconcile(app);
+        }
         while let Ok(msg) = app.rx.try_recv() {
             match msg {
                 Msg::ScanDone(seq, report) => {
@@ -2130,7 +2159,10 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
 
 fn move_main_selection(selected: &mut usize, key: KeyCode) {
     match key {
-        KeyCode::Up | KeyCode::Left => *selected = selected.saturating_sub(1),
+        // Grid semantics: up/down jump a whole row, left/right step one cell.
+        KeyCode::Up => *selected = selected.saturating_sub(MENU_COLS),
+        KeyCode::Down => *selected = (*selected + MENU_COLS).min(MAIN_MENU.len() - 1),
+        KeyCode::Left => *selected = selected.saturating_sub(1),
         _ => *selected = (*selected + 1).min(MAIN_MENU.len() - 1),
     }
 }
@@ -2711,7 +2743,6 @@ fn draw_header(f: &mut ratatui::Frame, area: ratatui::prelude::Rect) {
             "GHOSTPROVIDER",
             Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" · demo panel", Style::default().fg(DIM)),
     ];
 
     let version = env!("CARGO_PKG_VERSION");
@@ -2733,21 +2764,140 @@ fn draw_header(f: &mut ratatui::Frame, area: ratatui::prelude::Rect) {
 // --- main menu --------------------------------------------------------------
 
 fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected: usize) {
-    let list = List::new(MAIN_MENU.iter().enumerate().map(|(i, (icon, t, d, hue))| {
+    if area.width < 12 || area.height < 4 {
+        return;
+    }
+    let selected = selected.min(MAIN_MENU.len() - 1);
+    let (_, _, desc, hue) = MAIN_MENU[selected];
+
+    // Vertical budget: the button grid is mandatory; the brand block above
+    // and the selected-item description below degrade gracefully on short
+    // terminals.
+    let grid_h = 9u16; // box(3) + name(1) + gap(1) + box(3) + name(1)
+    let desc_room = area.height >= grid_h + 2; // one gap + one centered line
+    let grid_y = area.y + area.height - grid_h - if desc_room { 2 } else { 0 };
+    let top_room = grid_y.saturating_sub(area.y);
+
+    let mut y = area.y;
+    let centered = |f: &mut ratatui::Frame, y: u16, line: Line| {
+        f.render_widget(
+            Paragraph::new(line).alignment(Alignment::Center),
+            ratatui::prelude::Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            },
+        );
+    };
+    if top_room >= 6 {
+        for art in MAIN_ART {
+            centered(
+                f,
+                y,
+                Line::from(Span::styled(
+                    art,
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )),
+            );
+            y += 1;
+        }
+        centered(
+            f,
+            y,
+            Line::from(Span::styled(
+                "SYSTEM FOR AUTOMATED SELF-HOSTING",
+                Style::default().fg(BODY).add_modifier(Modifier::BOLD),
+            )),
+        );
+        y += 1;
+        centered(
+            f,
+            y,
+            Line::from(Span::styled("demo panel", Style::default().fg(DIM))),
+        );
+    } else if top_room >= 2 {
+        // Short screen: one brand line still says what this is.
+        centered(
+            f,
+            y,
+            Line::from(Span::styled(
+                "GHOST PROVIDER — SYSTEM FOR AUTOMATED SELF-HOSTING",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+        );
+        y += 1;
+        centered(
+            f,
+            y,
+            Line::from(Span::styled("demo panel", Style::default().fg(DIM))),
+        );
+    } else if top_room == 1 {
+        centered(
+            f,
+            y,
+            Line::from(Span::styled(
+                "GHOST PROVIDER",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )),
+        );
+    }
+
+    // Launcher grid: rounded buttons, icon inside, the item name centered
+    // under the button. The selected cell fills with its own hue.
+    let gap = 2u16;
+    let cell_w = (area.width.saturating_sub(3 * gap) / MENU_COLS as u16).clamp(10, 18);
+    let last_row = (MAIN_MENU.len() - 1) / MENU_COLS;
+    for (i, (icon, title, _, item_hue)) in MAIN_MENU.iter().enumerate() {
+        let row = i / MENU_COLS;
+        let col = i % MENU_COLS;
+        let in_row = if row == last_row {
+            MAIN_MENU.len() - last_row * MENU_COLS
+        } else {
+            MENU_COLS
+        };
+        // A partial last row centers under the full rows above it.
+        let row_w = in_row as u16 * cell_w + (in_row as u16 - 1) * gap;
+        let rx = area.x + area.width.saturating_sub(row_w) / 2;
+        let bx = rx + col as u16 * (cell_w + gap);
+        let by = grid_y + row as u16 * 5;
         let sel = i == selected;
-        let marker = if sel { " » " } else { "   " };
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                marker,
-                Style::default().fg(*hue).add_modifier(if sel {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-            ),
-            Span::styled(format!("{icon} "), Style::default().fg(*hue)),
-            Span::styled(
-                format!("{t} "),
+        let btn = ratatui::prelude::Rect {
+            x: bx,
+            y: by,
+            width: cell_w,
+            height: 3,
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(*item_hue).add_modifier(if sel {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            }))
+            .style(if sel {
+                Style::default().bg(*item_hue).fg(Color::Black)
+            } else {
+                Style::default()
+            });
+        let inner = block.inner(btn);
+        f.render_widget(block, btn);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                *icon,
+                Style::default()
+                    .fg(if sel { Color::Black } else { *item_hue })
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center),
+            inner,
+        );
+        // The name under the button may borrow half the gutter each side so
+        // long titles ("Deploy Service") stay on one line.
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                *title,
                 Style::default()
                     .fg(if sel { Color::White } else { BODY })
                     .add_modifier(if sel {
@@ -2755,15 +2905,26 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
                     } else {
                         Modifier::empty()
                     }),
-            ),
-            Span::styled(
-                format!("— {d}"),
-                Style::default().fg(if sel { *hue } else { DIM }),
-            ),
-        ]))
-    }))
-    .block(block("Menu", ACCENT));
-    f.render_widget(list, area);
+            )))
+            .alignment(Alignment::Center),
+            ratatui::prelude::Rect {
+                x: bx.saturating_sub(gap / 2),
+                y: by + 3,
+                width: cell_w + gap,
+                height: 1,
+            },
+        );
+    }
+    if desc_room {
+        centered(
+            f,
+            area.y + area.height - 1,
+            Line::from(Span::styled(
+                format!(" {desc} "),
+                Style::default().fg(hue).add_modifier(Modifier::BOLD),
+            )),
+        );
+    }
 }
 
 // --- system scan ------------------------------------------------------------
@@ -4493,7 +4654,7 @@ fn wizard_progress(current: usize) -> Line<'static> {
 fn hint_line(screen: &Screen) -> Line<'static> {
     let pairs: Vec<(&str, Color)> = match screen {
         Screen::Main { .. } => vec![
-            ("↑↓ select", ACCENT),
+            ("↑↓←→ select", ACCENT),
             ("Enter choose", OK_GREEN),
             ("q quit", MAGENTA),
         ],
@@ -4687,6 +4848,74 @@ mod tests {
                 "Logs"
             ]
         );
+    }
+
+    /// The brand art is the exact Pagga rendering picked in ~/Documents/style:
+    /// three equal-width lines, verbatim (the "░" grid is part of the glyphs).
+    #[test]
+    fn main_art_is_three_equal_pagga_lines() {
+        assert_eq!(MAIN_ART.len(), 3);
+        let w = MAIN_ART[0].chars().count();
+        assert!(w >= 50, "art should span a full headline, got {w} cols");
+        for line in MAIN_ART {
+            assert_eq!(line.chars().count(), w, "all art lines share one width");
+        }
+        assert!(MAIN_ART[0].starts_with("░█▀▀"), "starts with G");
+        assert!(MAIN_ART[0].ends_with("█▀▄"), "ends with R");
+    }
+
+    /// Arrows drive the launcher grid: up/down jump a row of MENU_COLS,
+    /// left/right step one cell; the last row clamps to the final item.
+    #[test]
+    fn main_menu_arrows_drive_the_button_grid() {
+        let mut s = 0usize;
+        move_main_selection(&mut s, KeyCode::Down);
+        assert_eq!(s, 4);
+        move_main_selection(&mut s, KeyCode::Up);
+        assert_eq!(s, 0);
+        move_main_selection(&mut s, KeyCode::Right);
+        assert_eq!(s, 1);
+        move_main_selection(&mut s, KeyCode::Left);
+        assert_eq!(s, 0);
+        move_main_selection(&mut s, KeyCode::Left);
+        assert_eq!(s, 0, "left saturates at the first cell");
+        let mut last = MAIN_MENU.len() - 1;
+        move_main_selection(&mut last, KeyCode::Down);
+        assert_eq!(last, MAIN_MENU.len() - 1, "down clamps on the last row");
+        move_main_selection(&mut last, KeyCode::Up);
+        assert_eq!(last, MAIN_MENU.len() - 1 - MENU_COLS);
+    }
+
+    /// The main screen really renders the Pagga art, the English subtitle,
+    /// the demo-panel mark, the button labels and the selected description.
+    #[test]
+    fn main_menu_screen_renders_art_subtitles_and_buttons() {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| draw_main_menu(f, f.area(), 2)).unwrap();
+        let buf = term.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        for expected in [
+            MAIN_ART[0],
+            "SYSTEM FOR AUTOMATED SELF-HOSTING",
+            "demo panel",
+            "System Scan",
+            "Deploy Service",
+            "My Services",
+            "Logs",
+            "deploy via GitHub URL or service.yaml", // selected item (2) description
+        ] {
+            assert!(
+                text.contains(expected),
+                "screen should contain {expected:?}"
+            );
+        }
     }
 
     /// Enter on the step-list screens advances (it used to open the inline
