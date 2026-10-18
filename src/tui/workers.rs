@@ -74,6 +74,7 @@ pub fn detect_url(url: &str) -> Result<DetectReady, String> {
         port: d.port,
         memory_max: d.memory_max,
         tasks_max: d.tasks_max,
+        build_env: d.build_env,
         detected: true,
         notes: d.notes,
         ..Default::default()

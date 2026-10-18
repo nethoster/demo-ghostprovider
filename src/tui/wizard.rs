@@ -34,6 +34,9 @@ pub struct Draft {
     pub port: String,
     pub memory_max: String,
     pub tasks_max: String,
+    /// Build-time env vars (name, value) carried into `build.env` —
+    /// auto-detected from `$env/static/public` imports for SvelteKit apps.
+    pub build_env: Vec<(String, String)>,
     /// True when steps came from stack detection (not profile defaults):
     /// the profile step keeps them unless the user picks another profile.
     pub detected: bool,
@@ -256,7 +259,7 @@ pub fn build_manifest(draft: &Draft) -> Result<ServiceManifest, String> {
                 .iter()
                 .map(|s| Step::Shell(s.clone()))
                 .collect(),
-            env: std::collections::BTreeMap::new(),
+            env: draft.build_env.iter().cloned().collect(),
         },
         run: crate::hoster::manifest::RunSpec {
             command: run_argv,

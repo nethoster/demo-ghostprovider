@@ -25,6 +25,10 @@ pub struct Detected {
     pub port: String,
     pub memory_max: String,
     pub tasks_max: String,
+    /// Build-time env vars auto-detected from `$env/static/public` imports
+    /// (SvelteKit): names from the source tree, values from the repo's own
+    /// env files. Empty for stacks without such imports.
+    pub build_env: Vec<(String, String)>,
     /// Why each guess was made / what must be verified by a human.
     pub notes: Vec<String>,
 }
@@ -180,6 +184,11 @@ fn detect_node(dir: &Path) -> Result<Detected, String> {
     if let Some((fw, _)) = framework {
         notes.push(format!("{fw} detected — port is a guess, verify it"));
     }
+    // SvelteKit apps import PUB_* from $env/static/public; the offline vite
+    // build fails when any of them is unset. Collect the names from the
+    // source tree and values from the repo's own env files.
+    let (build_env, env_notes) = detect_public_env(dir);
+    notes.extend(env_notes);
     Ok(Detected {
         profile: "bun".into(),
         prefetch,
@@ -188,6 +197,7 @@ fn detect_node(dir: &Path) -> Result<Detected, String> {
         port,
         memory_max: "384M".into(),
         tasks_max: "300".into(),
+        build_env,
         notes,
     })
 }
@@ -247,6 +257,7 @@ fn detect_python(dir: &Path) -> Result<Detected, String> {
         port,
         memory_max: "1024M".into(),
         tasks_max: "512".into(),
+        build_env: vec![],
         notes,
     })
 }
@@ -262,10 +273,187 @@ fn detect_go() -> Detected {
         port: "0".into(),
         memory_max: "1024M".into(),
         tasks_max: "512".into(),
+        build_env: vec![],
         notes: vec![
             "go modules detected — binary is built as ghost-server; change -o if yours differs"
                 .into(),
         ],
+    }
+}
+
+/// Build-time env vars for SvelteKit-style `$env/static/public` imports.
+///
+/// The offline vite build fails when any imported `PUB_*` name is unset, so
+/// detection scans the source tree for the imports and fills values from the
+/// repo's own env files (`.env.example` is the common template; real env
+/// files override it). Imported names with no value anywhere get an empty
+/// string plus a note — the review screen shows the result for editing.
+fn detect_public_env(dir: &Path) -> (Vec<(String, String)>, Vec<String>) {
+    const MAX_VARS: usize = 32;
+    /// Directories that never contain first-party source worth scanning.
+    const SKIP_DIRS: &[&str] = &[
+        "node_modules",
+        ".git",
+        "build",
+        "dist",
+        ".svelte-kit",
+        ".ghost-cache",
+        ".venv",
+        "target",
+        ".next",
+        ".nuxt",
+        ".output",
+        "vendor",
+    ];
+    let mut names = std::collections::BTreeSet::new();
+    collect_public_import_names(dir, SKIP_DIRS, &mut names, MAX_VARS);
+    if names.is_empty() {
+        return (vec![], vec![]);
+    }
+    // Values: .env.example is the template; .env.production and .env (when
+    // committed) override it, matching dotenv precedence.
+    let mut values = std::collections::BTreeMap::new();
+    for file in [".env.example", ".env.production", ".env"] {
+        merge_env_file(&dir.join(file), &mut values);
+    }
+    let mut notes = vec![];
+    let mut missing = vec![];
+    let mut out = Vec::new();
+    for name in names {
+        match values.get(&name) {
+            Some(v) => out.push((name, v.clone())),
+            None => {
+                missing.push(name.clone());
+                out.push((name, String::new()));
+            }
+        }
+    }
+    notes.push(format!(
+        "detected {} PUB_* build env var(s) from $env/static/public imports — review them on the last step",
+        out.len()
+    ));
+    if !missing.is_empty() {
+        notes.push(format!(
+            "no committed value for {} — set {} before deploying",
+            missing.len(),
+            missing.join(", ")
+        ));
+    }
+    (out, notes)
+}
+
+/// Recursively collect `PUB_*` identifiers imported from
+/// `$env/static/public` in source files under `dir`.
+fn collect_public_import_names(
+    dir: &Path,
+    skip_dirs: &[&str],
+    out: &mut std::collections::BTreeSet<String>,
+    max: usize,
+) {
+    if out.len() >= max {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if out.len() >= max {
+            return;
+        }
+        let path = entry.path();
+        let Ok(ft) = entry.file_type() else { continue };
+        if ft.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !skip_dirs.contains(&name.as_ref()) {
+                collect_public_import_names(&path, skip_dirs, out, max);
+            }
+        } else if ft.is_file() && is_source_file(&path) {
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            collect_import_names(&content, out, max);
+        }
+    }
+}
+
+fn is_source_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("ts" | "js" | "mjs" | "cjs" | "svelte" | "tsx" | "jsx")
+    )
+}
+
+/// Extract `PUB_*` names from `import { A, B } from "$env/static/public"`
+/// statements in `content`. Multi-line imports are handled by scanning
+/// backwards from each marker occurrence to the enclosing braces.
+fn collect_import_names(content: &str, out: &mut std::collections::BTreeSet<String>, max: usize) {
+    const MARKER: &str = "$env/static/public";
+    let mut rest = content;
+    while let Some(pos) = rest.find(MARKER) {
+        if out.len() >= max {
+            return;
+        }
+        let before = &rest[..pos];
+        if let Some(import_pos) = before.rfind("import") {
+            let stmt = &before[import_pos..];
+            if let (Some(open), Some(close)) = (stmt.rfind('{'), stmt.rfind('}'))
+                && open < close
+            {
+                for tok in stmt[open + 1..close].split(|c: char| c == ',' || c.is_whitespace()) {
+                    if out.len() >= max {
+                        return;
+                    }
+                    if tok.starts_with("PUB_")
+                        && tok.len() > 4
+                        && tok
+                            .chars()
+                            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                    {
+                        out.insert(tok.to_string());
+                    }
+                }
+            }
+        }
+        rest = &rest[pos + MARKER.len()..];
+    }
+}
+
+/// Parse `KEY=value` lines of one env file into `map` (later files
+/// override). Comments, blank lines, and malformed keys are skipped;
+/// surrounding quotes on values are stripped.
+fn merge_env_file(path: &Path, map: &mut std::collections::BTreeMap<String, String>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            continue;
+        }
+        let value = value.trim();
+        let value = if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            &value[1..value.len() - 1]
+        } else {
+            value
+        };
+        if value.len() <= 4096 && !value.contains('\n') {
+            map.insert(key.to_string(), value.to_string());
+        }
     }
 }
 
@@ -278,7 +466,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for (name, body) in files {
-            std::fs::write(dir.join(name), body).unwrap();
+            let path = dir.join(name);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, body).unwrap();
         }
         dir
     }
@@ -398,6 +590,187 @@ mod tests {
         let dir = tree("broken", &[("package.json", "{not json")]);
         let d = detect_tree(&dir).unwrap();
         assert_eq!(d.profile, "bun");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sveltekit_public_env_imports_are_detected_with_values() {
+        let dir = tree(
+            "svelte-env",
+            &[
+                (
+                    "package.json",
+                    r#"{"dependencies":{"@sveltejs/kit":"2.0.0"},"scripts":{"build":"vite build"}}"#,
+                ),
+                ("bun.lock", "x"),
+                (
+                    "src/lib/util/consts.ts",
+                    r#"import { PUB_ENV, PUB_HOSTNAME } from "$env/static/public";
+export const X = PUB_ENV;"#,
+                ),
+                (
+                    "src/routes/+layout.svelte",
+                    r#"<script>
+import { PUB_PLAUSIBLE_URL } from "$env/static/public";
+</script>"#,
+                ),
+                (
+                    ".env.example",
+                    "PUB_ENV=production\nPUB_HOSTNAME=localhost\nPUB_PLAUSIBLE_URL=\n",
+                ),
+            ],
+        );
+        let d = detect_tree(&dir).unwrap();
+        let env: std::collections::BTreeMap<&str, &str> = d
+            .build_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(env.len(), 3, "{:?}", d.build_env);
+        assert_eq!(env["PUB_ENV"], "production");
+        assert_eq!(env["PUB_HOSTNAME"], "localhost");
+        assert_eq!(env["PUB_PLAUSIBLE_URL"], "");
+        assert!(
+            d.notes
+                .iter()
+                .any(|n| n.contains("PUB_") && n.contains("env")),
+            "{:?}",
+            d.notes
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn public_env_import_without_committed_value_gets_empty_and_note() {
+        let dir = tree(
+            "svelte-missing",
+            &[
+                (
+                    "package.json",
+                    r#"{"dependencies":{"@sveltejs/kit":"2.0.0"},"scripts":{"build":"vite build"}}"#,
+                ),
+                ("bun.lock", "x"),
+                (
+                    "src/app.ts",
+                    "import { PUB_SECRET_THING } from \"$env/static/public\";\n",
+                ),
+            ],
+        );
+        let d = detect_tree(&dir).unwrap();
+        assert_eq!(d.build_env.len(), 1, "{:?}", d.build_env);
+        assert_eq!(d.build_env[0].0, "PUB_SECRET_THING");
+        assert_eq!(d.build_env[0].1, "");
+        assert!(
+            d.notes
+                .iter()
+                .any(|n| n.contains("PUB_SECRET_THING") && n.contains("no committed value")),
+            "{:?}",
+            d.notes
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_bun_app_has_no_detected_build_env() {
+        let dir = tree(
+            "plain-bun",
+            &[
+                ("package.json", r#"{"scripts":{"build":"tsc"}}"#),
+                ("bun.lock", "x"),
+                ("src/index.ts", "console.log('hi');\n"),
+            ],
+        );
+        let d = detect_tree(&dir).unwrap();
+        assert!(d.build_env.is_empty(), "{:?}", d.build_env);
+        assert!(
+            !d.notes.iter().any(|n| n.contains("build env")),
+            "{:?}",
+            d.notes
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn env_file_precedence_production_over_example() {
+        let dir = tree(
+            "svelte-precedence",
+            &[
+                (
+                    "package.json",
+                    r#"{"dependencies":{"@sveltejs/kit":"2.0.0"},"scripts":{"build":"vite build"}}"#,
+                ),
+                ("bun.lock", "x"),
+                (
+                    "src/a.ts",
+                    "import { PUB_ENV } from \"$env/static/public\";\n",
+                ),
+                (".env.example", "PUB_ENV=development\n"),
+                (".env.production", "PUB_ENV=production\n"),
+            ],
+        );
+        let d = detect_tree(&dir).unwrap();
+        assert_eq!(d.build_env, vec![("PUB_ENV".into(), "production".into())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn multiline_import_and_quoted_env_values() {
+        let dir = tree(
+            "svelte-multiline",
+            &[
+                (
+                    "package.json",
+                    r#"{"dependencies":{"@sveltejs/kit":"2.0.0"},"scripts":{"build":"vite build"}}"#,
+                ),
+                ("bun.lock", "x"),
+                (
+                    "src/b.ts",
+                    "import {\n  PUB_ALPHA,\n  PUB_BETA,\n} from \"$env/static/public\";\n",
+                ),
+                (
+                    ".env.example",
+                    "PUB_ALPHA='hello world'\nPUB_BETA=\"quoted\"\n# comment\nBAD LINE\n",
+                ),
+            ],
+        );
+        let d = detect_tree(&dir).unwrap();
+        let env: std::collections::BTreeMap<&str, &str> = d
+            .build_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(env["PUB_ALPHA"], "hello world");
+        assert_eq!(env["PUB_BETA"], "quoted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_modules_are_not_scanned_for_imports() {
+        let dir = tree(
+            "svelte-skip",
+            &[
+                (
+                    "package.json",
+                    r#"{"dependencies":{"@sveltejs/kit":"2.0.0"},"scripts":{"build":"vite build"}}"#,
+                ),
+                ("bun.lock", "x"),
+                (
+                    "src/real.ts",
+                    "import { PUB_REAL } from \"$env/static/public\";\n",
+                ),
+                (
+                    "node_modules/dep/index.js",
+                    "import { PUB_FROM_DEP } from \"$env/static/public\";\n",
+                ),
+            ],
+        );
+        let d = detect_tree(&dir).unwrap();
+        assert_eq!(
+            d.build_env,
+            vec![("PUB_REAL".into(), String::new())],
+            "{:?}",
+            d.build_env
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
