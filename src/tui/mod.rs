@@ -130,22 +130,14 @@ fn expand_art(art: &[&str; 3], n: u16) -> Vec<String> {
     out
 }
 
-/// Blank rows between menu items at scale n: the list spreads out with the
-/// art instead of leaving a giant banner above a cramped 1× list.
-fn menu_gap_at(n: u16) -> u16 {
-    n.saturating_sub(1)
-}
-
 /// Largest scale (1..=ART_MAX_SCALE) whose art fits the terminal both ways:
 /// width must hold `base × n`, and height must hold the whole composition
-/// (art 3n + subtitle 3 + gap/menu with its inter-item gaps + gap/description 2).
+/// (art 3n + subtitle 3 + gap/menu 2+7 + gap/description 2). The layout
+/// itself never changes with the window — only this scale does.
 fn art_scale(area: ratatui::prelude::Rect) -> u16 {
     let base_w = MAIN_ART[0].chars().count() as u16;
     let mut n = (area.width / base_w).clamp(1, ART_MAX_SCALE);
-    let content_h = |n: u16| {
-        let menu_rows = MAIN_MENU.len() as u16 + (MAIN_MENU.len() as u16 - 1) * menu_gap_at(n);
-        3 * n + 3 + 2 + menu_rows + 2
-    };
+    let content_h = |n: u16| 3 * n + 3 + 2 + MAIN_MENU.len() as u16 + 2;
     while n > 1 && content_h(n) > area.height {
         n -= 1;
     }
@@ -2850,11 +2842,10 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
     let selected = selected.min(MAIN_MENU.len() - 1);
 
     // Scale the Pagga art to the terminal (1×–4×): the largest size whose
-    // width and the whole composition's height still fit. Menu items gain
-    // blank rows between them at larger scales, so the whole composition
-    // grows with the terminal instead of a giant banner over a tiny list.
+    // width and the whole composition's height still fit. The layout below
+    // is fixed — same rows, same spacing, packed menu — at every scale;
+    // only the banner grows or shrinks with the window.
     let art = expand_art(&MAIN_ART, art_scale(area));
-    let menu_gap = menu_gap_at((art.len() / 3) as u16);
 
     // The whole composition — art, subtitle, mark, menu — is one block,
     // centered in the body both ways; the selected description anchors the
@@ -2863,8 +2854,7 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
     // between brand and menu (which pushes the menu down), and below the
     // menu before the bottom description.
     let brand_h = art.len() as u16 + 3; // art + subtitle + mark + version
-    let menu_h = MAIN_MENU.len() as u16 + (MAIN_MENU.len() as u16 - 1) * menu_gap;
-    let content_h = brand_h + 2 + menu_h; // gap + menu
+    let content_h = brand_h + 2 + MAIN_MENU.len() as u16; // gap + menu
     let slack = area.height.saturating_sub(content_h + 2); // + gap/desc rows
     let mut y = area.y + slack / 3;
 
@@ -2944,7 +2934,7 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
                 height: 1,
             },
         );
-        y += 1 + menu_gap;
+        y += 1;
     }
 
     // The selected item's description: bottom-anchored, centered.
@@ -5028,8 +5018,7 @@ mod tests {
     }
 
     /// The scale follows the terminal: wider gets bigger (up to 4×), but a
-    /// short terminal caps the art so the menu (including its inter-item
-    /// gaps at larger scales) still fits.
+    /// short terminal caps the art so the (always packed) menu still fits.
     #[test]
     fn art_scale_grows_with_width_and_shrinks_with_height() {
         let s = |w, h| art_scale(ratatui::prelude::Rect::new(0, 0, w, h));
@@ -5037,9 +5026,6 @@ mod tests {
         assert_eq!(s(114, 40), 2, "2x width fits at 114");
         assert_eq!(s(200, 50), 3, "3x width fits at 171+");
         assert_eq!(s(250, 60), 4, "wide: 4x");
-        // 22 rows: the 2x composition with menu gaps (26 rows) does not
-        // fit, so the scale drops to 1x even though the width allows more.
-        assert_eq!(s(114, 22), 1, "menu gaps count into the height cap");
         assert_eq!(s(250, 18), 1, "short: 1x even when wide");
         assert_eq!(s(50, 10), 1, "tiny: never below 1x");
     }
@@ -5159,6 +5145,33 @@ mod tests {
             text.contains(&expand_art(&MAIN_ART, 4)[0]),
             "4x art on 250x50"
         );
+    }
+
+    /// Style is constant across window sizes: menu items stay packed
+    /// back-to-back at every art scale — resizing grows/shrinks the banner
+    /// and never re-spaces the list.
+    #[test]
+    fn menu_stays_packed_at_every_art_scale() {
+        use ratatui::backend::TestBackend;
+        for (w, h) in [(100u16, 30u16), (120, 36), (200, 50), (250, 50)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw_main_menu(f, f.area(), 0)).unwrap();
+            let buf = term.backend().buffer();
+            let mut scan: Option<(u16, usize)> = None;
+            let mut next: Option<(u16, usize)> = None;
+            for y in 0..buf.area.height {
+                let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                if let Some(col) = row.find("@ System Scan") {
+                    scan = Some((y, col));
+                } else if let Some(col) = row.find("# Self-Hosting") {
+                    next = Some((y, col));
+                }
+            }
+            let (sy, sx) = scan.unwrap_or_else(|| panic!("{w}x{h}: System Scan missing"));
+            let (ny, nx) = next.unwrap_or_else(|| panic!("{w}x{h}: Self-Hosting missing"));
+            assert_eq!(ny, sy + 1, "{w}x{h}: menu items must be packed");
+            assert_eq!(nx, sx, "{w}x{h}: icons stay on one left edge");
+        }
     }
 
     /// Two consecutive frozen heartbeat windows fire the stall exit;
