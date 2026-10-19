@@ -451,6 +451,14 @@ pub(crate) fn start_target_deployment(tx: Sender<Msg>, target: DeployTarget) {
             append_deploy_log(&line);
             let _ = log_tx.send(Msg::Log(line));
         };
+        // The deploy about to run is the code loaded when this panel started:
+        // if a newer binary was installed since, the log must say so before
+        // the first build step — old code is the reason deploys "randomly" fail.
+        if crate::paths::binary_is_stale() {
+            log(
+                "! OUTDATED panel build — a newer binary is installed; this deploy runs the OLD code. Relaunch the panel, then redeploy.".to_string(),
+            );
+        }
         // The deploy pipeline (clone/git/rawfetch) reports diagnostics via
         // eprintln!() to the process stderr. During the TUI that stderr is the
         // terminal, so those lines would leak raw bytes over the alternate

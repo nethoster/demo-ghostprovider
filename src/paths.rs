@@ -84,3 +84,67 @@ pub fn user_unit_dir() -> PathBuf {
         .unwrap_or_else(|| home().join(".config"));
     cfg.join("systemd/user")
 }
+
+/// True when the binary this process is running differs from the file that
+/// now sits at its path — i.e. a newer build was installed (mv-replaced)
+/// while this process stayed up, so every deploy it runs is old code with
+/// the already-fixed bugs still in it. The running image on Linux is
+/// /proc/self/exe, readable even after its directory entry was replaced
+/// (the readlink then carries a trailing " (deleted)").
+pub fn binary_is_stale() -> bool {
+    let Ok(running) = std::fs::metadata("/proc/self/exe") else {
+        return false;
+    };
+    let Ok(link) = std::fs::read_link("/proc/self/exe") else {
+        return false;
+    };
+    let raw = link.to_string_lossy();
+    let path = raw.strip_suffix(" (deleted)").unwrap_or(raw.as_ref());
+    let Ok(disk) = std::fs::metadata(path) else {
+        return false;
+    };
+    stale_meta(&running, &disk)
+}
+
+/// Whether the on-disk file is a different build than the running image:
+/// a different inode (the install path replaces via rename), or the same
+/// inode edited in place (size or mtime moved).
+pub(crate) fn stale_meta(running: &std::fs::Metadata, disk: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    running.ino() != disk.ino() || running.len() != disk.len() || running.mtime() != disk.mtime()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_meta_sees_replacement_and_ignores_same_file() {
+        let dir = std::env::temp_dir().join(format!("gp-stale-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("bin");
+
+        // Same file, freshly stat'ed twice: the launch case — not stale.
+        std::fs::write(&f, "build-one").unwrap();
+        let running = std::fs::metadata(&f).unwrap();
+        assert!(!stale_meta(&running, &std::fs::metadata(&f).unwrap()));
+
+        // In-place overwrite (same inode, new bytes): stale.
+        std::fs::write(&f, "build-two, but longer").unwrap();
+        assert!(stale_meta(&running, &std::fs::metadata(&f).unwrap()));
+
+        // Rename-replace: a fresh inode — exactly what `mv … .new …` does
+        // when a new build is installed over the running path.
+        std::fs::write(dir.join("bin.new"), "other").unwrap();
+        std::fs::rename(dir.join("bin.new"), &f).unwrap();
+        assert!(stale_meta(&running, &std::fs::metadata(&f).unwrap()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn freshly_launched_process_is_not_stale() {
+        // The test binary runs straight from disk at its own path.
+        assert!(!binary_is_stale());
+    }
+}

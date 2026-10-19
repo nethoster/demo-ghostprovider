@@ -1076,7 +1076,10 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             Ok(target) => {
                                 app.screen = Screen::Confirm {
                                     target,
-                                    yes_selected: true,
+                                    // An outdated running build opens the gate
+                                    // on [N]o: proceeding means deploying old
+                                    // code with the known failures still in it.
+                                    yes_selected: !crate::paths::binary_is_stale(),
                                 };
                             }
                             Err(e) => *error = Some(e),
@@ -3338,6 +3341,23 @@ fn draw_confirm(
             ("Confirm Deployment", " — deploy")
         }
     };
+    // Outdated running build: the gate says so before [Y]es can be pressed —
+    // the most likely moment the user would otherwise repeat a failed deploy.
+    if crate::paths::binary_is_stale() {
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            " ⚠ this panel runs an OUTDATED build — the fixed binary is on disk.",
+            Style::default().fg(ERR_RED).add_modifier(Modifier::BOLD),
+        )));
+        text.push(Line::from(Span::styled(
+            " Deploying now runs the old code (known deploy failures stay).",
+            Style::default().fg(WARN_YELLOW),
+        )));
+        text.push(Line::from(Span::styled(
+            " Quit (q) and relaunch the panel, then deploy again.",
+            Style::default().fg(DIM),
+        )));
+    }
     text.extend([
         Line::from(""),
         Line::from(choice_spans("[Y]es", yes_label, OK_GREEN, yes_selected)),
@@ -4739,7 +4759,7 @@ fn wizard_progress(current: usize) -> Line<'static> {
 // --- hint bar ---------------------------------------------------------------
 
 fn hint_line(screen: &Screen) -> Line<'static> {
-    let pairs: Vec<(&str, Color)> = match screen {
+    let pairs: Vec<(&'static str, Color)> = match screen {
         Screen::Main { .. } => vec![
             ("↑↓ select", ACCENT),
             ("Enter choose", OK_GREEN),
@@ -4872,6 +4892,15 @@ fn hint_line(screen: &Screen) -> Line<'static> {
             ("Esc back", WARN_YELLOW),
         ],
     };
+    // Mid-deploy and the confirm dialog keep their own hints: the dialog
+    // already carries the full outdated-build warning (plus the nav keys),
+    // and relaunching mid-deploy would kill the running pipeline.
+    let stale = crate::paths::binary_is_stale()
+        && !matches!(
+            screen,
+            Screen::Deploy { done: None, .. } | Screen::Confirm { .. }
+        );
+    let pairs = stale_hint_pairs(pairs, stale);
     let mut spans: Vec<Span> = Vec::new();
     for (i, (text, color)) in pairs.iter().enumerate() {
         if i > 0 {
@@ -4883,6 +4912,17 @@ fn hint_line(screen: &Screen) -> Line<'static> {
         ));
     }
     Line::from(spans)
+}
+
+/// A stale running build replaces the whole hint bar: while the panel is
+/// running old code, "relaunch" beats every navigation hint. Fresh builds
+/// pass the per-screen hints through untouched.
+fn stale_hint_pairs(pairs: Vec<(&'static str, Color)>, stale: bool) -> Vec<(&'static str, Color)> {
+    if stale {
+        vec![("⟳ newer build on disk — relaunch panel", ERR_RED)]
+    } else {
+        pairs
+    }
 }
 
 fn block(title: &str, color: Color) -> Block<'_> {
@@ -4898,6 +4938,21 @@ fn block(title: &str, color: Color) -> Block<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The hint bar collapses to the relaunch notice only on a stale build;
+    /// a fresh build must keep the per-screen navigation hints.
+    #[test]
+    fn stale_hint_replaces_the_bar_but_fresh_keeps_it() {
+        let base = vec![("Enter choose", OK_GREEN), ("q quit", MAGENTA)];
+        let fresh = stale_hint_pairs(base.clone(), false);
+        assert_eq!(fresh.len(), 2);
+        assert_eq!(fresh[0].0, "Enter choose");
+
+        let stale = stale_hint_pairs(base, true);
+        assert_eq!(stale.len(), 1);
+        assert!(stale[0].0.contains("relaunch"));
+        assert_eq!(stale[0].1, ERR_RED);
+    }
 
     /// The menu is the single source of truth: five items, Add Service last.
     /// Navigation caps derive from MAIN_MENU so this guards desync.

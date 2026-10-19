@@ -443,7 +443,9 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             Ok(target) => {
                                 app.screen = Screen::Confirm {
                                     target,
-                                    yes_selected: true,
+                                    // Outdated running build: open on [N]o —
+                                    // deploying now runs old code.
+                                    yes_selected: !crate::paths::binary_is_stale(),
                                 };
                             }
                             Err(e) => *error = Some(e),
@@ -1249,6 +1251,18 @@ fn draw_confirm(
             ("Confirm Deployment", " — deploy")
         }
     };
+    // Outdated running build: say it before [Y]es can be pressed.
+    if crate::paths::binary_is_stale() {
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            " ⚠ this panel runs an OUTDATED build — the fixed binary is on disk.",
+            Style::default().fg(DIM_RED).add_modifier(Modifier::BOLD),
+        )));
+        text.push(Line::from(Span::styled(
+            " Quit (q) and relaunch the panel, then deploy again.",
+            Style::default().fg(DIM),
+        )));
+    }
     text.extend([
         Line::from(""),
         Line::from(choice_spans("[Y]es", yes_label, RED, yes_selected)),
@@ -1799,6 +1813,18 @@ fn hint_line(screen: &Screen) -> Line<'static> {
             ("↑↓ scroll", RED),
             ("Esc back", RED),
         ],
+    };
+    // Outdated running build: the bar collapses to the relaunch notice
+    // (mid-deploy and the confirm dialog keep their own hints).
+    let stale = crate::paths::binary_is_stale()
+        && !matches!(
+            screen,
+            Screen::Deploy { done: None, .. } | Screen::Confirm { .. }
+        );
+    let pairs: Vec<(&'static str, Color)> = if stale {
+        vec![("⟳ newer build on disk — relaunch panel", RED)]
+    } else {
+        pairs
     };
     if pairs.is_empty() {
         return Line::from(vec![Span::styled("", Style::default().bg(BG))]);
