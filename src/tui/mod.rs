@@ -96,30 +96,56 @@ const MAIN_ART: [&str; 3] = [
 /// which fills an ultrawide terminal without outgrowing typical heights.
 const ART_MAX_SCALE: u16 = 4;
 
-/// Repeat each Pagga cell n×n terminal cells: the same letterforms the
-/// user picked, at any scale.
+/// Repeat each Pagga cell into an n×n block: the same letterforms, at any
+/// scale. At 1× the art is rendered verbatim — the half-block ▀/▄ glyphs
+/// are part of the letterforms. At ≥2× the half-blocks are decomposed into
+/// full ░/█ blocks (a true pixel zoom): naively repeating a ▀ row would
+/// stack top-half glyphs n times and stripe the letterforms with
+/// comb-like gaps.
 fn expand_art(art: &[&str; 3], n: u16) -> Vec<String> {
-    let n = n.max(1) as usize;
+    let n = n.max(1);
+    if n == 1 {
+        return art.iter().map(|l| l.to_string()).collect();
+    }
+    let n = n as usize;
+    let ink_rows = n.div_ceil(2); // top half of an ▀ cell (bottom half of ▄)
     let mut out = Vec::with_capacity(3 * n);
     for line in art {
-        let scaled: String = line
-            .chars()
-            .flat_map(|c| std::iter::repeat_n(c, n))
-            .collect();
-        for _ in 0..n {
-            out.push(scaled.clone());
+        for sub in 0..n {
+            let scaled: String = line
+                .chars()
+                .flat_map(|c| {
+                    let fill = match c {
+                        '█' => '█',
+                        '▀' if sub < ink_rows => '█',
+                        '▄' if sub >= ink_rows => '█',
+                        _ => '░',
+                    };
+                    std::iter::repeat_n(fill, n)
+                })
+                .collect();
+            out.push(scaled);
         }
     }
     out
 }
 
+/// Blank rows between menu items at scale n: the list spreads out with the
+/// art instead of leaving a giant banner above a cramped 1× list.
+fn menu_gap_at(n: u16) -> u16 {
+    n.saturating_sub(1)
+}
+
 /// Largest scale (1..=ART_MAX_SCALE) whose art fits the terminal both ways:
 /// width must hold `base × n`, and height must hold the whole composition
-/// (art 3n + subtitle 3 + gap/menu 2+7 + gap/description 2).
+/// (art 3n + subtitle 3 + gap/menu with its inter-item gaps + gap/description 2).
 fn art_scale(area: ratatui::prelude::Rect) -> u16 {
     let base_w = MAIN_ART[0].chars().count() as u16;
     let mut n = (area.width / base_w).clamp(1, ART_MAX_SCALE);
-    let content_h = |n: u16| 3 * n + 3 + 2 + MAIN_MENU.len() as u16 + 2;
+    let content_h = |n: u16| {
+        let menu_rows = MAIN_MENU.len() as u16 + (MAIN_MENU.len() as u16 - 1) * menu_gap_at(n);
+        3 * n + 3 + 2 + menu_rows + 2
+    };
     while n > 1 && content_h(n) > area.height {
         n -= 1;
     }
@@ -2824,8 +2850,11 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
     let selected = selected.min(MAIN_MENU.len() - 1);
 
     // Scale the Pagga art to the terminal (1×–4×): the largest size whose
-    // width and the whole composition's height still fit.
+    // width and the whole composition's height still fit. Menu items gain
+    // blank rows between them at larger scales, so the whole composition
+    // grows with the terminal instead of a giant banner over a tiny list.
     let art = expand_art(&MAIN_ART, art_scale(area));
+    let menu_gap = menu_gap_at((art.len() / 3) as u16);
 
     // The whole composition — art, subtitle, mark, menu — is one block,
     // centered in the body both ways; the selected description anchors the
@@ -2834,7 +2863,8 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
     // between brand and menu (which pushes the menu down), and below the
     // menu before the bottom description.
     let brand_h = art.len() as u16 + 3; // art + subtitle + mark + version
-    let content_h = brand_h + 2 + MAIN_MENU.len() as u16; // gap + menu
+    let menu_h = MAIN_MENU.len() as u16 + (MAIN_MENU.len() as u16 - 1) * menu_gap;
+    let content_h = brand_h + 2 + menu_h; // gap + menu
     let slack = area.height.saturating_sub(content_h + 2); // + gap/desc rows
     let mut y = area.y + slack / 3;
 
@@ -2914,7 +2944,7 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
                 height: 1,
             },
         );
-        y += 1;
+        y += 1 + menu_gap;
     }
 
     // The selected item's description: bottom-anchored, centered.
@@ -4950,7 +4980,10 @@ mod tests {
         assert_eq!(last, MAIN_MENU.len() - 1, "down clamps at the last item");
     }
 
-    /// The scaled art is the same letterforms at n×n cells per glyph.
+    /// The scaled art is the same letterforms at n×n cells per glyph. At 1×
+    /// it is verbatim (half-blocks intact); at ≥2× the half-blocks are
+    /// decomposed into full ░/█ blocks so vertically stacked rows never
+    /// stripe the letterforms with comb-like gaps.
     #[test]
     fn pagga_art_scales_to_n_times_the_size() {
         for n in 1..=4u16 {
@@ -4958,13 +4991,45 @@ mod tests {
             assert_eq!(big.len(), 3 * n as usize);
             let w = MAIN_ART[0].chars().count() * n as usize;
             assert_eq!(big[0].chars().count(), w);
-            assert_eq!(big[0], big[n as usize - 1], "each line repeats n times");
             assert!(big[0].starts_with(&"░".repeat(n as usize)), "G scaled");
+            if n == 1 {
+                assert_eq!(big[0], MAIN_ART[0], "1x is verbatim");
+                continue;
+            }
+            // No half-block glyphs survive the zoom: only ░/█ cells, so a
+            // terminal renders every row fully opaque or fully empty.
+            for row in &big {
+                assert!(
+                    row.chars().all(|c| c == '░' || c == '█'),
+                    "scaled art must be ░/█ only, got {row:?}"
+                );
+            }
+            // ▀ (source row 0, col 2) splits into ink on the top rows and
+            // background on the bottom rows of its n-row block — the
+            // pixel-zoom semantics, not n copies of the top-half glyph.
+            // Full cells (█ at col 1) fill the whole block instead.
+            assert_eq!(big[0].chars().nth(n as usize), Some('█'), "█ fills top");
+            assert_eq!(
+                big[n as usize - 1].chars().nth(n as usize),
+                Some('█'),
+                "█ fills bottom"
+            );
+            assert_eq!(
+                big[0].chars().nth(2 * n as usize),
+                Some('█'),
+                "▀ ink on top"
+            );
+            assert_eq!(
+                big[n as usize - 1].chars().nth(2 * n as usize),
+                Some('░'),
+                "▀ background on the bottom"
+            );
         }
     }
 
     /// The scale follows the terminal: wider gets bigger (up to 4×), but a
-    /// short terminal caps the art so the menu still fits.
+    /// short terminal caps the art so the menu (including its inter-item
+    /// gaps at larger scales) still fits.
     #[test]
     fn art_scale_grows_with_width_and_shrinks_with_height() {
         let s = |w, h| art_scale(ratatui::prelude::Rect::new(0, 0, w, h));
@@ -4972,6 +5037,9 @@ mod tests {
         assert_eq!(s(114, 40), 2, "2x width fits at 114");
         assert_eq!(s(200, 50), 3, "3x width fits at 171+");
         assert_eq!(s(250, 60), 4, "wide: 4x");
+        // 22 rows: the 2x composition with menu gaps (26 rows) does not
+        // fit, so the scale drops to 1x even though the width allows more.
+        assert_eq!(s(114, 22), 1, "menu gaps count into the height cap");
         assert_eq!(s(250, 18), 1, "short: 1x even when wide");
         assert_eq!(s(50, 10), 1, "tiny: never below 1x");
     }
