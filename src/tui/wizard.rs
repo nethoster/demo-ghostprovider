@@ -162,11 +162,13 @@ pub fn check_git(git: &str) -> Result<(), String> {
 
 pub fn check_commit(commit: &str) -> Result<(), String> {
     let t = commit.trim();
-    if t.len() == 40 && t.bytes().all(|b| b.is_ascii_hexdigit()) {
-        Ok(())
-    } else {
-        Err("commit must be the full 40-hex SHA (git ls-remote <url> HEAD)".into())
+    if crate::hoster::manifest::is_full_sha(t) {
+        return Ok(());
     }
+    if crate::hoster::manifest::valid_ref_name(t).is_ok() {
+        return Ok(());
+    }
+    Err("must be a full 40-hex commit SHA or a branch name (e.g. main)".into())
 }
 
 pub fn check_port(port: &str) -> Result<u16, String> {
@@ -428,7 +430,9 @@ mod tests {
         assert!(check_git("https://github.com/o/n.git").is_ok());
         assert!(check_git("http://github.com/o/n").is_err());
         assert!(check_commit(&"a".repeat(40)).is_ok());
-        assert!(check_commit("abc").is_err());
+        assert!(check_commit("main").is_ok());
+        assert!(check_commit("a b").is_err());
+        assert!(check_commit("").is_err());
         assert_eq!(check_port("0"), Ok(0));
         assert!(check_port("80").is_err());
         assert!(check_memory("1G").is_ok());

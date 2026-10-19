@@ -17,9 +17,11 @@ pub struct DemoRecipe {
     pub service_name: &'static str,
     pub description: &'static str,
     pub display_name: &'static str,
-    /// Pinned commit SHA that a deployment checks out after cloning, so a
-    /// recipe never silently tracks whatever `main`/`master` moved to at
-    /// build time (anti-TOFU). Bumped consciously when a recipe is updated.
+    /// Version the deployment checks out: either a full 40-hex commit SHA
+    /// (exact pin, anti-TOFU) or a branch/tag name whose tip is resolved to
+    /// a SHA at the start of each deploy (for upstreams that force-push,
+    /// where a static pin would go stale). Either way the build is of one
+    /// exact resolved commit — never a moving target mid-build.
     pub commit: &'static str,
     pub pre_build: &'static [&'static str],
     pub build_steps: &'static [&'static str],

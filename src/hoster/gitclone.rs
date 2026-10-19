@@ -312,6 +312,65 @@ pub fn pinned_sha(dir: &Path) -> Option<String> {
     super::rawfetch::pinned_sha(dir)
 }
 
+/// Resolve `refname` (a branch or tag name) to the 40-hex SHA it currently
+/// points at upstream, via `git ls-remote`. Used when a manifest tracks a
+/// branch instead of pinning: the tip is resolved once per deploy, then the
+/// deployment proceeds exactly as if that SHA had been pinned — the
+/// materializer and the anti-TOFU check only ever see the resolved commit.
+pub fn resolve_ref(url: &str, refname: &str) -> anyhow::Result<String> {
+    let askpass = write_askpass()?;
+    let env = git_env(askpass.as_deref());
+    let args = [
+        "ls-remote".to_string(),
+        url.to_string(),
+        format!("refs/heads/{refname}"),
+        format!("refs/tags/{refname}"),
+        refname.to_string(),
+    ];
+    let out = run_git_with_timeout(&args, &env, Duration::from_secs(60));
+    cleanup_askpass(askpass.as_deref());
+    let Some(out) = out else {
+        anyhow::bail!("git ls-remote failed to run");
+    };
+    if !out.status.success() {
+        anyhow::bail!(
+            "git ls-remote: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    pick_sha(&stdout, refname).ok_or_else(|| anyhow::anyhow!("no ref '{refname}' found upstream"))
+}
+
+/// Pure `git ls-remote` stdout parser: prefer the heads match, then a peeled
+/// tag (`^{}`), then the tag itself, then a bare refname line. Only 40-hex
+/// object ids count.
+fn pick_sha(ls_remote_stdout: &str, refname: &str) -> Option<String> {
+    let head_ref = format!("refs/heads/{refname}");
+    let tag_ref = format!("refs/tags/{refname}");
+    let peeled_ref = format!("{tag_ref}^{{}}");
+    let (mut head, mut peeled, mut tag, mut bare) = (None, None, None, None);
+    for line in ls_remote_stdout.lines() {
+        let mut it = line.split_whitespace();
+        let (Some(sha), Some(name)) = (it.next(), it.next()) else {
+            continue;
+        };
+        if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        if name == head_ref {
+            head = Some(sha.to_string());
+        } else if name == peeled_ref {
+            peeled = Some(sha.to_string());
+        } else if name == tag_ref {
+            tag = Some(sha.to_string());
+        } else if name == refname {
+            bare = Some(sha.to_string());
+        }
+    }
+    head.or(peeled).or(tag).or(bare)
+}
+
 fn tarball_fallback(url: &str, dest: &Path) -> CloneStatus {
     let base = url.trim_end_matches(".git").trim_end_matches('/');
     let candidates = [
@@ -684,5 +743,39 @@ mod tests {
         assert_eq!(pinned_sha(&dir), None, "blank marker means unpinned");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pick_sha_prefers_head_then_peeled_tag_then_tag_then_bare() {
+        let head = "f5ecdec90d52fa84d5204fb59bb8da7d31e3704a";
+        let peeled = "1111111111111111111111111111111111111111";
+        let tag = "2222222222222222222222222222222222222222";
+        let bare = "3333333333333333333333333333333333333333";
+
+        // heads wins over everything.
+        let out = format!(
+            "{tag}\trefs/tags/main\n{bare}\tmain\n{peeled}\trefs/tags/main^{{}}\n{head}\trefs/heads/main\n"
+        );
+        assert_eq!(pick_sha(&out, "main").as_deref(), Some(head));
+
+        // Peeled tag beats the lightweight tag and a bare line.
+        let out = format!("{tag}\trefs/tags/main\n{peeled}\trefs/tags/main^{{}}\n");
+        assert_eq!(pick_sha(&out, "main").as_deref(), Some(peeled));
+
+        // Bare tag when nothing is peeled.
+        let out = format!("{tag}\trefs/tags/main\n");
+        assert_eq!(pick_sha(&out, "main").as_deref(), Some(tag));
+
+        // Bare refname line (no refs/ prefix).
+        let out = format!("{bare}\tmain\n");
+        assert_eq!(pick_sha(&out, "main").as_deref(), Some(bare));
+
+        // Non-hex and wrong-ref lines are ignored.
+        assert_eq!(pick_sha("nothex\trefs/heads/main\n", "main"), None);
+        assert_eq!(
+            pick_sha(&format!("{head}\trefs/heads/other\n"), "main"),
+            None
+        );
+        assert_eq!(pick_sha("", "main"), None);
     }
 }

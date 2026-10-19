@@ -204,9 +204,13 @@ fn source_line(manifest: &super::manifest::ServiceManifest) -> String {
         .owner_name()
         .map(|(o, n)| format!("{o}/{n}"))
         .unwrap_or_else(|| manifest.service.id.clone());
-    let short: String = manifest.source.commit.chars().take(7).collect();
+    let pin_display = if super::manifest::is_full_sha(&manifest.source.commit) {
+        manifest.source.commit.chars().take(7).collect::<String>()
+    } else {
+        format!("{} (branch)", manifest.source.commit)
+    };
     format!(
-        "source: {what} @ {short} (profile {}, tools [{}])",
+        "source: {what} @ {pin_display} (profile {}, tools [{}])",
         manifest.build.profile,
         manifest.tools.join(", ")
     )
@@ -408,8 +412,43 @@ pub fn deploy_service(
         return result;
     }
 
+    // ── pin resolution ──
+    // recipe.commit is either an exact 40-hex pin or a ref name (branch
+    // tracking). A ref is resolved to the tip SHA right now; the deploy then
+    // proceeds exactly as if that SHA had been pinned — the materializer and
+    // the anti-TOFU check below only ever see the resolved commit.
+    let pin: String = if super::manifest::is_full_sha(recipe.commit) {
+        recipe.commit.to_string()
+    } else {
+        let url = format!(
+            "https://github.com/{}/{}.git",
+            analysis.owner, analysis.name
+        );
+        match gitclone::resolve_ref(&url, recipe.commit) {
+            Ok(sha) => {
+                emit(&format!(
+                    "source: branch {} resolved to {}",
+                    recipe.commit,
+                    &sha[..7]
+                ));
+                sha
+            }
+            Err(e) => {
+                let refname = recipe.commit;
+                report_err(
+                    &mut result,
+                    format!(
+                        "cannot resolve '{refname}' of {}/{}: {e:#}",
+                        analysis.owner, analysis.name
+                    ),
+                );
+                return result;
+            }
+        }
+    };
+
     emit("cloning repository...");
-    let Some(project_dir) = clone_repo(analysis, work_dir, Some(recipe.commit)) else {
+    let Some(project_dir) = clone_repo(analysis, work_dir, Some(&pin)) else {
         result
             .errors
             .push("git clone failed after retries (check network connection)".into());
@@ -417,19 +456,19 @@ pub fn deploy_service(
     };
 
     // ── pinned commit (anti-TOFU) ──
-    // The recipe names one specific commit; a deployment must build exactly
-    // that, never whichever `main`/`master` happens to point at download
-    // time. `clone_repo` was asked for `recipe.commit`, so the tree in
+    // The recipe named one specific commit — either pinned directly or
+    // resolved from a tracked branch just above — and a deployment must
+    // build exactly that, never whichever tip downloads at build time.
+    // `clone_repo` was asked for the resolved pin, so the tree in
     // `project_dir` was materialized blob-by-blob from that SHA — verify the
     // recorded marker matches, then refuse to build anything else.
     match super::gitclone::pinned_sha(&project_dir) {
-        Some(have) if have == recipe.commit => {}
+        Some(have) if have == pin => {}
         Some(have) => {
             report_err(
                 &mut result,
                 format!(
-                    "checkout is pinned to {have}, recipe pins {} (anti-TOFU); refusing to build an unpinned tree.",
-                    recipe.commit
+                    "checkout is pinned to {have}, deploy resolved {pin} (anti-TOFU); refusing to build an unpinned tree."
                 ),
             );
             rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
@@ -439,8 +478,7 @@ pub fn deploy_service(
             report_err(
                 &mut result,
                 format!(
-                    "checkout carries no pin marker, recipe pins {} (anti-TOFU); refusing to build an unpinned tree.",
-                    recipe.commit
+                    "checkout carries no pin marker, deploy resolved {pin} (anti-TOFU); refusing to build an unpinned tree."
                 ),
             );
             rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);

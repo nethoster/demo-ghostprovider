@@ -15,7 +15,7 @@ service:
   description: My self-hosted app
 source:
   git: https://github.com/example/my-service.git
-  commit: "0123456789abcdef0123456789abcdef01234567"  # full 40-hex SHA
+  commit: "0123456789abcdef0123456789abcdef01234567"  # 40-hex SHA (exact pin) or branch name (e.g. main)
 prefetch:                   # host phase (network allowed): downloaders only
   - ["bun", "install", "--frozen-lockfile", "--ignore-scripts"]
 build:
@@ -45,7 +45,12 @@ tools: ["bun"]
 
 * `manifest_version` must be `1`. Unknown fields are rejected.
 * `source.git` must be `https://github.com/<owner>/<repo>(.git)`.
-  `source.commit` must be a full 40-hex SHA (anti-TOFU: never tracks `main`).
+  `source.commit` must be a full 40-hex SHA (exact pin — the deploy builds
+  exactly that commit) or a safe branch name such as `main` (branch
+  tracking — the tip is resolved to a SHA at the start of each deploy and
+  the build proceeds pin-exact against that resolution; for upstreams that
+  force-push, where a static pin would go stale). The plan output shows
+  which mode is in effect.
 * Steps accept shell strings (`"python3 -m venv --clear .venv"`) or argv
   arrays (`["bun", "run", "build"]`). Argv is preferred: items are
   shell-quoted so `sh -c` cannot reinterpret them.

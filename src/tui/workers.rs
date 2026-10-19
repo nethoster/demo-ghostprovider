@@ -54,19 +54,25 @@ pub fn detect_url(url: &str) -> Result<DetectReady, String> {
         wipe();
         return Err(format!("fetch failed: {}", status.last_message));
     }
-    let sha = std::process::Command::new("git")
-        .args(["-C", &tmp.to_string_lossy(), "rev-parse", "HEAD"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
+    // The pin marker materialize leaves behind holds the default branch
+    // name (unpinned clone); a real git clone has no marker, so fall back
+    // to the actual HEAD. Either lands in the commit field, which accepts
+    // a SHA or a branch name.
+    let pin_val = gitclone::pinned_sha(&tmp).unwrap_or_else(|| {
+        std::process::Command::new("git")
+            .args(["-C", &tmp.to_string_lossy(), "rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default()
+    });
     let found = detect::detect_tree(&tmp);
     wipe();
     let d = found.map_err(|e| format!("stack not recognized: {e}"))?;
     let draft = super::wizard::Draft {
         git: url.to_string(),
-        commit: sha,
+        commit: pin_val,
         profile: d.profile,
         prefetch: d.prefetch,
         build_steps: d.build,

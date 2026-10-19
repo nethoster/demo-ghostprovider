@@ -93,6 +93,47 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\"'\"'"))
 }
 
+/// True for a full 40-hex commit SHA (an exact pin).
+pub fn is_full_sha(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// A ref name safe to hand to the materializer and `git ls-remote`: no
+/// shell/URL hazards, no traversal shapes, no empty segments. Mirrors git's
+/// own ref-format rules closely enough for branches and tags.
+pub fn valid_ref_name(s: &str) -> anyhow::Result<()> {
+    if s.is_empty() {
+        anyhow::bail!("ref name is empty");
+    }
+    if s == "HEAD" {
+        anyhow::bail!("HEAD is not a stable ref — use the branch name (e.g. main)");
+    }
+    if s.len() > 100 {
+        anyhow::bail!("ref name too long (max 100)");
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+    {
+        anyhow::bail!("ref name may only contain letters, digits, '.', '_', '/', '-'");
+    }
+    if s.starts_with('-') || s.starts_with('/') || s.starts_with('.') {
+        anyhow::bail!("ref name must not start with '-', '/' or '.'");
+    }
+    if s.ends_with('/') || s.ends_with('.') {
+        anyhow::bail!("ref name must not end with '/' or '.'");
+    }
+    if s.contains("..") || s.contains("//") || s.contains("@{") {
+        anyhow::bail!("ref name must not contain '..', '//' or '@{{'");
+    }
+    if s.split('/')
+        .any(|seg| seg.is_empty() || seg.starts_with('.') || seg.ends_with(".lock"))
+    {
+        anyhow::bail!("ref name must not contain empty, leading-'.' or '.lock' path segments");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServiceMeta {
     pub id: String,
@@ -105,6 +146,11 @@ pub struct ServiceMeta {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SourceSpec {
     pub git: String,
+    /// Either a full 40-hex commit SHA (exact pin — the deploy builds
+    /// exactly that commit) or a safe ref name such as `main` (branch
+    /// tracking — the tip is resolved to a SHA at the start of each deploy
+    /// and the build proceeds pin-exact against that resolution; for
+    /// upstreams that force-push, where a static pin would go stale).
     pub commit: String,
 }
 
@@ -341,10 +387,13 @@ impl ServiceManifest {
                 at("source.git must be https://github.com/<owner>/<repo>(.git)")
             );
         };
-        if self.source.commit.len() != 40
-            || !self.source.commit.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            anyhow::bail!("{}", at("source.commit must be a full 40-hex commit SHA"));
+        // commit: a full 40-hex SHA (exact pin) or a safe ref name (branch
+        // tracking — the tip is resolved to a SHA at each deploy).
+        if !is_full_sha(&self.source.commit) && valid_ref_name(&self.source.commit).is_err() {
+            anyhow::bail!(
+                "{}",
+                at("source.commit must be a full 40-hex commit SHA or a branch name (e.g. main)")
+            );
         }
         // ── profile ──
         match self.build.profile.as_str() {
@@ -541,7 +590,14 @@ impl ServiceManifest {
             "service:  {} ({})\n",
             self.service.id, self.source.git
         ));
-        out.push_str(&format!("commit:   {}\n", self.source.commit));
+        if is_full_sha(&self.source.commit) {
+            out.push_str(&format!("commit:   {} (exact pin)\n", self.source.commit));
+        } else {
+            out.push_str(&format!(
+                "branch:   {} (tip resolved at each deploy)\n",
+                self.source.commit
+            ));
+        }
         out.push_str(&format!(
             "profile:  {}  tools: [{}]\n",
             self.build.profile,
@@ -986,9 +1042,46 @@ mod tests {
         let mut m = sample();
         m.manifest_version = 2;
         assert!(m.validate("t").is_err());
+        // Neither a 40-hex SHA nor a safe ref name (space).
         let mut m = sample();
-        m.source.commit = "abc".into();
+        m.source.commit = "a b".into();
         assert!(m.validate("t").is_err());
+    }
+
+    #[test]
+    fn accepts_branch_tracking_source() {
+        let mut m = sample();
+        m.source.commit = "main".into();
+        m.validate("t").unwrap();
+        let mut m = sample();
+        m.source.commit = "release/1.2".into();
+        m.validate("t").unwrap();
+    }
+
+    #[test]
+    fn rejects_hazardous_ref_names() {
+        for bad in [
+            "",
+            "HEAD",
+            "a b",
+            "-x",
+            "/x",
+            "x/",
+            ".x",
+            "x.",
+            "a..b",
+            "a//b",
+            "x@{y}",
+            "feature/.hidden",
+            "a.lock",
+            "a.lock/b",
+            &"a".repeat(101),
+        ] {
+            assert!(valid_ref_name(bad).is_err(), "{bad:?} must be rejected");
+        }
+        for ok in ["main", "release/1.2", "feat_x.y", "v1.2.3"] {
+            valid_ref_name(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
     }
 
     #[test]
