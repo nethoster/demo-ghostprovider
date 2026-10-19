@@ -559,6 +559,19 @@ pub fn deploy_service(
             return result;
         }
     }
+    // Python: after a fully successful prefetch, mark the wheelhouse
+    // complete so the offline build's pip is forced onto it
+    // (`pip_offline_env` keys on this marker). Without it the sandboxed
+    // `pip install` probes pypi.org under PrivateNetwork=yes and dies on
+    // DNS resolution after minutes of retries — the prefetch step itself
+    // already failed closed above, so a reached marker means full wheels.
+    if recipe.language == "Python"
+        && let Err(e) = super::prefetch::mark_pip_wheelhouse(&project_dir)
+    {
+        report_err(&mut result, format!("pip wheelhouse marker failed: {e:#}"));
+        rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
+        return result;
+    }
     // Pinned paraglide-js plugin seed (VERT). Fetched through the allowlisted
     // client and verified against recipe SHA-256 pins before anything is
     // placed; fail closed exactly like the prefetch steps above — the offline

@@ -243,6 +243,12 @@ fn host_env(project_dir: &Path, path_prefix: &[PathBuf]) -> BTreeMap<String, Str
     for (k, v) in cache {
         env.insert(k.to_string(), v);
     }
+    // The host phase is the index-facing one (`pip download` must reach
+    // pypi.org and resolve fresh candidates): PIP_NO_INDEX/PIP_FIND_LINKS
+    // belong to the offline sandbox build only — restore the pre-seed host
+    // behavior here.
+    env.remove("PIP_NO_INDEX");
+    env.remove("PIP_FIND_LINKS");
     prepend_path_if_any(&mut env, path_prefix);
     env
 }
@@ -468,6 +474,25 @@ fn offline_env(wh: &Path) -> Vec<(String, String)> {
         ("PIP_NO_INDEX".to_string(), "1".to_string()),
         ("PIP_FIND_LINKS".to_string(), p),
     ]
+}
+
+/// Mark the wheelhouse as complete — the counterpart *write* to
+/// [`pip_offline_env`]'s read. Called by the deploy after every host
+/// prefetch step succeeded for a Python recipe: without this marker the
+/// sandboxed `pip install` would probe pypi.org under PrivateNetwork=yes
+/// and die on DNS resolution after minutes of retries, instead of
+/// consuming the wheels the prefetch just downloaded. A tree without
+/// `requirements.txt` (a recipe that never installs pip deps) is a no-op.
+pub fn mark_pip_wheelhouse(project_dir: &Path) -> anyhow::Result<()> {
+    if !project_dir.join("requirements.txt").is_file() {
+        return Ok(());
+    }
+    let wh = wheelhouse(project_dir);
+    std::fs::create_dir_all(&wh)
+        .with_context(|| format!("prefetch: create wheelhouse {}", wh.display()))?;
+    crate::atomic::write_atomic(&wh.join(DONE), b"ok")
+        .with_context(|| format!("prefetch: write wheelhouse marker {}", wh.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -818,5 +843,41 @@ mod tests {
         // No modules key: an ordinary inlang project with no remote plugins.
         let (pins, notes) = pins_from_settings(r#"{"baseLocale":"en"}"#, &|_| Ok(vec![]));
         assert!(pins.is_empty() && notes.is_empty());
+    }
+
+    #[test]
+    fn wheelhouse_marker_roundtrip_enables_pip_offline_env() {
+        let dir = std::env::temp_dir().join(format!("gp-pip-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No requirements.txt → mark is a no-op, nothing gets offline.
+        mark_pip_wheelhouse(&dir).unwrap();
+        assert!(pip_offline_env(&dir).is_empty());
+
+        // With requirements: before the marker pip_offline_env stays dark
+        // (a partial wheelhouse must never be trusted)…
+        std::fs::write(dir.join("requirements.txt"), "certifi==2026.7.22\n").unwrap();
+        assert!(pip_offline_env(&dir).is_empty());
+
+        // …and after a successful prefetch marks it, the sandbox gets the
+        // index-free wheelhouse env — the exact pair the failed searxng
+        // deploy was missing.
+        mark_pip_wheelhouse(&dir).unwrap();
+        let env = pip_offline_env(&dir);
+        assert_eq!(env.len(), 2, "{env:?}");
+        assert_eq!(env[0], ("PIP_NO_INDEX".into(), "1".into()));
+        assert!(env[1].0 == "PIP_FIND_LINKS" && env[1].1.ends_with("pip-wheelhouse"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_env_stays_index_facing_no_pip_offline_vars() {
+        let dir = std::env::temp_dir().join(format!("gp-hostenv-pip-{}", std::process::id()));
+        let env = host_env(&dir, &[]);
+        // The sandbox-only pip overrides must never leak into the host
+        // phase: `pip download` has to reach the index to fill the house.
+        assert_eq!(env.get("PIP_NO_INDEX"), None, "host must reach the index");
+        assert_eq!(env.get("PIP_FIND_LINKS"), None, "host resolves from pypi");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

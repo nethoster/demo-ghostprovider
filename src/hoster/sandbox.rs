@@ -349,6 +349,14 @@ fn cache_env(project_dir: Option<&Path>) -> BTreeMap<&'static str, String> {
         ("GOTMPDIR", m("go-tmp")),
         ("npm_config_store_dir", m("pnpm")),
         ("PNPM_HOME", m("pnpm-home")),
+        // pip: the offline build must resolve exclusively from the host-
+        // downloaded wheelhouse (prefetch `pip download -d …`), never from an
+        // index — the sandbox has no network, and index retries only turn
+        // into noisy DNS failures after minutes of backoff. The host prefetch
+        // phase drops PIP_NO_INDEX again (see prefetch.rs::host_env): that
+        // phase is the index-facing one.
+        ("PIP_NO_INDEX", "1".to_string()),
+        ("PIP_FIND_LINKS", m("pip-wheelhouse")),
         // pnpm v11 is network-paranoid by default: it verifies the managed
         // engine's npm registry signature (engine identity) and re-checks each
         // locked version's publish age against the registry (default
@@ -388,6 +396,7 @@ const PATH_ENV_KEYS: &[&str] = &[
     "GOTMPDIR",
     "npm_config_store_dir",
     "PNPM_HOME",
+    "PIP_FIND_LINKS",
     "TMPDIR",
     "HOME",
     "XDG_RUNTIME_DIR",
@@ -843,6 +852,19 @@ mod tests {
             env.get("pnpm_config_minimum_release_age")
                 .map(String::as_str),
             Some("0")
+        );
+        // pip must never see an index inside the offline sandbox: its only
+        // source is the host-seeded wheelhouse (marker-gated in deploy.rs).
+        assert_eq!(
+            env.get("PIP_NO_INDEX").map(String::as_str),
+            Some("1"),
+            "offline builds must not probe pypi"
+        );
+        assert!(
+            matches!(env.get("PIP_FIND_LINKS").map(String::as_str),
+                     Some(p) if p.starts_with("/proj/.ghost-cache/pip-wheelhouse")),
+            "find-links points at the project wheelhouse: {:?}",
+            env.get("PIP_FIND_LINKS")
         );
     }
 
