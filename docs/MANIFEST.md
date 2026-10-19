@@ -81,7 +81,11 @@ tools: ["bun"]
   the build sandbox stays offline and host prefetch stays on its own
   downloader allowlist.
 * `plugins` (bun only) pin `https://cdn.jsdelivr.net/npm/@inlang/plugin-*`
-  modules by SHA-256, like the built-in VERT manifest.
+  modules by SHA-256, like the built-in VERT manifest. Stack detection
+  fills these automatically from `project.inlang/settings.json` (fetched
+  and hashed on the host) — without the pins an offline build compiles
+  paraglide projects with an empty messages module and they die at
+  prerender.
 * Secrets never go in the manifest (see `secrets.rs`).
 
 ## CLI

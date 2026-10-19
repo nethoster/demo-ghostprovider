@@ -37,6 +37,10 @@ pub struct Draft {
     /// Build-time env vars (name, value) carried into `build.env` —
     /// auto-detected from `$env/static/public` imports for SvelteKit apps.
     pub build_env: Vec<(String, String)>,
+    /// Remote inlang/paraglide modules pinned by content hash
+    /// (url, sha256) — auto-detected so the offline build compiles real
+    /// messages instead of an empty (broken) module.
+    pub plugins: Vec<(String, String)>,
     /// True when steps came from stack detection (not profile defaults):
     /// the profile step keeps them unless the user picks another profile.
     pub detected: bool,
@@ -119,6 +123,12 @@ pub fn apply_profile_defaults(draft: &mut Draft, profile: &str) -> bool {
             draft.tasks_max = d.tasks_max;
             draft.detected = false;
             draft.notes.clear();
+            // Plugin pins are a bun/paraglide concept (the schema rejects
+            // them elsewhere); drop them on a profile switch so the user
+            // never hits a confusing validation error later.
+            if profile != "bun" {
+                draft.plugins.clear();
+            }
             true
         }
         None => false,
@@ -276,7 +286,14 @@ pub fn build_manifest(draft: &Draft) -> Result<ServiceManifest, String> {
             oom_score_adjust: None,
         },
         healthcheck: None,
-        plugins: vec![],
+        plugins: draft
+            .plugins
+            .iter()
+            .map(|(url, sha256)| crate::hoster::manifest::PluginPin {
+                url: url.clone(),
+                sha256: sha256.clone(),
+            })
+            .collect(),
         searxng: draft.profile == "python-searxng",
         tools,
         egress: Default::default(),
@@ -457,6 +474,26 @@ mod tests {
         let yaml = preview_yaml(&d).unwrap();
         assert!(yaml.contains("wz-demo"));
         ServiceManifest::load_from_str(&yaml, "preview").unwrap();
+    }
+
+    #[test]
+    fn detected_plugins_flow_into_the_manifest() {
+        let mut d = filled("bun");
+        d.plugins = vec![(
+            "https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format@4/dist/index.js"
+                .to_string(),
+            "85a5ce9d714530f6e0b5f3f2a1c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2".to_string(),
+        )];
+        let m = build_manifest(&d).unwrap();
+        assert_eq!(m.plugins.len(), 1);
+        assert_eq!(m.plugins[0].url, d.plugins[0].0);
+        let yaml = preview_yaml(&d).unwrap();
+        assert!(yaml.contains("plugin-message-format"), "{yaml}");
+        ServiceManifest::load_from_str(&yaml, "preview").unwrap();
+        // Switching away from bun drops the pins (the schema rejects them
+        // with any other profile) instead of failing validation later.
+        assert!(apply_profile_defaults(&mut d, "python"));
+        assert!(d.plugins.is_empty());
     }
 
     #[test]

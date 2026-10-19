@@ -29,6 +29,10 @@ pub struct Detected {
     /// (SvelteKit): names from the source tree, values from the repo's own
     /// env files. Empty for stacks without such imports.
     pub build_env: Vec<(String, String)>,
+    /// Remote inlang/paraglide modules pinned by content hash
+    /// (url, sha256) so the offline build can compile real messages
+    /// without reaching the CDN. Empty for stacks without paraglide.
+    pub plugins: Vec<(String, String)>,
     /// Why each guess was made / what must be verified by a human.
     pub notes: Vec<String>,
 }
@@ -189,6 +193,17 @@ fn detect_node(dir: &Path) -> Result<Detected, String> {
     // source tree and values from the repo's own env files.
     let (build_env, env_notes) = detect_public_env(dir);
     notes.extend(env_notes);
+    // paraglide apps declare remote inlang modules in project.inlang; the
+    // offline build needs them content-pinned on local disk or it silently
+    // compiles an empty messages module (see prefetch::pin_remote_paraglide_modules).
+    let (plugins, plugin_notes) = crate::hoster::prefetch::pin_remote_paraglide_modules(dir);
+    if !plugins.is_empty() {
+        notes.push(format!(
+            "pinned {} inlang plugin(s) by content hash — offline build stays reproducible",
+            plugins.len()
+        ));
+    }
+    notes.extend(plugin_notes);
     Ok(Detected {
         profile: "bun".into(),
         prefetch,
@@ -198,6 +213,7 @@ fn detect_node(dir: &Path) -> Result<Detected, String> {
         memory_max: "384M".into(),
         tasks_max: "300".into(),
         build_env,
+        plugins,
         notes,
     })
 }
@@ -258,6 +274,7 @@ fn detect_python(dir: &Path) -> Result<Detected, String> {
         memory_max: "1024M".into(),
         tasks_max: "512".into(),
         build_env: vec![],
+        plugins: vec![],
         notes,
     })
 }
@@ -274,6 +291,7 @@ fn detect_go() -> Detected {
         memory_max: "1024M".into(),
         tasks_max: "512".into(),
         build_env: vec![],
+        plugins: vec![],
         notes: vec![
             "go modules detected — binary is built as ghost-server; change -o if yours differs"
                 .into(),

@@ -150,6 +150,69 @@ fn seed_pinned_plugins(
     Ok(())
 }
 
+/// Pin the paraglide remote modules declared in a tree's
+/// `project.inlang/settings.json` by content hash — the host-phase half of
+/// [`seed_paraglide_plugins`], run during stack *detection* where the
+/// network is available. Returns (url, sha256) pairs plus notes for the
+/// review screen. A module that cannot be fetched is reported, never
+/// silently dropped: without the pin the offline build compiles the project
+/// WITHOUT its messages (paraglide warns and continues on
+/// `PluginImportError`) and the app then dies at prerender with
+/// `TypeError: (void 0) is not a function`.
+pub fn pin_remote_paraglide_modules(project_dir: &Path) -> (Vec<(String, String)>, Vec<String>) {
+    let settings = project_dir.join("project.inlang").join("settings.json");
+    let Ok(text) = std::fs::read_to_string(&settings) else {
+        return (vec![], vec![]);
+    };
+    pins_from_settings(&text, &crate::hoster::httpclient::get_bytes)
+}
+
+/// Testable core of [`pin_remote_paraglide_modules`]: `fetch` is injected so
+/// the network path is unit-testable offline.
+fn pins_from_settings(
+    settings_json: &str,
+    fetch: &dyn Fn(&str) -> anyhow::Result<Vec<u8>>,
+) -> (Vec<(String, String)>, Vec<String>) {
+    // Schema: too many plugin pins (max 8) — anything past the cap stays
+    // unpinned and is reported so the review screen can trim the list.
+    const MAX_MODULES: usize = 8;
+    // The only CDN the schema accepts for plugin URLs (fail closed: a
+    // foreign module URL is left unpinned and reported, not fetched).
+    const ALLOWED_PREFIX: &str = "https://cdn.jsdelivr.net/npm/@inlang/plugin-";
+    let mut pins = Vec::new();
+    let mut notes = Vec::new();
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(settings_json) else {
+        notes.push(
+            "project.inlang/settings.json is not valid JSON — inlang modules left unpinned".into(),
+        );
+        return (pins, notes);
+    };
+    let Some(modules) = v.get("modules").and_then(|m| m.as_array()) else {
+        return (pins, notes);
+    };
+    for url in modules.iter().filter_map(|m| m.as_str()) {
+        if pins.len() >= MAX_MODULES {
+            notes.push(format!(
+                "more than {MAX_MODULES} inlang modules — the extra ones stay unpinned"
+            ));
+            break;
+        }
+        if !url.starts_with(ALLOWED_PREFIX) {
+            notes.push(format!(
+                "inlang module outside the jsdelivr plugin CDN was left unpinned: {url}"
+            ));
+            continue;
+        }
+        match fetch(url) {
+            Ok(bytes) => pins.push((url.to_string(), sha256_hex(&bytes))),
+            Err(e) => notes.push(format!(
+                "couldn't fetch inlang module {url} ({e:#}) — the offline build will compile without it"
+            )),
+        }
+    }
+    (pins, notes)
+}
+
 /// The cache-env redirects for `bun`/`pnpm` live in `sandbox.rs::cache_env`;
 /// `run_host_step` applies them too, so the prefetch writes into the same
 /// project cache (`XDG_CACHE_HOME`, `npm_config_store_dir`, …) that the
@@ -702,5 +765,58 @@ mod tests {
                 .exists()
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pins_from_settings_hashes_modules_and_reports_failures() {
+        let settings = r#"{
+            "modules": [
+                "https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format@4/dist/index.js",
+                "https://evil.example.com/steal.js",
+                "https://cdn.jsdelivr.net/npm/@inlang/plugin-m-function-matcher@2/dist/index.js"
+            ]
+        }"#;
+        let fetch = |url: &str| -> anyhow::Result<Vec<u8>> {
+            if url.contains("m-function") {
+                anyhow::bail!("fetch failed")
+            } else if url.contains("message-format") {
+                Ok(b"format-bytes".to_vec())
+            } else {
+                panic!("foreign module must never be fetched: {url}")
+            }
+        };
+        let (pins, notes) = pins_from_settings(settings, &fetch);
+        assert_eq!(pins.len(), 1, "only the allowed module is pinned: {pins:?}");
+        assert_eq!(
+            pins[0].0,
+            "https://cdn.jsdelivr.net/npm/@inlang/plugin-message-format@4/dist/index.js"
+        );
+        assert_eq!(pins[0].1, sha256_hex(b"format-bytes"));
+        // A foreign module URL is fail-closed (left unpinned) and reported.
+        assert!(
+            notes.iter().any(|n| n.contains("evil.example.com")),
+            "foreign module reported: {notes:?}"
+        );
+        // A fetch failure is reported loudly — silence here means a silently
+        // broken offline build later.
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("m-function") && n.contains("fetch failed")),
+            "fetch failure reported: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn pins_from_settings_tolerates_missing_or_invalid_json() {
+        let (pins, notes) = pins_from_settings("not json {", &|_| Ok(vec![]));
+        assert!(pins.is_empty());
+        assert!(
+            notes.iter().any(|n| n.contains("not valid JSON")),
+            "{notes:?}"
+        );
+        // No modules key: an ordinary inlang project with no remote plugins.
+        let (pins, notes) = pins_from_settings(r#"{"baseLocale":"en"}"#, &|_| Ok(vec![]));
+        assert!(pins.is_empty() && notes.is_empty());
     }
 }

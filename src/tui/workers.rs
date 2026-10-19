@@ -81,6 +81,7 @@ pub fn detect_url(url: &str) -> Result<DetectReady, String> {
         memory_max: d.memory_max,
         tasks_max: d.tasks_max,
         build_env: d.build_env,
+        plugins: d.plugins,
         detected: true,
         notes: d.notes,
         ..Default::default()
