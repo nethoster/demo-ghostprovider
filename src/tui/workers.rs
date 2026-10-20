@@ -24,14 +24,24 @@ pub struct DetectReady {
     pub draft: super::wizard::Draft,
 }
 
+/// Where a detection result should go once it lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetectRoute {
+    /// Autopilot (Enter on the URL input): store the manifest and deploy
+    /// without further prompts.
+    Auto,
+    /// Step-by-step review: the draft opens at wizard step 1.
+    Wizard,
+}
+
 /// Clone a repo shallowly into a temp dir, detect its stack, resolve the
 /// HEAD pin, then wipe the tree. Runs on a worker thread; the result lands
-/// as `Msg::DetectDone`. The tree never touches the library or the deploy
-/// pipeline — detection only reads.
-pub(crate) fn spawn_detect(tx: Sender<Msg>, url: String) {
+/// as `Msg::DetectDone` tagged with `route`. The tree never touches the
+/// library or the deploy pipeline — detection only reads.
+pub(crate) fn spawn_detect(tx: Sender<Msg>, url: String, route: DetectRoute) {
     std::thread::spawn(move || {
         let out = detect_url(&url).map(Box::new);
-        let _ = tx.send(Msg::DetectDone(out));
+        let _ = tx.send(Msg::DetectDone { res: out, route });
     });
 }
 
@@ -109,7 +119,15 @@ fn sanitize_id(name: &str) -> String {
     while out.contains("--") {
         out = out.replace("--", "-");
     }
-    out.trim_matches('-').to_string()
+    let trimmed = out.trim_matches('-');
+    // The schema caps ids at 64 chars — a suggestion longer than that can
+    // never validate, so cap it here (every char at this point is ascii).
+    let capped = if trimmed.len() > 64 {
+        &trimmed[..64]
+    } else {
+        trimmed
+    };
+    capped.trim_matches('-').to_string()
 }
 
 /// The in-flight deploy worker thread (if any), so the exit path can wait out
@@ -775,6 +793,17 @@ mod tests {
                 urls: urls.iter().map(|s| s.to_string()).collect(),
             },
         )
+    }
+
+    #[test]
+    fn sanitize_id_normalizes_and_caps_to_schema_length() {
+        assert_eq!(sanitize_id("VERT-sh/VERT"), "vert-sh-vert");
+        // owner + repo can exceed the schema's 64-char cap — a suggestion
+        // that can never validate is worse than a truncated one.
+        let long = sanitize_id(&format!("{}-{}", "a".repeat(40), "b".repeat(40)));
+        assert!(long.len() <= 64, "{}", long.len());
+        assert!(!long.starts_with('-') && !long.ends_with('-'), "{long}");
+        assert!(!long.contains("--"), "{long}");
     }
 
     #[test]

@@ -403,10 +403,14 @@ pub(crate) enum Msg {
     DeployLogsCleared,
     SoftwareLogsCleared,
     CrashLogsCleared,
-    /// Stack detection finished (Add Service → Detect): prefilled wizard
-    /// draft on success, human-readable reason on failure. Boxed — the
-    /// draft keeps `Msg` small (channel-backed enum).
-    DetectDone(Result<Box<workers::DetectReady>, String>),
+    /// Stack detection finished (URL input → autopilot or wizard, Add
+    /// Service → Detect): prefilled wizard draft on success, human-readable
+    /// reason on failure, plus where the result must go. Boxed — the draft
+    /// keeps `Msg` small (channel-backed enum).
+    DetectDone {
+        res: Result<Box<workers::DetectReady>, String>,
+        route: workers::DetectRoute,
+    },
     /// Egress live-check finished for one library service: rendered lines.
     EgressChecked {
         id: String,
@@ -527,6 +531,9 @@ pub fn run() -> anyhow::Result<()> {
         crash_tail_keep: None,
         exit_notices: Vec::new(),
     };
+    // A stale build that re-exec'ed here left its action in the handover
+    // file: resume it before the first frame draws.
+    resume_pending_action(&mut app);
     let res = event_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
@@ -712,21 +719,44 @@ fn event_loop(
                         *scroll = 0;
                     }
                 }
-                Msg::DetectDone(res) => {
+                Msg::DetectDone { res, route } => {
                     // Apply only while the Detect screen is still open: Esc
                     // meanwhile means the user cancelled — drop the stale result.
-                    if let Screen::DetectInput { error, busy, .. } = &mut app.screen {
+                    if matches!(app.screen, Screen::DetectInput { .. }) {
                         match res {
                             Ok(ready) => {
-                                app.screen = Screen::WzId {
-                                    buffer: ready.suggested_id,
-                                    error: None,
-                                    draft: ready.draft,
-                                };
+                                let mut ready = *ready;
+                                match route {
+                                    workers::DetectRoute::Wizard => {
+                                        app.screen = Screen::WzId {
+                                            buffer: ready.suggested_id,
+                                            error: None,
+                                            draft: ready.draft,
+                                        };
+                                    }
+                                    workers::DetectRoute::Auto => {
+                                        match auto_store(&mut ready.draft, &ready.suggested_id) {
+                                            Ok(target) => start_deploy_screen(app, target),
+                                            // Manifest would not validate:
+                                            // open the wizard on the same
+                                            // draft with the reason, so the
+                                            // user fixes exactly what failed.
+                                            Err(e) => {
+                                                app.screen = Screen::WzId {
+                                                    buffer: ready.suggested_id,
+                                                    error: Some(e),
+                                                    draft: ready.draft,
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
-                                *error = Some(e);
-                                *busy = false;
+                                if let Screen::DetectInput { error, busy, .. } = &mut app.screen {
+                                    *error = Some(e);
+                                    *busy = false;
+                                }
                             }
                         }
                     }
@@ -1068,17 +1098,49 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 KeyCode::Backspace => {
                     buffer.pop();
                 }
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Tab => {
                     if buffer.trim().is_empty() {
                         *error = Some("enter a GitHub URL or a path to service.yaml".into());
                     } else {
+                        let autopilot = key == KeyCode::Enter;
                         match workers::classify_deploy_input(buffer.trim()) {
-                            Ok(target) => {
+                            // URL: Enter = autopilot (detect → store manifest
+                            // → deploy, no gate to click through), Tab = the
+                            // same detect landing in the wizard for
+                            // step-by-step review.
+                            Ok(workers::DeployTarget::Detect { url, .. }) => {
+                                if crate::paths::binary_is_stale() {
+                                    restart_with_pending(&crate::paths::PendingAction {
+                                        payload: url.clone(),
+                                        route: if autopilot {
+                                            crate::paths::PendingRoute::Auto
+                                        } else {
+                                            crate::paths::PendingRoute::Wizard
+                                        },
+                                    });
+                                }
+                                app.screen = Screen::DetectInput {
+                                    buffer: url.clone(),
+                                    error: None,
+                                    busy: true,
+                                };
+                                workers::spawn_detect(
+                                    app.tx.clone(),
+                                    url,
+                                    if autopilot {
+                                        workers::DetectRoute::Auto
+                                    } else {
+                                        workers::DetectRoute::Wizard
+                                    },
+                                );
+                            }
+                            // A local manifest still passes the gate: hosting
+                            // a file needs the explicit Yes. An outdated build
+                            // opens the gate on [N]o — and a Yes restarts onto
+                            // the fresh build instead of deploying old code.
+                            Ok(target @ workers::DeployTarget::Manifest { .. }) => {
                                 app.screen = Screen::Confirm {
                                     target,
-                                    // An outdated running build opens the gate
-                                    // on [N]o: proceeding means deploying old
-                                    // code with the known failures still in it.
                                     yes_selected: !crate::paths::binary_is_stale(),
                                 };
                             }
@@ -1114,24 +1176,37 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             }
             match decision {
                 Some(true) => match target {
-                    // A URL never deploys: it feeds stack detection, whose
-                    // result lands in the wizard for explicit review.
+                    // Legacy gate for a URL — the input now sends URLs
+                    // straight to autopilot/wizard; this arm stays reachable
+                    // only through older callers and still routes to wizard
+                    // detection (with the stale-restart handshake first).
                     workers::DeployTarget::Detect { url, .. } => {
+                        if crate::paths::binary_is_stale() {
+                            restart_with_pending(&crate::paths::PendingAction {
+                                payload: url.clone(),
+                                route: crate::paths::PendingRoute::Wizard,
+                            });
+                        }
                         let url = url.clone();
                         app.screen = Screen::DetectInput {
                             buffer: url.clone(),
                             error: None,
                             busy: true,
                         };
-                        workers::spawn_detect(app.tx.clone(), url);
+                        workers::spawn_detect(app.tx.clone(), url, workers::DetectRoute::Wizard);
                     }
                     manifest @ workers::DeployTarget::Manifest { .. } => {
-                        let label = manifest.describe();
-                        workers::start_target_deployment(app.tx.clone(), manifest.clone());
-                        app.screen = Screen::Deploy {
-                            lines: vec![format!("deploying {label}...")],
-                            done: None,
-                        };
+                        // Consent was just given by this Enter: an outdated
+                        // build hands the exact target to the fresh process
+                        // instead of deploying old code.
+                        if crate::paths::binary_is_stale() {
+                            restart_with_pending(&crate::paths::PendingAction {
+                                payload: manifest.back_to_input(),
+                                route: crate::paths::PendingRoute::PathDeploy,
+                            });
+                        }
+                        let owned = manifest.clone();
+                        start_deploy_screen(app, owned);
                     }
                 },
                 // Back to the input with the URL/path preserved.
@@ -1627,7 +1702,11 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 } else {
                     *error = None;
                     *busy = true;
-                    workers::spawn_detect(app.tx.clone(), buffer.trim().to_string());
+                    workers::spawn_detect(
+                        app.tx.clone(),
+                        buffer.trim().to_string(),
+                        workers::DetectRoute::Wizard,
+                    );
                 }
             }
             // Raw char: URLs must be typed verbatim on any layout.
@@ -2226,37 +2305,57 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     draft,
                 };
             }
+            // Save only: park the manifest in the library (deploy later
+            // from Add Service).
+            KeyCode::Char('s') => {
+                if yaml.is_none() {
+                    *error = Some("fix the errors above first (Esc goes back)".into());
+                } else {
+                    let text = yaml.clone().unwrap_or_default();
+                    match wizard_save(draft, &text) {
+                        Ok((_, id)) => {
+                            let files = crate::hoster::library::list();
+                            // Selection space has 3 action rows on top.
+                            let selected = files
+                                .iter()
+                                .position(|f| f.id == id)
+                                .map(|i| i + 3)
+                                .unwrap_or(3);
+                            app.screen = Screen::AddService {
+                                files,
+                                selected,
+                                message: Some(format!("created {id} — Enter deploys it")),
+                                armed_delete: None,
+                            };
+                        }
+                        Err(e) => *error = Some(e),
+                    }
+                }
+            }
+            // Save and go: the manifest lands in the library and the deploy
+            // starts immediately — one key instead of save → pick → confirm.
             KeyCode::Enter => {
                 if yaml.is_none() {
                     *error = Some("fix the errors above first (Esc goes back)".into());
                 } else {
-                    match wizard::build_manifest(draft) {
-                        Ok(manifest) => {
-                            let text = yaml.clone().unwrap_or_default();
-                            match crate::hoster::library::save(&manifest, &text) {
-                                Ok(id) => {
-                                    let files = crate::hoster::library::list();
-                                    // Selection space has 3 action rows on top.
-                                    let selected = files
-                                        .iter()
-                                        .position(|f| f.id == id)
-                                        .map(|i| i + 3)
-                                        .unwrap_or(3);
-                                    app.screen = Screen::AddService {
-                                        files,
-                                        selected,
-                                        message: Some(format!("created {id} — Enter deploys it")),
-                                        armed_delete: None,
-                                    };
-                                }
-                                Err(e) => {
-                                    *error = Some(workers::short_error_for(&e));
-                                }
+                    let text = yaml.clone().unwrap_or_default();
+                    match wizard_save(draft, &text) {
+                        Ok((manifest, id)) => match crate::hoster::library::file_path(&id) {
+                            Ok(path) => {
+                                let target = workers::DeployTarget::Manifest {
+                                    path,
+                                    service_id: id,
+                                    plan: manifest
+                                        .plan_text()
+                                        .lines()
+                                        .map(str::to_string)
+                                        .collect(),
+                                };
+                                start_deploy_screen(app, target);
                             }
-                        }
-                        Err(e) => {
-                            *error = Some(e);
-                        }
+                            Err(e) => *error = Some(format!("{e:#}")),
+                        },
+                        Err(e) => *error = Some(e),
                     }
                 }
             }
@@ -2270,6 +2369,135 @@ fn move_main_selection(selected: &mut usize, key: KeyCode) {
     match key {
         KeyCode::Up | KeyCode::Left => *selected = selected.saturating_sub(1),
         _ => *selected = (*selected + 1).min(MAIN_MENU.len() - 1),
+    }
+}
+
+/// Switch to the streaming Deploy screen for an already-classified target
+/// (and kick the worker off first, so the first lines never get dropped).
+fn start_deploy_screen(app: &mut App, target: workers::DeployTarget) {
+    let label = target.describe();
+    workers::start_target_deployment(app.tx.clone(), target);
+    app.screen = Screen::Deploy {
+        lines: vec![format!("deploying {label}...")],
+        done: None,
+    };
+}
+
+/// Autopilot storage: build the manifest from a detected draft, render its
+/// YAML and put it in the library under its own id — replacing an earlier
+/// run of the same service, so re-entering the same URL just redeploys.
+/// Returns the deploy target of the stored file.
+fn auto_store(
+    draft: &mut wizard::Draft,
+    suggested_id: &str,
+) -> Result<workers::DeployTarget, String> {
+    // Detection leaves draft.id blank — the wizard's step 1 would accept the
+    // suggestion there; the autopilot accepts it right here.
+    if draft.id.trim().is_empty() {
+        draft.id = suggested_id.to_string();
+    }
+    let manifest = wizard::build_manifest(draft)?;
+    let yaml = serde_yaml::to_string(&manifest).map_err(|e| format!("cannot render YAML: {e}"))?;
+    let id = manifest.service.id.clone();
+    let exists = crate::hoster::library::list().iter().any(|e| e.id == id);
+    if exists {
+        crate::hoster::library::replace(&id, yaml.as_bytes()).map_err(|e| format!("{e:#}"))?;
+    } else {
+        crate::hoster::library::save(&manifest, &yaml).map_err(|e| format!("{e:#}"))?;
+    }
+    let path = crate::hoster::library::file_path(&id).map_err(|e| format!("{e:#}"))?;
+    Ok(workers::DeployTarget::Manifest {
+        path,
+        service_id: id,
+        plan: manifest.plan_text().lines().map(str::to_string).collect(),
+    })
+}
+
+/// Build, validate and store a wizard draft's manifest with the library's
+/// duplicate guard (an id already on the shelf must be deleted first — the
+/// autopilot path replaces on purpose, the wizard keeps its explicit rule).
+/// Returns the manifest and its id so the caller can chain a deploy.
+fn wizard_save(
+    draft: &wizard::Draft,
+    yaml: &str,
+) -> Result<(crate::hoster::manifest::ServiceManifest, String), String> {
+    let manifest = wizard::build_manifest(draft)?;
+    let id =
+        crate::hoster::library::save(&manifest, yaml).map_err(|e| workers::short_error_for(&e))?;
+    Ok((manifest, id))
+}
+
+/// Re-exec the panel onto the fresh build on disk, handing `action` over so
+/// the new process resumes it at startup — the user's keystroke survives the
+/// restart even though the running image was outdated. Only returns when the
+/// takeover could not happen (no disk copy, exec refused); the caller then
+/// proceeds with the running build, which still shows the outdated warnings.
+/// Never fires mid-deploy or during shutdown: the journal and the terminal
+/// must outlive this process untouched.
+fn restart_with_pending(action: &crate::paths::PendingAction) {
+    if crate::hoster::deploy::deploy_in_flight() || crate::hoster::cancel::is_exiting() {
+        return;
+    }
+    if crate::paths::write_pending_action(action).is_err() {
+        return;
+    }
+    let Some(bin) = crate::paths::disk_binary_path() else {
+        let _ = std::fs::remove_file(crate::paths::pending_action_file());
+        return;
+    };
+    // Raw mode and the alternate screen are tty state, not process state:
+    // they survive exec, and run() re-initializes them anyway.
+    use std::os::unix::process::CommandExt;
+    let _err = std::process::Command::new(&bin).exec();
+    // Exec refused: this build continues the action itself, so drop the
+    // handover — replaying it from a later launch would fire the user's
+    // Enter long after they pressed it.
+    let _ = std::fs::remove_file(crate::paths::pending_action_file());
+}
+
+/// Startup: finish a deploy the previous (outdated) build handed over before
+/// re-execing. The original Enter already gave consent — replay it without
+/// asking again.
+fn resume_pending_action(app: &mut App) {
+    let Some(pending) = crate::paths::take_pending_action() else {
+        return;
+    };
+    match pending.route {
+        crate::paths::PendingRoute::Auto | crate::paths::PendingRoute::Wizard => {
+            let route = match pending.route {
+                crate::paths::PendingRoute::Wizard => workers::DetectRoute::Wizard,
+                _ => workers::DetectRoute::Auto,
+            };
+            app.screen = Screen::DetectInput {
+                buffer: pending.payload.clone(),
+                error: None,
+                busy: true,
+            };
+            workers::spawn_detect(app.tx.clone(), pending.payload, route);
+        }
+        crate::paths::PendingRoute::PathDeploy => {
+            match workers::classify_deploy_input(&pending.payload) {
+                Ok(target @ workers::DeployTarget::Manifest { .. }) => {
+                    start_deploy_screen(app, target)
+                }
+                // The payload turned into a URL somehow (or the file is
+                // gone): hand the input back instead of failing blind.
+                Ok(other) => {
+                    app.screen = Screen::UrlInput {
+                        buffer: other.back_to_input(),
+                        error: None,
+                        busy: false,
+                    }
+                }
+                Err(e) => {
+                    app.screen = Screen::UrlInput {
+                        buffer: pending.payload,
+                        error: Some(e),
+                        busy: false,
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -3903,11 +4131,11 @@ fn draw_detect_input(
             Style::default().fg(DIM),
         )),
         Line::from(Span::styled(
-            " the stack is detected, and the wizard opens prefilled.",
+            " the stack is detected — autopilot deploys, the wizard reviews;",
             Style::default().fg(DIM),
         )),
         Line::from(Span::styled(
-            " Nothing is stored until you save at step 9/9.",
+            " detection itself stores nothing.",
             Style::default().fg(DIM),
         )),
         Line::from(""),
@@ -4305,9 +4533,10 @@ fn draw_wz_review(
         )));
     }
     f.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(block("New Service 9/9 · review (Enter saves)", VIOLET)),
+        Paragraph::new(text).wrap(Wrap { trim: false }).block(block(
+            "New Service 9/9 · review (Enter saves + deploys)",
+            VIOLET,
+        )),
         area,
     );
 }
@@ -4770,7 +4999,11 @@ fn hint_line(screen: &Screen) -> Line<'static> {
             if *busy {
                 vec![("working…", WARN_YELLOW)]
             } else {
-                vec![("Enter continue", OK_GREEN), ("Esc back", WARN_YELLOW)]
+                vec![
+                    ("Enter deploy", OK_GREEN),
+                    ("Tab wizard", VIOLET),
+                    ("Esc back", WARN_YELLOW),
+                ]
             }
         }
         Screen::Confirm { .. } => vec![
@@ -4888,7 +5121,8 @@ fn hint_line(screen: &Screen) -> Line<'static> {
             ("Esc back", WARN_YELLOW),
         ],
         Screen::WzReview { .. } => vec![
-            ("Enter save → library", OK_GREEN),
+            ("Enter save + deploy", OK_GREEN),
+            ("s save only", VIOLET),
             ("Esc back", WARN_YELLOW),
         ],
     };
@@ -5433,7 +5667,49 @@ mod tests {
             yaml: None,
             error: None,
         };
-        assert!(text(&review).contains("Enter save → library"));
+        assert!(text(&review).contains("Enter save + deploy"));
+    }
+
+    /// The autopilot path stores the detected manifest on the first run and
+    /// REPLACES it on a redeploy of the same service — re-entering the same
+    /// URL must just work (the wizard's duplicate guard does not apply here),
+    /// and detected build.env vars must survive into the stored file.
+    #[test]
+    fn autopilot_stores_then_replaces_on_redeploy() {
+        let _guard = crate::paths::ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("dgp-auto-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        #[allow(unsafe_code)] // test-only env mutation (XDG_DATA_HOME)
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &tmp);
+        }
+
+        let mut draft = wizard::Draft {
+            // Detection hands the id over as a SUGGESTION, not in the draft —
+            // the autopilot must seed it, exactly like wizard step 1 would.
+            id: String::new(),
+            git: "https://github.com/example/auto-demo.git".into(),
+            commit: "c".repeat(40),
+            ..Default::default()
+        };
+        assert!(wizard::apply_profile_defaults(&mut draft, "bun"));
+
+        draft.build_env = vec![("PUB_VERTD_URL".into(), "https://vert.local".into())];
+        let target = auto_store(&mut draft, "auto-demo").expect("first store");
+        assert_eq!(target.short_name(), "auto-demo");
+        let path = crate::hoster::library::file_path("auto-demo").unwrap();
+        let first = std::fs::read_to_string(&path).unwrap();
+        assert!(first.contains("PUB_VERTD_URL"), "{first}");
+
+        // Redeploy with changed detection: replaces the stored file.
+        draft.build_env = vec![("PUB_NEW".into(), "1".into())];
+        let again = auto_store(&mut draft, "auto-demo").expect("redeploy replaces");
+        assert_eq!(again.short_name(), "auto-demo");
+        let second = std::fs::read_to_string(&path).unwrap();
+        assert!(second.contains("PUB_NEW"), "{second}");
+        assert!(!second.contains("PUB_VERTD_URL"), "{second}");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

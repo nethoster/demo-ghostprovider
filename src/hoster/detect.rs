@@ -324,15 +324,19 @@ fn detect_public_env(dir: &Path) -> (Vec<(String, String)>, Vec<String>) {
         "vendor",
     ];
     let mut names = std::collections::BTreeSet::new();
-    collect_public_import_names(dir, SKIP_DIRS, &mut names, MAX_VARS);
-    if names.is_empty() {
-        return (vec![], vec![]);
-    }
+    collect_source_env_names(dir, SKIP_DIRS, &mut names, MAX_VARS);
     // Values: .env.example is the template; .env.production and .env (when
-    // committed) override it, matching dotenv precedence.
+    // committed) override it, matching dotenv precedence. Their PUB_*
+    // keys are names too: apps read those vars dynamically (or through
+    // defineEnvVars) and the offline build still needs them set.
     let mut values = std::collections::BTreeMap::new();
     for file in [".env.example", ".env.production", ".env"] {
-        merge_env_file(&dir.join(file), &mut values);
+        let path = dir.join(file);
+        merge_env_file(&path, &mut values);
+        collect_env_file_keys(&path, &mut names, MAX_VARS);
+    }
+    if names.is_empty() {
+        return (vec![], vec![]);
     }
     let mut notes = vec![];
     let mut missing = vec![];
@@ -347,7 +351,7 @@ fn detect_public_env(dir: &Path) -> (Vec<(String, String)>, Vec<String>) {
         }
     }
     notes.push(format!(
-        "detected {} PUB_* build env var(s) from $env/static/public imports — review them on the last step",
+        "detected {} PUB_* build env var(s) from source declarations and env files — review them on the last step",
         out.len()
     ));
     if !missing.is_empty() {
@@ -360,9 +364,10 @@ fn detect_public_env(dir: &Path) -> (Vec<(String, String)>, Vec<String>) {
     (out, notes)
 }
 
-/// Recursively collect `PUB_*` identifiers imported from
-/// `$env/static/public` in source files under `dir`.
-fn collect_public_import_names(
+/// Recursively collect `PUB_*` env var names that the source declares:
+/// literal `$env/static/public` imports and `defineEnvVars({...})` keys
+/// (SvelteKit v2 declares vars without any import).
+fn collect_source_env_names(
     dir: &Path,
     skip_dirs: &[&str],
     out: &mut std::collections::BTreeSet<String>,
@@ -384,13 +389,14 @@ fn collect_public_import_names(
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if !skip_dirs.contains(&name.as_ref()) {
-                collect_public_import_names(&path, skip_dirs, out, max);
+                collect_source_env_names(&path, skip_dirs, out, max);
             }
         } else if ft.is_file() && is_source_file(&path) {
             let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
             collect_import_names(&content, out, max);
+            collect_define_env_names(&content, out, max);
         }
     }
 }
@@ -434,6 +440,77 @@ fn collect_import_names(content: &str, out: &mut std::collections::BTreeSet<Stri
             }
         }
         rest = &rest[pos + MARKER.len()..];
+    }
+}
+
+/// `defineEnvVars({ PUB_X: {...} })` (SvelteKit v2's env declaration) never
+/// mentions `$env/static/public` — take every `PUB_*:` key from files that
+/// use it. Key-shaped tokens only (name followed by a colon).
+fn collect_define_env_names(
+    content: &str,
+    out: &mut std::collections::BTreeSet<String>,
+    max: usize,
+) {
+    if out.len() >= max || !content.contains("defineEnvVars") {
+        return;
+    }
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i + 4 <= bytes.len() {
+        if out.len() >= max {
+            return;
+        }
+        if &bytes[i..i + 4] != b"PUB_" {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < bytes.len()
+            && (bytes[j].is_ascii_uppercase() || bytes[j].is_ascii_digit() || bytes[j] == b'_')
+        {
+            j += 1;
+        }
+        let mut k = j;
+        while k < bytes.len() && (bytes[k] == b' ' || bytes[k] == b'\t' || bytes[k] == b'\n') {
+            k += 1;
+        }
+        if j - i > 4 && k < bytes.len() && bytes[k] == b':' {
+            // The walked token is pure ascii, so this cannot fail.
+            if let Ok(tok) = std::str::from_utf8(&bytes[i..j]) {
+                out.insert(tok.to_string());
+            }
+        }
+        i = j;
+    }
+}
+
+/// `PUB_*` keys declared by one env file (template or committed env).
+/// Only `PUB_*` is taken: SvelteKit exposes exactly that prefix as public,
+/// so a committed `.env` can never smuggle a secret key into build.env.
+fn collect_env_file_keys(path: &Path, out: &mut std::collections::BTreeSet<String>, max: usize) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        if out.len() >= max {
+            return;
+        }
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, _)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.starts_with("PUB_")
+            && key.len() > 4
+            && key
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        {
+            out.insert(key.to_string());
+        }
     }
 }
 
@@ -685,6 +762,49 @@ import { PUB_PLAUSIBLE_URL } from "$env/static/public";
             "{:?}",
             d.notes
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The VERT shape: SvelteKit v2 declares vars via defineEnvVars (no
+    /// `$env/static/public` imports anywhere) and the values live in the
+    /// committed .env.example — the offline build needs every one of them.
+    #[test]
+    fn define_env_vars_and_env_template_supply_build_env() {
+        let dir = tree(
+            "svelte-define",
+            &[
+                (
+                    "package.json",
+                    r#"{"dependencies":{"@sveltejs/kit":"2.0.0"},"scripts":{"build":"vite build"}}"#,
+                ),
+                ("bun.lock", "x"),
+                (
+                    "src/env.ts",
+                    "import { defineEnvVars } from \"@sveltejs/kit/env\";\n\
+                     export const vars = defineEnvVars({\n\
+                     \x20 PUB_VERTD_URL: { public: true, static: true },\n\
+                     \x20 PUB_ENV: { public: true, static: true },\n\
+                     });\n",
+                ),
+                (
+                    ".env.example",
+                    "PUB_VERTD_URL=https://vertd.vert.sh\n\
+                     PUB_ENV=production\n\
+                     PUB_DONATION_URL=https://donations.vert.sh\n",
+                ),
+            ],
+        );
+        let d = detect_tree(&dir).unwrap();
+        let env: std::collections::BTreeMap<&str, &str> = d
+            .build_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        // Two declared keys + one template-only key, all with values.
+        assert_eq!(env.len(), 3, "{:?}", d.build_env);
+        assert_eq!(env["PUB_VERTD_URL"], "https://vertd.vert.sh");
+        assert_eq!(env["PUB_ENV"], "production");
+        assert_eq!(env["PUB_DONATION_URL"], "https://donations.vert.sh");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

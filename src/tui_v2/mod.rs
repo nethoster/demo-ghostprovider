@@ -286,7 +286,7 @@ fn event_loop(
                 // it may still receive are no-ops here.
                 Msg::CrashLog(_) | Msg::CrashLogsCleared => {}
                 // Stack detection lives in the primary TUI only; drop it here.
-                Msg::DetectDone(_) => {}
+                Msg::DetectDone { .. } => {}
                 // Same for egress live-checks.
                 Msg::EgressChecked { .. } => {}
                 Msg::Terminate => {

@@ -95,15 +95,69 @@ pub fn binary_is_stale() -> bool {
     let Ok(running) = std::fs::metadata("/proc/self/exe") else {
         return false;
     };
-    let Ok(link) = std::fs::read_link("/proc/self/exe") else {
+    let Some(path) = disk_binary_path() else {
         return false;
     };
-    let raw = link.to_string_lossy();
-    let path = raw.strip_suffix(" (deleted)").unwrap_or(raw.as_ref());
-    let Ok(disk) = std::fs::metadata(path) else {
+    let Ok(disk) = std::fs::metadata(&path) else {
         return false;
     };
     stale_meta(&running, &disk)
+}
+
+/// Where the running binary lives on disk, with Linux's " (deleted)" marker
+/// stripped — present exactly when the file was replaced after this process
+/// launched. `None` when /proc/self/exe cannot be read at all.
+pub fn disk_binary_path() -> Option<PathBuf> {
+    let link = std::fs::read_link("/proc/self/exe").ok()?;
+    Some(PathBuf::from(strip_deleted_suffix(&link.to_string_lossy())))
+}
+
+fn strip_deleted_suffix(raw: &str) -> String {
+    raw.strip_suffix(" (deleted)").unwrap_or(raw).to_string()
+}
+
+/// A deploy the user already committed to (Enter was pressed) that the
+/// running build is too outdated to perform. Persisted just before the
+/// panel re-execs onto the fresh binary so the new process resumes it at
+/// startup — a keystroke given to an old build never gets lost.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PendingAction {
+    pub payload: String,
+    pub route: PendingRoute,
+}
+
+/// Where a pending action should go once the fresh process picks it up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PendingRoute {
+    /// URL → autopilot: detect, store the manifest, deploy, no prompts.
+    Auto,
+    /// URL → prefilled wizard for step-by-step review.
+    Wizard,
+    /// A manifest path whose Confirm gate was already answered Yes.
+    PathDeploy,
+}
+
+pub fn pending_action_file() -> PathBuf {
+    state_home().join("demo-ghostprovider/pending-action.json")
+}
+
+/// Hand the action over to the next process (atomic, 0600 — same writer as
+/// the deploy journal).
+pub fn write_pending_action(action: &PendingAction) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(action).map_err(std::io::Error::other)?;
+    if let Some(parent) = pending_action_file().parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    crate::atomic::write_atomic(&pending_action_file(), &bytes)
+}
+
+/// Read-and-remove the handover: the file is consumed even when its content
+/// is garbage, so a corrupt handover can never loop across launches.
+pub fn take_pending_action() -> Option<PendingAction> {
+    let path = pending_action_file();
+    let bytes = std::fs::read(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Whether the on-disk file is a different build than the running image:
@@ -146,5 +200,42 @@ mod tests {
     fn freshly_launched_process_is_not_stale() {
         // The test binary runs straight from disk at its own path.
         assert!(!binary_is_stale());
+        // And its on-disk path is resolvable without a deleted marker.
+        let link = std::fs::read_link("/proc/self/exe").unwrap();
+        assert_eq!(disk_binary_path().as_deref(), Some(link.as_path()));
+    }
+
+    #[test]
+    fn deleted_marker_is_stripped_from_disk_path() {
+        assert_eq!(strip_deleted_suffix("/opt/gp/bin"), "/opt/gp/bin");
+        assert_eq!(strip_deleted_suffix("/opt/gp/bin (deleted)"), "/opt/gp/bin");
+    }
+
+    #[test]
+    fn pending_action_roundtrip_consumes_file_even_when_garbage() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("gp-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        #[allow(unsafe_code)] // test-only env mutation (XDG_STATE_HOME)
+        unsafe {
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
+
+        let action = PendingAction {
+            payload: "https://github.com/example/vert".into(),
+            route: PendingRoute::Auto,
+        };
+        write_pending_action(&action).unwrap();
+        assert_eq!(take_pending_action(), Some(action));
+        // Second read: gone — the handover fires exactly once.
+        assert_eq!(take_pending_action(), None);
+
+        // Corrupt content is consumed too (no retry loop across launches).
+        std::fs::create_dir_all(pending_action_file().parent().unwrap()).unwrap();
+        std::fs::write(pending_action_file(), b"{not json").unwrap();
+        assert_eq!(take_pending_action(), None);
+        assert!(!pending_action_file().exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
