@@ -12,9 +12,13 @@ In short: forking for yourself is fine; opening a pull request or making money w
 
 <h1 align="center">Automated self-hosting platform</h1>
 
-> <p align="center">GhostProvider — source-available платформа, упрощающая self-hosting</p>
+> <p align="center">GhostProvider — a source-available platform that makes self-hosting simple</p>
 
 ![GHOST PROVIDER Panel](assets/GHOSTPROVIDER%20PANEL.JPEG)
+
+GhostProvider is a terminal panel for Linux. It takes a GitHub URL or a
+`service.yaml`, builds the project in a sandbox and runs it as a systemd
+**user** service on your machine. No root, no cloud, no third parties.
 
 ## One-Click Deploy
 
@@ -24,6 +28,21 @@ Private, local, no third parties.
 ![Experience with GhostProvider](assets/user-experience.webp)
 
 [Watch the full experience as video (user-experience.mp4)](assets/user-experience.mp4)
+
+## The panel
+
+Eight screens, one menu:
+
+| # | Screen | What it does |
+|---|--------|--------------|
+| 1 | **System Scan** | shows interfaces, occupied ports and installed tools |
+| 2 | **Self-Hosting** | every deployed unit: start, stop, restart, status |
+| 3 | **Deploy Service** | deploy from a GitHub URL or a `service.yaml` |
+| 4 | **Add Service** | import a `service.yaml` into your library |
+| 5 | **My Services** | your added services with their deploy status |
+| 6 | **Edit Service** | change a deployed service — name, port, commit, limits |
+| 7 | **Egress** | what each service may reach outside, verified live |
+| 8 | **Logs** | three tabs: deploy, software and crash logs |
 
 ## Requirements
 
@@ -39,84 +58,112 @@ Private, local, no third parties.
 
 ## Why systemd?
 
-GhostProvider uses systemd user-level services because they provide:
-- **No root required** — every user can manage their own services
-- **Auto-start on login** — services survive reboots without manual config
-- **Clean removal** — `systemctl --user disable` + delete unit file; demo-ghostprovider also cleans the cloned repo, secrets file, and lingering ports
-- **Sandboxing** — built-in security directives (NoNewPrivileges, ProtectHome, ProtectSystem)
+GhostProvider runs every service as a systemd **user** unit:
 
-This is the standard on Arch, Ubuntu, Fedora, Debian, and most modern Linux distributions.
+- **No root** — you manage only your own services; nothing is installed system-wide.
+- **Starts with login** — services survive reboots without extra setup.
+- **Clean removal** — disable the unit and GhostProvider also wipes the clone,
+  the secrets file and the port it announced.
+- **Sandboxing** — every unit ships with NoNewPrivileges, ProtectHome and
+  ProtectSystem enabled.
+
+User units are the standard on Arch, Ubuntu, Fedora, Debian and most modern
+Linux distributions.
 
 ### When the clean removal happens
 
-GhostProvider cleans up everything it created for a service — the systemd unit,
-the secrets file, the cloned project tree (build caches included) and the
-announced port — in every scenario:
+GhostProvider removes the unit, the secrets file, the cloned repo (build
+caches included) and the announced port whenever a deploy did not finish
+cleanly:
 
-- **Explicit delete** — removing a service from *My Services* cleans unit, env
-  file, clone and registry entry.
-- **Failed deploy** — a deploy that fails in-process is rolled back and wiped
-  immediately (`clean removal` applies to the failed attempt, not just to a
-  finished service).
-- **User leaves while a deploy is running** (Ctrl+C / `q` / closing the
-  terminal, `SIGTERM`/`SIGHUP`) — the in-flight deploy is cleaned up as the
+- **Explicit delete** — removing a service from *My Services*.
+- **Failed deploy** — rolled back and wiped immediately.
+- **Panel closed mid-deploy** (Ctrl+C, `q`, SIGTERM/SIGHUP) — cleaned as the
   panel exits.
-- **The system shut down or rebooted mid-deploy** (or the panel was killed with
-  `SIGKILL`) — nothing can run while the machine is off, so the deploy is
-  recorded in an on-disk journal and fully removed on the next panel start.
-- **The panel is never launched again** — every install ships a
-  `demo-ghostprovider-cleanup` systemd user **timer** that periodically runs
-  `demo-ghostprovider __cleanup`, so leftovers of an interrupted deploy are
-  removed in the background even if the interactive panel never opens again.
+- **Shutdown or `SIGKILL` mid-deploy** — recorded in an on-disk journal and
+  removed on the next panel start.
+- **Panel never launched again** — the shipped `demo-ghostprovider-cleanup`
+  timer sweeps leftovers in the background.
+
+The sweep is race-free: a deploy holds an exclusive `flock` (`deploy.lock`)
+from the moment its journal entry is written until it is cleared. The kernel
+releases the lock on any exit — including `SIGKILL` and power loss — so the
+timer only removes deploys whose process is provably dead. A deploy that
+*finished* is never touched: its service is registered and auto-starts on
+login; removing it is always an explicit act.
 
 A scripted deploy (`demo-ghostprovider __deploy --manifest service.yaml`) gets
-the same treatment:
-the first `SIGINT`/`SIGTERM`/`SIGHUP` triggers the removal path and exits
-`130`, so Ctrl+C cannot leave a half-built clone behind.
-
-The background sweep is never racy with a live deploy: a deploy holds an
-exclusive `flock` (`deploy.lock`) from the moment its journal entry is written
-until it is cleared, so the timer only removes something when it sees a journal
-entry whose deploying process is provably dead (the kernel releases the lock
-automatically on any exit, including `SIGKILL`, shutdown and power loss).
-
-A deploy that *finished* is never touched by this: its service is registered
-and survives reboots (auto-start on login), and removing it is always an
-explicit act.
+the same treatment: the first `SIGINT`/`SIGTERM`/`SIGHUP` triggers the removal
+path and exits `130`.
 
 ## Security Model
 
-Here is the security module that Ghost Provider uses, this is the necessary architecture for the secure operation of the software.
+- **All data stays local** — every request goes through an HTTPS client locked
+  to a compile-time host allowlist, is recorded in net.log, and credentials
+  never leave api.github.com. Nothing is sent to third parties.
 
-- **All data stays local** — every request goes through an HTTPS client locked to a compile-time host allowlist, is recorded in net.log, and credentials never leave api.github.com. Nothing is sent to third parties.
+- **Outbound traffic is controlled per service** — two modes:
+  - **Allowlist** — the unit gets `IPAddressDeny=any` plus the hosts you
+    approved; the panel verifies the filter live and says honestly when the
+    kernel cannot enforce it (best-effort warning, never silent).
+  - **Deny-all** — the unit runs with `PrivateNetwork=yes` and a
+    socket-activated `__egress-shim`: the service gets a real network
+    namespace with **loopback only**, so its entire network is the localhost
+    tunnel and nothing else routes.
+  Hosts are detected from the manifest (`auto: true`) and you review the list
+  before deploying.
 
-- **DNS that survives broken VPN/TUN setups** — resolution is system `getaddrinfo` first; if that fails or times out (broken TUN DNS, `EAI_AGAIN` storms), the client transparently falls back to a DNS-over-HTTPS bootstrap at `cloudflare-dns.com` (pinned anycast IPs, Mozilla roots), which is allowlisted and net.log-recorded like any other outbound hop. Retries remain permanent — the deploy never fails closed on a transient network blip, and a network outage is reported as one clear status line instead of a retry storm.
+- **DNS that survives broken VPN/TUN setups** — system `getaddrinfo` first;
+  if that fails, a pinned DNS-over-HTTPS fallback at `cloudflare-dns.com`
+  (pinned anycast IPs, Mozilla roots). Retries never fail closed on a
+  transient network blip.
 
-- **No root required** — services run as ordinary systemd user units; no sudo, no elevated privileges, nothing installed system-wide.
+- **No root required** — ordinary systemd user units; nothing installed
+  system-wide.
 
-- **Explicit confirmation before deploy** — a deploy only starts after you explicitly confirm it; nothing is built or installed on its own.
+- **Explicit confirmation before deploy** — nothing is built or installed
+  on its own.
 
-- **Sandbox** — builds run in a mandatory isolated environment (sandboxed home, locked-down network, resource caps). A deploy proceeds only when the sandbox verifies as FULL.
+- **Sandbox** — builds run in an isolated environment (sandboxed home,
+  locked-down network, resource caps). A deploy proceeds only when the sandbox
+  verifies as FULL.
 
-- **Pinned build tools, provisioned into the project cache** — when a service needs the build tools `bun`/`pnpm`/`go` and none (or an outdated one) is installed, the exact pinned release is downloaded through the same allowlisted, net.log-recorded client, SHA-256-verified against a compiled-in checksum table, and extracted into the project's `.ghost-cache` (never system-wide, no root). `python3` remains a hard system requirement.
+- **Pinned build tools, provisioned into the project cache** — `bun`, `pnpm`,
+  `go` and pip wheels are downloaded through the same allowlisted client,
+  SHA-256-verified against compiled-in checksums and unpacked into the
+  project's `.ghost-cache` (never system-wide). Python installs then run
+  offline from that wheelhouse. `python3` itself remains a hard system
+  requirement.
 
 ## System Scan
 
-Scans your machine for prerequisites and maps occupied ports with their owning processes — nothing more. Deliberately: no VPN status details (the one exception is the boolean presence of the `tailscale` binary — no login state, no peers), no service fingerprinting, so the report stays useless to anyone but you. "Network" is measured with the same allowlisted, net.log-recorded HTTPS GET to github.com the fetches use — never ICMP ping or raw DNS.
+Before deploying, GhostProvider checks what is already on your machine:
 
-### Why System Scan?
+- **Prerequisites** — python3, cargo, git, systemd.
+- **Listening ports** — which ports are taken and by which process.
+- **Known services** — is VERT, SearXNG or Memos already running?
+- **Tailscale** — the `tailscale` binary is present (presence only; the tunnel
+  state is shown in the Self-Hosting panel).
 
-Before deploying a new service, demo-ghostprovider checks what's already running on your machine:
-- **Prerequisites** — do you have cargo, systemd, git installed?
-- **Listening ports** — which ports are already in use?
-- **Known services** — is SearXNG, Memos, or VERT already running?
-- **Tailscale** — is the `tailscale` binary present? (Presence only; the tunnel state itself is shown in the Self-Hosting panel.)
-
-This avoids port conflicts and helps GhostProvider choose the right deployment strategy. All data stays on your machine — nothing is sent anywhere.
+That avoids port conflicts and helps pick the right deploy strategy. The scan
+stays useless to anyone but you: no VPN login state, no service fingerprinting;
+reachability is measured with the same allowlisted, net.log-recorded HTTPS GET
+to github.com — never an ICMP ping.
 
 ## Control panel
 
-Full dashboard for all deployed services. Start, stop, restart, or remove — one click cleans the service, unit file, cloned repo, secrets file, and lingering ports. GhostProvider cleans up the resources it manages; applications may still leave their own state (databases, caches, external sockets) elsewhere. When the tailscaled daemon is up, the panel also shows a read-only tailscale status row (`running` / `stopped` / `needs login`) — the tunnel itself is never touched by the panel.
+A full dashboard for everything that runs: start, stop, restart or remove —
+one removal cleans the service, unit file, cloned repo, secrets file and
+lingering ports. GhostProvider cleans the resources it manages; applications
+may still leave their own state (databases, caches, external sockets)
+elsewhere.
+
+- **Egress screen** — each service's outbound policy with live verification,
+  including an explicit `deny-all: REAL (private netns)` row while the
+  loopback-only tunnel is active.
+- **Logs screen** — three tabs: **Deploy**, **Software** and **Crash**.
+- **Tailscale** — a read-only status row (`running` / `stopped` /
+  `needs login`) whenever the daemon is up; the panel never touches the tunnel.
 
 ## Service support
 
@@ -129,10 +176,17 @@ This demo ships three reference `service.yaml` manifests in `docs/examples/`
 
 Nothing deploys from a URL by itself: paste a GitHub URL anywhere (panel
 Deploy input, `demo-ghostprovider __deploy URL`) and the stack is detected
-into a `service.yaml` you review before deploying. Same format for every
-service: `demo-ghostprovider __check-manifest service.yaml`
-validates and prints the deploy plan, `demo-ghostprovider __deploy --manifest service.yaml`
-deploys it through the identical sandbox + loopback + cleanup pipeline.
+into a `service.yaml` you review before deploying — pressing **Enter** on a
+detected URL runs the autopilot (detect → store manifest → deploy). Same
+format for every service:
+
+```bash
+demo-ghostprovider __check-manifest service.yaml    # validate and print the plan
+demo-ghostprovider __deploy --manifest service.yaml # deploy it
+```
+
+Both go through the identical sandbox + loopback + cleanup pipeline.
+
 In the panel, menu item 4 (Add Service) imports `service.yaml` files into your
 library (`~/.local/share/demo-ghostprovider/manifests/`) for one-key redeploys,
 or walks you through writing one with the built-in 9-step wizard (first row);
@@ -168,6 +222,9 @@ demo-ghostprovider                                  # launch the interactive pan
 demo-ghostprovider --show-endpoints                 # allowlist + session request counters
 demo-ghostprovider --selftest                       # E2E check against live systemd (loopback only)
 demo-ghostprovider --verify-sandbox                 # audit the build sandbox under strace (needs strace)
+demo-ghostprovider __check-manifest PATH            # validate a service.yaml and print the plan
+demo-ghostprovider __deploy --manifest PATH         # deploy one service.yaml
+demo-ghostprovider __deploy GITHUB_URL              # detect the stack, print service.yaml to stdout
 demo-ghostprovider __cleanup                        # manual leftover sweep (runs automatically via a timer)
 demo-ghostprovider --version                        # print version
 ```
