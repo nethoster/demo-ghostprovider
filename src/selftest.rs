@@ -43,16 +43,14 @@ pub fn run() -> anyhow::Result<()> {
         extra_env: &[],
         res: crate::hoster::units::ResourceLimits::none(),
         egress_allow: &[],
+        port,
     };
     units::create_unit(&spec).context("unit creation")?;
 
-    let out = std::process::Command::new("systemctl")
-        .args(["--user", "start", "--no-block", "gp-selftest"])
-        .status()
-        .context("systemctl start")?;
-    if !out.success() {
-        bail!("systemctl start failed");
-    }
+    // Empty egress_allow puts the unit in netns deny-all mode (PrivateNetwork
+    // + .socket + __egress-shim) — the selftest therefore live-proves the
+    // real no-egress mechanism, not just the IP-filter decoration.
+    units::start_unit("gp-selftest").context("systemctl start")?;
 
     println!("waiting for activation (polling)...");
     let mut attempts = 0;

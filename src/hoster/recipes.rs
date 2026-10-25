@@ -30,6 +30,11 @@ pub struct DemoRecipe {
     /// public env, without which `$env/static/public` imports fail the
     /// offline vite build. Runtime units never see these.
     pub build_env: &'static [(&'static str, &'static str)],
+    /// Runtime environment variables (`run.env` in the manifest), written
+    /// to the unit's 0600 EnvironmentFile. Values may hold `{port}` and
+    /// `{secret}` (fresh per-deploy hex) — resolved in `deploy.rs` when the
+    /// unit is written.
+    pub run_env: &'static [(&'static str, &'static str)],
     /// Host-phase dependency pre-fetch steps, run BEFORE the sandboxed build
     /// with network available (see `prefetch.rs`). These fill the tool caches
     /// so each sandboxed build step below runs fully offline. They are
@@ -51,13 +56,18 @@ pub struct DemoRecipe {
     pub start_cmd: &'static str,
     /// 0 = pick a random free port.
     pub port: u16,
-    pub searxng: bool,
     /// Executables required on PATH for the build steps to succeed.
     pub tools: &'static [&'static str],
     /// Runtime egress exceptions: hostnames/IPv4 the unit may reach besides
     /// loopback (empty = historic deny-all). Converted from the manifest's
     /// `egress.allow`, normalized there.
     pub egress_allow: &'static [&'static str],
+    /// May the deploy auto-fill `egress_allow` from what the source tree
+    /// declares (e.g. a searx-style settings file's engine list)? True
+    /// only when the manifest's `egress.allow` is empty and `egress.auto`
+    /// is still `None` (untouched) — a user-edited list (even emptied) is
+    /// sacred.
+    pub egress_may_autofill: bool,
     /// systemd resource caps for the deployed unit (cgroup memory/tasks
     /// bounds): a runaway demo service must never grind the whole user
     /// session. See `units.rs::ResourceLimits`.

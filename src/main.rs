@@ -12,6 +12,9 @@
 //!                        no outbound connects, no code-loading exec's
 //!   __serve-static DIR PORT   internal: static server used by deployed units
 //!   __egress-probe [--hosts a,b]  internal: probe beats for egress checks
+//!   __egress-shim PORT -- CMD...  internal: netns deny-all front — adopts the
+//!                        socket-unit listener (fd 3) and bridges it to CMD
+//!                        inside the private network namespace
 //!   __check-manifest PATH   validate a service.yaml and print the plan
 //!   __recipe-edit ID        edit a stored service.yaml in $EDITOR (re-validated)
 //!   __deploy URL            detect the stack of a GitHub URL and print a
@@ -88,6 +91,10 @@ fn main() -> anyhow::Result<()> {
                 .context("usage: __serve-static DIR PORT")?
                 .parse()?;
             serve::serve_static(std::path::Path::new(dir), port)?;
+        }
+        // Internal subcommand used by netns deny-all units. Not advertised.
+        Some("__egress-shim") => {
+            demo_ghostprovider::hoster::shim::run(&args[1..])?;
         }
         // Internal subcommand for scripted E2E: full pipeline without the TUI.
         // Internal subcommand for the demo-ghostprovider-cleanup systemd user
@@ -208,9 +215,13 @@ fn main() -> anyhow::Result<()> {
 
 /// Clean up artifacts left by deploys interrupted out-of-band (panel exit,
 /// kill, shutdown/reboot) before the interactive/scripted entry starts, and
-/// surface what was removed on stderr.
+/// surface what was removed on stderr. Lock-guarded: while another process
+/// is deploying, its live tree is left alone (deferred to the next launch
+/// or the cleanup timer once the lock is free).
 fn reconcile_on_startup() {
-    for m in demo_ghostprovider::hoster::deploy::reconcile_stale(false) {
+    for m in demo_ghostprovider::hoster::deploy::reconcile_stale_locked(
+        demo_ghostprovider::hoster::deploy::ReconcileBasis::Startup,
+    ) {
         eprintln!("{m}");
     }
 }
@@ -239,8 +250,10 @@ fn arm_deploy_signal_watchdog() {
         // on the next launch.
         demo_ghostprovider::hoster::cancel::request_exit();
         demo_ghostprovider::hoster::deploy::quiesce(std::time::Duration::from_secs(3));
-        for m in demo_ghostprovider::hoster::deploy::reconcile_stale_with_basis(
-            false,
+        // Lock-guarded: this process just released its own deploy lock, so
+        // the sweep runs — unless a different session is deploying, whose
+        // live tree must survive.
+        for m in demo_ghostprovider::hoster::deploy::reconcile_stale_locked(
             demo_ghostprovider::hoster::deploy::ReconcileBasis::Exit,
         ) {
             eprintln!("{m}");

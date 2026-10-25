@@ -7,7 +7,7 @@
 //! in-process rollback. An entry still present at the next launch therefore
 //! means the previous run was interrupted out-of-band (user exited the panel,
 //! the process was killed, or the machine shut down / rebooted), and the
-//! orphaned artifacts must be removed. See [`crate::hoster::deploy::reconcile_stale`].
+//! orphaned artifacts must be removed. See [`crate::hoster::deploy::reconcile_stale_locked`].
 
 use std::collections::BTreeMap;
 

@@ -148,10 +148,16 @@ impl ResourceLimits {
 /// home + inaccessible invoker secret roots, strict-ish filesystem
 /// protection with a writable working dir, kernel/control-group locks,
 /// seccomp deny-list, empty capability bounding set, per-recipe
-/// CPU/memory/tasks caps. Every unit is locked to loopback: services have
-/// IP-level egress removed at the systemd firewall (`IPAddressDeny=any` +
-/// `IPAddressAllow=127.0.0.1 ::1`), so a compromised build output can never
-/// phone home.
+/// CPU/memory/tasks caps. Egress comes in two shapes:
+///
+///   * `egress.allow` non-empty → the systemd IP firewall
+///     (`IPAddressDeny=any` + `IPAddressAllow=127.0.0.1 ::1 <exceptions>`)
+///     — best-effort on hosts where unprivileged eBPF is disabled;
+///   * empty → a REAL deny-all: `PrivateNetwork=yes` puts the unit in a
+///     network namespace with no route out, and a companion `.socket` unit
+///     hands the host-facing loopback listener to `__egress-shim` (fd 3),
+///     which bridges it to the app inside the namespace. No exception list
+///     exists to weaken.
 pub struct UnitSpec<'a> {
     pub service_name: &'a str,
     pub working_dir: &'a Path,
@@ -164,8 +170,14 @@ pub struct UnitSpec<'a> {
     /// Per-service egress exceptions (manifest `egress.allow`) — already
     /// resolved to literal addresses by the deploy pipeline: systemd's
     /// `IPAddressAllow=` rejects hostnames, so names never reach the unit.
-    /// Empty keeps the historic deny-all: loopback only.
+    /// Empty switches the unit to the netns deny-all mode (PrivateNetwork
+    /// plus a `.socket` companion and `__egress-shim`); non-empty renders
+    /// the IP allowlist on top of the historic deny-all.
     pub egress_allow: &'a [&'a str],
+    /// The port the service (and, in netns mode, its `.socket` companion)
+    /// uses. Only rendered in netns mode / the socket unit; the app command
+    /// already carries it via `exec_start`.
+    pub port: u16,
 }
 
 pub fn create_unit(spec: &UnitSpec) -> anyhow::Result<()> {
@@ -173,7 +185,7 @@ pub fn create_unit(spec: &UnitSpec) -> anyhow::Result<()> {
     let unit_dir = crate::paths::user_unit_dir();
     std::fs::create_dir_all(&unit_dir)?;
 
-    // Stale drop-ins (e.g. an old SEARXNG_SETTINGS_PATH override pointing at
+    // Stale drop-ins (e.g. an old settings-path override pointing at
     // a file the current recipe never creates) otherwise survive redeploys:
     // systemd merges them over the fresh unit and the service crash-loops
     // while the deploy reports success. Current units carry all env inline,
@@ -199,9 +211,25 @@ pub fn create_unit(spec: &UnitSpec) -> anyhow::Result<()> {
     crate::atomic::write_atomic(&unit_path, content.as_bytes())
         .with_context(|| format!("writing unit {}", unit_path.display()))?;
 
+    // Netns mode also needs the host-facing listener: a companion .socket
+    // unit that binds 127.0.0.1:port and hands the fd to the service
+    // (LISTEN_FDS). The reverse mode switch (allowlist gained) drops a
+    // stale socket so only the IP filter guards the unit.
+    let socket_path = unit_dir.join(format!("{service_name}.socket"));
+    if spec.egress_allow.is_empty() {
+        let sock = render_socket_unit(spec);
+        crate::atomic::write_atomic(&socket_path, sock.as_bytes())
+            .with_context(|| format!("writing socket unit {}", socket_path.display()))?;
+    } else if socket_path.exists() {
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
     // Best effort reload/enable; failures surface at start time.
     let _ = systemctl(&["daemon-reload"]);
     let _ = systemctl(&["enable", &service_name]);
+    if spec.egress_allow.is_empty() {
+        let _ = systemctl(&["enable", &format!("{service_name}.socket")]);
+    }
     Ok(())
 }
 
@@ -369,15 +397,16 @@ fn render_unit(spec: &UnitSpec) -> anyhow::Result<String> {
     // a single value and stays unquoted.
     let working = escape_unit_value(&spec.working_dir.to_string_lossy());
     let inaccessible = inaccessible_paths();
-    // Egress is denied for EVERY service by default. IPAddressAllow takes
-    // precedence over IPAddressDeny, so `Deny=any` + `Allow=127.0.0.1 ::1`
-    // means the unit may only talk to loopback: the localhost:PORT surface
-    // stays reachable while any outbound connection fails at the systemd
-    // firewall level. A manifest `egress.allow` list appends exceptions
-    // (each a conscious trust decision recorded in service.yaml) — already
-    // resolved to literal addresses by the deploy pipeline, because
-    // IPAddressAllow= rejects hostnames and would refuse the whole unit.
-    // Empty keeps the historic deny-all byte-for-byte.
+    // Egress: the IP filter renders for EVERY unit as defense-in-depth.
+    // IPAddressAllow takes precedence over IPAddressDeny, so `Deny=any` +
+    // `Allow=127.0.0.1 ::1` means only loopback passes the systemd firewall.
+    // A manifest `egress.allow` list appends exceptions (each a conscious
+    // trust decision recorded in service.yaml) — already resolved to
+    // literal addresses by the deploy pipeline, because IPAddressAllow=
+    // rejects hostnames and would refuse the whole unit. On hosts where
+    // unprivileged eBPF is disabled this filter is decoration; the REAL
+    // guarantee for the empty-allow case is the private network namespace
+    // rendered below.
     let mut ip_filter = String::from("IPAddressDeny=any\nIPAddressAllow=127.0.0.1 ::1");
     for h in spec.egress_allow {
         ip_filter.push(' ');
@@ -387,6 +416,27 @@ fn render_unit(spec: &UnitSpec) -> anyhow::Result<String> {
     // Per-unit traffic accounting: the Egress screen reads IPEgressBytes /
     // IPIngressBytes back. Counting only — enforcement stays above.
     let ip_filter = ip_filter + "IPAccounting=yes\n";
+    // Netns deny-all mode (empty allow): PrivateNetwork=yes gives the unit
+    // a network namespace with no route out (loopback only, inside). The
+    // host-facing listener lives in the .socket companion unit; ExecStart
+    // becomes __egress-shim, which adopts that socket (LISTEN_FDS, fd 3)
+    // and bridges every host connection to the app's loopback listener
+    // inside the namespace. The app command itself is unchanged.
+    let netns = spec.egress_allow.is_empty();
+    let exec = if netns {
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "demo-ghostprovider".into());
+        format!(
+            "\"{}\" \"__egress-shim\" \"{}\" \"--\" {}",
+            escape_unit_value(&exe),
+            spec.port,
+            quote_exec_args(spec.exec_start)
+        )
+    } else {
+        quote_exec_args(spec.exec_start)
+    };
+    let private_net = if netns { "PrivateNetwork=yes\n" } else { "" };
     let content = format!(
         "[Unit]\nDescription={desc}\nAfter=network.target\n\n\
           [Service]\nType=simple\nWorkingDirectory={working}\nExecStart={exec}\n\
@@ -399,6 +449,7 @@ fn render_unit(spec: &UnitSpec) -> anyhow::Result<String> {
               # runtime_unset_environment()).\n\
      UnsetEnvironment={unset_env}\n\
          # -- Privacy & Security Hardening --\n\
+         {private_net}\
          NoNewPrivileges=yes\nProtectHome=read-only\nProtectSystem=full\n\
          ReadWritePaths=\"{working}\"\nEnvironment=\"HOME={working}/.ghost-cache/home\"\nEnvironment=\"XDG_CACHE_HOME={working}/.ghost-cache\"\nEnvironment=\"XDG_RUNTIME_DIR={working}/.ghost-cache/runtime\"\n\
          InaccessiblePaths={inaccessible}\n\
@@ -414,12 +465,61 @@ RestrictSUIDSGID=yes\nProtectProc=invisible\nPrivateDevices=yes\nProcSubset=pid\
             spec.description
         }),
         working = working,
-        exec = quote_exec_args(spec.exec_start),
+        exec = exec,
+        private_net = private_net,
          res_lines = res_lines,
         ip_filter = ip_filter,
         unset_env = runtime_unset_environment(),
     );
     Ok(content)
+}
+
+/// Companion `.socket` unit for netns deny-all mode: binds the host-facing
+/// loopback listener and hands the listening fd to the service via the
+/// LISTEN_FDS handshake (systemd socket activation). The fd transcends the
+/// service's private network namespace, so the host can still reach the
+/// app through `__egress-shim` while the app itself has no route out.
+pub fn render_socket_unit(spec: &UnitSpec) -> String {
+    let service_name = sanitize_service_name(spec.service_name);
+    format!(
+        "[Unit]\nDescription={} (egress listener)\n\n\
+         [Socket]\nListenStream=127.0.0.1:{}\n\n\
+         [Install]\nWantedBy=sockets.target\n",
+        escape_unit_value(if spec.description.is_empty() {
+            &service_name
+        } else {
+            spec.description
+        }),
+        spec.port,
+    )
+}
+
+/// Start a unit, activating its `.socket` companion first when one exists
+/// (netns deny-all mode): systemd only passes the listening fd when the
+/// socket unit is already active, so the service must not start bare.
+/// A non-zero exit means the unit/job was rejected outright (bad unit, dead
+/// user manager) — fail closed instead of masking it as a later timeout.
+pub fn start_unit(service: &str) -> anyhow::Result<()> {
+    let socket = crate::paths::user_unit_dir().join(format!("{service}.socket"));
+    if socket.is_file() {
+        let st = Command::new("systemctl")
+            .args(["--user", "start", &format!("{service}.socket")])
+            .status()
+            .with_context(|| format!("systemctl start {service}.socket"))?;
+        anyhow::ensure!(
+            st.success(),
+            "systemctl start rejected the socket unit {service}.socket (non-zero exit)"
+        );
+    }
+    let st = Command::new("systemctl")
+        .args(["--user", "start", "--no-block", service])
+        .status()
+        .with_context(|| format!("systemctl start {service}"))?;
+    anyhow::ensure!(
+        st.success(),
+        "systemctl start rejected the unit {service} (non-zero exit)"
+    );
+    Ok(())
 }
 
 /// Per-unit traffic counters (egress, ingress) in bytes, via the
@@ -501,12 +601,19 @@ pub fn service_logs(service: &str, lines: usize) -> String {
         .unwrap_or_default()
 }
 
-/// Stop, disable and delete a user unit (best-effort cleanup).
+/// Stop, disable and delete a user unit (best-effort cleanup). The netns
+/// deny-all companion `.socket` is torn down with the service so the host
+/// port is actually released.
 pub fn remove_unit(service: &str) {
     let _ = systemctl(&["stop", service]);
     let _ = systemctl(&["disable", service]);
+    let sock = format!("{service}.socket");
+    let _ = systemctl(&["stop", &sock]);
+    let _ = systemctl(&["disable", &sock]);
     let unit = crate::paths::user_unit_dir().join(format!("{service}.service"));
     let _ = std::fs::remove_file(unit);
+    let socket = crate::paths::user_unit_dir().join(format!("{service}.socket"));
+    let _ = std::fs::remove_file(socket);
     let dropin = crate::paths::user_unit_dir().join(format!("{service}.service.d"));
     if dropin.is_dir() {
         let _ = std::fs::remove_dir_all(dropin);
@@ -576,6 +683,7 @@ mod tests {
                 limit_nofile: Some(4096),
                 oom_score_adjust: Some(-100),
             },
+            port: 8000,
         };
         let content = render_unit(&spec).unwrap();
         for needle in [
@@ -597,6 +705,10 @@ mod tests {
             "ProcSubset=pid\n",
             "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\n",
             "SystemCallFilter=~@mount @swap @reboot @cpu-emulation @obsolete @module @raw-io @clock @debug\n",
+            // Empty allowlist → REAL deny-all: private network namespace +
+            // socket-activation shim (the IP filter alone is best-effort
+            // where unprivileged eBPF is disabled).
+            "PrivateNetwork=yes\n",
             "IPAddressDeny=any\n",
             "IPAddressAllow=127.0.0.1 ::1\n",
             // Traffic accounting for the Egress screen rides on every unit.
@@ -604,6 +716,15 @@ mod tests {
         ] {
             assert!(content.contains(needle), "missing {needle:?}");
         }
+        // ExecStart must route through the shim with the assigned port.
+        let exec_line = content
+            .lines()
+            .find(|l| l.starts_with("ExecStart="))
+            .expect("ExecStart directive");
+        assert!(
+            exec_line.contains("__egress-shim") && exec_line.contains("\"8000\" \"--\""),
+            "netns ExecStart must wrap the app in __egress-shim: {exec_line}"
+        );
         // InaccessiblePaths is derived from $HOME (CI runs as /home/runner) and
         // only includes roots that actually exist, so assert the directive is
         // present and every existing secret root made it in.
@@ -637,11 +758,11 @@ mod tests {
         assert!(!content.contains("OOMScoreAdjust="));
     }
 
-    /// Egress exceptions append to the loopback Allow line (never replace
-    /// the deny-all), and stay empty by default. The strings are literal
-    /// addresses — hostnames never reach the unit (deploy resolves them;
-    /// see `egress::resolve_egress_hosts`), which this test pins by only
-    /// ever rendering IPs.
+    /// Egress exceptions render the IP-filter mode: an empty allowlist gets
+    /// the netns deny-all (PrivateNetwork + shim, no socket); a non-empty
+    /// list renders IPAddressDeny/Allow with the exceptions appended — the
+    /// strings are literal addresses, hostnames never reach the unit
+    /// (deploy resolves them; see `egress::resolve_egress_hosts`).
     #[test]
     fn egress_allow_renders_ip_exceptions() {
         let base = UnitSpec {
@@ -653,11 +774,20 @@ mod tests {
             extra_env: &[],
             egress_allow: &[],
             res: ResourceLimits::none(),
+            port: 8000,
         };
         let content = render_unit(&base).unwrap();
         assert!(
+            content.contains("PrivateNetwork=yes\n"),
+            "empty allow must render the real deny-all (private network namespace)"
+        );
+        assert!(
             content.contains("IPAddressAllow=127.0.0.1 ::1\n"),
-            "empty allow must keep the loopback-only line byte-for-byte"
+            "empty allow keeps the loopback-only IP line as defense-in-depth"
+        );
+        assert!(
+            render_socket_unit(&base).contains("ListenStream=127.0.0.1:8000\n"),
+            "empty allow needs the .socket companion binding the host port"
         );
         let spec = UnitSpec {
             egress_allow: &["93.184.216.34", "1.1.1.1"],
@@ -669,6 +799,35 @@ mod tests {
             "allow list must append to the same Allow line"
         );
         assert!(content.contains("IPAddressDeny=any\n"));
+        assert!(
+            !content.contains("PrivateNetwork=yes"),
+            "allowlist mode keeps the service on the host network"
+        );
+        assert!(
+            !content.contains("__egress-shim"),
+            "allowlist mode must not wrap ExecStart in the shim"
+        );
+    }
+
+    /// The `.socket` companion binds exactly the assigned loopback port and
+    /// is wanted by sockets.target (socket activation at boot).
+    #[test]
+    fn socket_unit_binds_host_loopback() {
+        let spec = UnitSpec {
+            service_name: "demo-x",
+            working_dir: Path::new("/tmp/x"),
+            exec_start: "/x/serve 8123",
+            description: "demo",
+            env_file: None,
+            extra_env: &[],
+            egress_allow: &[],
+            res: ResourceLimits::none(),
+            port: 8123,
+        };
+        let sock = render_socket_unit(&spec);
+        assert!(sock.contains("[Socket]\n"));
+        assert!(sock.contains("ListenStream=127.0.0.1:8123\n"));
+        assert!(sock.contains("WantedBy=sockets.target\n"));
     }
 
     /// Runtime `UnsetEnvironment=` must always cover the sandbox scrub lists
@@ -686,6 +845,7 @@ mod tests {
             extra_env: &[],
             egress_allow: &[],
             res: ResourceLimits::none(),
+            port: 8000,
         })
         .unwrap();
         let line = content

@@ -172,6 +172,12 @@ pub struct RunSpec {
     pub command: Vec<String>,
     #[serde(default = "default_port")]
     pub port: u16,
+    /// Runtime environment variables, written to a per-service 0600
+    /// EnvironmentFile. Values may use the `{port}` placeholder and
+    /// `{secret}` (fresh 16-byte hex per deploy) — e.g. an app config that
+    /// documents an env override for a committed placeholder secret.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 fn default_port() -> u16 {
@@ -226,6 +232,12 @@ pub struct PluginPin {
 pub struct EgressSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
+    /// Auto-fill policy: `None` = untouched (deploy may fill `allow` from
+    /// what the tree declares, when it declares anything); `Some(true)` =
+    /// the deploy already filled it; `Some(false)` = the user edited the
+    /// list (even to empty) and the deploy must never touch it again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<bool>,
 }
 
 /// Max allowed egress hosts per service (v1): keeps the unit line and the
@@ -233,7 +245,7 @@ pub struct EgressSpec {
 pub const MAX_EGRESS_HOSTS: usize = 8;
 
 /// Validate one egress host; returns it normalized (trimmed, lowercased).
-fn validate_egress_host(host: &str) -> Result<String, String> {
+pub(crate) fn validate_egress_host(host: &str) -> Result<String, String> {
     let t = host.trim().to_lowercase();
     if t.is_empty() || t.len() > 253 {
         return Err(format!("egress host must be 1..=253 chars: '{host}'"));
@@ -304,11 +316,6 @@ pub struct ServiceManifest {
     pub healthcheck: Option<HealthcheckSpec>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plugins: Vec<PluginPin>,
-    /// SearXNG-style settings patch (secret + loopback bind). Only valid
-    /// with `build.profile: python-searxng`; kept explicit instead of an
-    /// `if id == ...` in the engine.
-    #[serde(default)]
-    pub searxng: bool,
     /// Extra build tools required on PATH (provisionable: bun/pnpm/go).
     #[serde(default)]
     pub tools: Vec<String>,
@@ -397,19 +404,13 @@ impl ServiceManifest {
         }
         // ── profile ──
         match self.build.profile.as_str() {
-            "bun" | "python" | "python-searxng" | "go" | "node" => {}
+            "bun" | "python" | "go" | "node" => {}
             other => anyhow::bail!(
                 "{}",
                 at(&format!(
-                    "build.profile '{other}' unsupported (bun|python|python-searxng|go|node)"
+                    "build.profile '{other}' unsupported (bun|python|go|node)"
                 ))
             ),
-        }
-        if self.searxng && self.build.profile != "python-searxng" {
-            anyhow::bail!(
-                "{}",
-                at("searxng: true requires build.profile: python-searxng")
-            );
         }
         // ── tools ──
         for t in &self.tools {
@@ -526,25 +527,82 @@ impl ServiceManifest {
             }
         }
         let joined = self.run.command.join(" ");
-        // SearXNG receives its port via settings.yml patch (prepare_searxng_config),
-        // not via CLI argv — so {port} is required everywhere except searxng.
-        if !self.searxng && !joined.contains("{port}") {
-            anyhow::bail!("{}", at("run.command must contain the {port} placeholder"));
-        }
-        // Loopback pin: the deployed unit must bind 127.0.0.1 (or be our
-        // loopback static server / searxng-patched).
-        let loopback_ok =
-            joined.contains("__serve-static") || joined.contains("127.0.0.1") || self.searxng;
-        if !loopback_ok {
+        // The assigned port must reach the app somewhere: argv (`--port
+        // {port}`) or the environment (`PORT: '{port}'` — the convention the
+        // recipe also exports by default). Command-only would reject every
+        // env-binding app.
+        let env_has_port = self.run.env.values().any(|v| v.contains("{port}"));
+        if !joined.contains("{port}") && !env_has_port {
             anyhow::bail!(
                 "{}",
-                at(
-                    "run.command must bind loopback: use __serve-static or 127.0.0.1 (or searxng patch)"
-                )
+                at("run.command or run.env must contain the {port} placeholder")
+            );
+        }
+        // Loopback pin: the deployed unit must bind 127.0.0.1 (or be our
+        // loopback static server).
+        if !(joined.contains("__serve-static") || joined.contains("127.0.0.1")) {
+            anyhow::bail!(
+                "{}",
+                at("run.command must bind loopback: use __serve-static or 127.0.0.1")
             );
         }
         if !(self.run.port == 0 || (1024..=65535).contains(&self.run.port)) {
             anyhow::bail!("{}", at("run.port must be 0 (random) or 1024..=65535"));
+        }
+        // ── run.env: same shape rules as build.env, plus placeholder check
+        // so a typo like {secert} fails validation instead of shipping the
+        // literal braces to the unit ──
+        if self.run.env.len() > 64 {
+            anyhow::bail!("{}", at("run.env holds at most 64 variables"));
+        }
+        for (k, v) in &self.run.env {
+            if k.is_empty()
+                || k.len() > 128
+                || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                || k.starts_with(|c: char| c.is_ascii_digit())
+            {
+                anyhow::bail!(
+                    "{}",
+                    at(&format!(
+                        "run.env key must be [A-Za-z_][A-Za-z0-9_] (got {k:?})"
+                    ))
+                );
+            }
+            if v.len() > 4096 || v.contains('\0') || v.contains('\n') {
+                anyhow::bail!(
+                    "{}",
+                    at(&format!(
+                        "run.env value for {k} must be ≤4096 chars without NUL/newlines"
+                    ))
+                );
+            }
+            let mut rest = v.as_str();
+            while let Some(open) = rest.find('{') {
+                if rest[..open].contains('}') {
+                    anyhow::bail!("{}", at(&format!("run.env value for {k} has a stray }}")));
+                }
+                let Some(close) = rest[open + 1..].find('}') else {
+                    anyhow::bail!(
+                        "{}",
+                        at(&format!(
+                            "run.env value for {k} has an unclosed {{placeholder"
+                        ))
+                    );
+                };
+                let token = &rest[open + 1..open + 1 + close];
+                if token != "port" && token != "secret" {
+                    anyhow::bail!(
+                        "{}",
+                        at(&format!(
+                            "run.env value for {k} has unknown placeholder {{{token}}} (port|secret)"
+                        ))
+                    );
+                }
+                rest = &rest[open + 1 + close + 1..];
+            }
+            if rest.contains('}') {
+                anyhow::bail!("{}", at(&format!("run.env value for {k} has a stray }}")));
+            }
         }
         // ── resources (budgets are mandatory: unbounded units can grind the session) ──
         if self.resources.memory_max.is_none() || self.resources.tasks_max.is_none() {
@@ -560,6 +618,14 @@ impl ServiceManifest {
                 at(&format!(
                     "egress.allow holds at most {MAX_EGRESS_HOSTS} hosts"
                 ))
+            );
+        }
+        if self.egress.auto == Some(true) && self.egress.allow.is_empty() {
+            anyhow::bail!(
+                "{}",
+                at(
+                    "egress.auto=true requires a non-empty egress.allow (a filled list is the point)"
+                )
             );
         }
         {
@@ -646,10 +712,15 @@ impl ServiceManifest {
             self.resources.cpu_quota
         ));
         if self.egress.allow.is_empty() {
-            out.push_str("egress:   loopback only (deny-all)\n");
+            out.push_str("egress:   loopback only (deny-all — private network namespace)\n");
         } else {
+            let auto = if self.egress.auto == Some(true) {
+                " (auto)"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "egress:   loopback + {}\n",
+                "egress:   loopback + {}{auto}\n",
                 self.egress.allow.join(", ")
             ));
         }
@@ -801,6 +872,19 @@ pub fn to_leaked_recipe(m: &ServiceManifest) -> super::recipes::DemoRecipe {
         .iter()
         .map(|(k, v)| (leak_str(k), leak_str(v)))
         .collect();
+    let mut run_env: Vec<(&'static str, &'static str)> = m
+        .run
+        .env
+        .iter()
+        .map(|(k, v)| (leak_str(k), leak_str(v)))
+        .collect();
+    // PORT={port} on every deploy unless the manifest sets PORT itself: the
+    // industry-standard convention — next/nuxt/express/uvicorn-with-env and
+    // hundreds more bind exactly where the healthcheck probes. Harmless for
+    // servers that ignore it.
+    if !m.run.env.contains_key("PORT") {
+        run_env.push(("PORT", "{port}"));
+    }
     let tools: Vec<&'static str> = m.tools.iter().map(|t| leak_str(t)).collect();
     let egress: Vec<&'static str> = m
         .egress
@@ -808,9 +892,10 @@ pub fn to_leaked_recipe(m: &ServiceManifest) -> super::recipes::DemoRecipe {
         .iter()
         .map(|h| leak_str(&h.trim().to_lowercase()))
         .collect();
+    let egress_may_autofill = m.egress.allow.is_empty() && m.egress.auto.is_none();
     let language: &'static str = match m.build.profile.as_str() {
         "go" => "Go",
-        "python" | "python-searxng" => "Python",
+        "python" => "Python",
         _ => "JavaScript",
     };
     let start_cmd = leak_str(&m.run.command.join(" "));
@@ -833,13 +918,14 @@ pub fn to_leaked_recipe(m: &ServiceManifest) -> super::recipes::DemoRecipe {
         pre_build: leak_slice(pre_build),
         build_steps: leak_slice(build),
         build_env: Box::leak(build_env.into_boxed_slice()),
+        run_env: Box::leak(run_env.into_boxed_slice()),
         prefetch_steps: leak_slice(prefetch),
         plugins: Box::leak(plugins.into_boxed_slice()),
         start_cmd,
         port: m.run.port,
-        searxng: m.searxng,
         tools: leak_slice(tools),
         egress_allow: leak_slice(egress),
+        egress_may_autofill,
         res: super::units::ResourceLimits {
             memory_high: m.resources.memory_high.as_deref().map(leak_str),
             memory_max: m.resources.memory_max.as_deref().map(leak_str),
@@ -1025,6 +1111,41 @@ mod tests {
         let m = sample();
         assert!(m.egress.allow.is_empty());
         assert!(to_leaked_recipe(&m).egress_allow.is_empty());
+        // Untouched (auto=None, allow empty) is autofill-eligible.
+        assert!(to_leaked_recipe(&m).egress_may_autofill);
+    }
+
+    #[test]
+    fn egress_auto_true_requires_a_filled_list() {
+        let mut m = sample();
+        m.egress.auto = Some(true);
+        m.egress.allow = vec!["duckduckgo.com".into()];
+        m.validate("t").unwrap();
+        let mut m = sample();
+        m.egress.auto = Some(true);
+        assert!(m.validate("t").is_err());
+        // auto=false with an empty list is the "user emptied it" state — valid,
+        // and never autofill-eligible.
+        let mut m = sample();
+        m.egress.auto = Some(false);
+        m.validate("t").unwrap();
+        assert!(!to_leaked_recipe(&m).egress_may_autofill);
+        // auto=true with a filled list converts, but is not autofill-eligible.
+        let mut m = sample();
+        m.egress.auto = Some(true);
+        m.egress.allow = vec!["duckduckgo.com".into()];
+        assert!(!to_leaked_recipe(&m).egress_may_autofill);
+        assert_eq!(to_leaked_recipe(&m).egress_allow, ["duckduckgo.com"]);
+        // plan_text marks an auto-filled list.
+        assert!(
+            m.plan_text()
+                .contains("egress:   loopback + duckduckgo.com (auto)")
+        );
+        // serde round-trip keeps the tri-state.
+        let yaml = serde_yaml::to_string(&m).unwrap();
+        assert!(yaml.contains("auto: true"), "{yaml}");
+        let back: ServiceManifest = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(back.egress.auto, Some(true));
     }
 
     #[test]
@@ -1166,11 +1287,9 @@ mod tests {
         for id in example_ids() {
             let m = example(id);
             let joined = m.run.command.join(" ");
-            if !m.searxng {
-                assert!(joined.contains("{port}"), "{id}");
-            }
+            assert!(joined.contains("{port}"), "{id}");
             assert!(
-                joined.contains("__serve-static") || joined.contains("127.0.0.1") || m.searxng,
+                joined.contains("__serve-static") || joined.contains("127.0.0.1"),
                 "{id}: {joined}"
             );
         }
@@ -1209,6 +1328,61 @@ mod tests {
         assert!(
             vert.build.env.contains_key("PUB_ENV"),
             "vert example must set PUB_ENV"
+        );
+    }
+
+    /// `run.env`: valid entries reach the leaked recipe, bad keys/values/
+    /// placeholders fail validation before any deploy sees them.
+    #[test]
+    fn run_env_validates_and_reaches_the_recipe() {
+        let mut m = sample();
+        m.run.env.insert("SEARXNG_SECRET".into(), "{secret}".into());
+        m.run.env.insert("APP_PORT".into(), "listen {port}".into());
+        m.validate("t").expect("valid run.env");
+        let r = to_leaked_recipe(&m);
+        assert!(r.run_env.contains(&("SEARXNG_SECRET", "{secret}")));
+        assert!(r.run_env.contains(&("APP_PORT", "listen {port}")));
+
+        // Unknown placeholder (typo) must not ship literal braces.
+        let mut m = sample();
+        m.run.env.insert("X".into(), "{secert}".into());
+        assert!(m.validate("t").is_err(), "typo placeholder rejected");
+        // Stray / unclosed braces.
+        let mut m = sample();
+        m.run.env.insert("X".into(), "abc}".into());
+        assert!(m.validate("t").is_err(), "stray brace rejected");
+        let mut m = sample();
+        m.run.env.insert("X".into(), "{port".into());
+        assert!(m.validate("t").is_err(), "unclosed brace rejected");
+        // Same shape rules as build.env.
+        let mut m = sample();
+        m.run.env.insert("1BAD".into(), "x".into());
+        assert!(m.validate("t").is_err(), "bad key rejected");
+        let mut m = sample();
+        m.run.env.insert("GOOD_KEY".into(), "a\nb".into());
+        assert!(m.validate("t").is_err(), "newline value rejected");
+    }
+
+    /// Every recipe exports PORT={port} (the universal convention aid) —
+    /// unless the manifest pins PORT itself, which must win.
+    #[test]
+    fn recipe_exports_port_unless_manifest_pins_it() {
+        let m = sample();
+        let r = to_leaked_recipe(&m);
+        assert!(
+            r.run_env.contains(&("PORT", "{port}")),
+            "PORT exported by default: {:?}",
+            r.run_env
+        );
+
+        let mut pinned = sample();
+        pinned.run.env.insert("PORT".into(), "9999".into());
+        let r = to_leaked_recipe(&pinned);
+        assert!(r.run_env.contains(&("PORT", "9999")), "{:?}", r.run_env);
+        assert!(
+            !r.run_env.contains(&("PORT", "{port}")),
+            "pinned PORT not overridden: {:?}",
+            r.run_env
         );
     }
 }

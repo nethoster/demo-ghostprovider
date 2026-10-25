@@ -148,6 +148,27 @@ pub fn replace(id: &str, bytes: &[u8]) -> anyhow::Result<()> {
 pub fn set_egress_allow(id: &str, hosts: &[String]) -> anyhow::Result<()> {
     let mut m = load(id)?;
     m.egress.allow = hosts.to_vec();
+    // Any edit from the Egress menu marks the list user-owned: the deploy
+    // must never auto-fill (or re-fill) it again — even after the user
+    // empties the list back to deny-all.
+    m.egress.auto = Some(false);
+    m.validate(&format!("library:{id}"))?;
+    let yaml = serde_yaml::to_string(&m).map_err(|e| anyhow::anyhow!("cannot render YAML: {e}"))?;
+    crate::atomic::write_atomic(&file_path(id)?, yaml.as_bytes())?;
+    Ok(())
+}
+
+/// Record the port the service was actually observed listening on (the
+/// self-healing healthcheck adopted it after the app ignored the assigned
+/// port) — so the next deploy probes the right port from the start.
+/// Best-effort by design: a manifest outside the library simply isn't
+/// rewritten.
+pub fn set_run_port(id: &str, port: u16) -> anyhow::Result<()> {
+    let mut m = load(id)?;
+    if m.run.port == port {
+        return Ok(());
+    }
+    m.run.port = port;
     m.validate(&format!("library:{id}"))?;
     let yaml = serde_yaml::to_string(&m).map_err(|e| anyhow::anyhow!("cannot render YAML: {e}"))?;
     crate::atomic::write_atomic(&file_path(id)?, yaml.as_bytes())?;
@@ -169,15 +190,41 @@ pub fn load(id: &str) -> anyhow::Result<ServiceManifest> {
     ServiceManifest::load_from_file(&file_path(id)?)
 }
 
-/// Open `path` in $EDITOR (VISUAL, EDITOR, `vi` fallback) and report whether
-/// the user changed anything. Terminal setup/teardown is the caller's job:
-/// the CLI calls this directly, the TUI suspends first.
+/// Open `path` in $EDITOR (VISUAL, EDITOR, else the first of vi/vim/nvim/
+/// nano that actually exists) and report whether the user changed anything.
+/// Terminal setup/teardown is the caller's job: the CLI calls this directly,
+/// the TUI suspends first.
 pub fn invoke_editor(path: &Path) -> anyhow::Result<bool> {
     let before = std::fs::read(path).unwrap_or_default();
-    let prog = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".into());
-    let st = std::process::Command::new(&prog).arg(path).status()?;
+    // A set-but-empty VISUAL/EDITOR must not win over the fallback: spawning
+    // "" fails instantly and the caller reports a bounce instead of an editor.
+    let configured = ["VISUAL", "EDITOR"]
+        .iter()
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()));
+    let st = match configured {
+        Some(prog) => std::process::Command::new(&prog).arg(path).status()?,
+        None => {
+            // No editor configured: walk common candidates. Machines that
+            // ship only nano must not report "No such file or directory"
+            // for a bare `vi` probe.
+            let mut ran = None;
+            let mut tried: Vec<&str> = Vec::new();
+            for cand in ["vi", "vim", "nvim", "nano"] {
+                match std::process::Command::new(cand).arg(path).status() {
+                    Ok(st) => {
+                        ran = Some(st);
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => tried.push(cand),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            match ran {
+                Some(st) => st,
+                None => anyhow::bail!("no editor found (tried {})", tried.join(", ")),
+            }
+        }
+    };
     if !st.success() {
         anyhow::bail!("editor exited with {st}");
     }
@@ -343,12 +390,15 @@ tools: ["bun"]
         set_egress_allow("lib-demo", &["api.telegram.org".into()]).unwrap();
         let m = load("lib-demo").unwrap();
         assert_eq!(m.egress.allow, vec!["api.telegram.org".to_string()]);
+        // Any menu edit marks the list user-owned (auto=Some(false)).
+        assert_eq!(m.egress.auto, Some(false));
         // Other fields survive the rewrite.
         assert_eq!(m.run.port, 0);
-        // Garbage is refused, original kept.
+        // Garbage is refused, original kept (and auto flag untouched by a failed call).
         assert!(set_egress_allow("lib-demo", &["*.evil.com".into()]).is_err());
         assert!(set_egress_allow("lib-demo", &["a.com".into(), "a.com".into()]).is_err());
         assert_eq!(load("lib-demo").unwrap().egress.allow.len(), 1);
+        assert_eq!(load("lib-demo").unwrap().egress.auto, Some(false));
     }
 
     #[test]

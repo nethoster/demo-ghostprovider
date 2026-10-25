@@ -17,7 +17,7 @@ use super::recipes::DemoRecipe;
 use super::sandbox::run_build_cmd;
 use super::secrets::write_env_file;
 use super::units::{
-    StartOutcome, UnitSpec, create_unit, remove_unit, service_logs, wait_until_active,
+    StartOutcome, UnitSpec, create_unit, remove_unit, service_logs, start_unit, wait_until_active,
 };
 
 fn safe_dirname(name: &str) -> String {
@@ -45,7 +45,7 @@ pub fn clone_repo(
     analysis: &RepoAnalysis,
     work_dir: Option<&Path>,
     pin: Option<&str>,
-) -> Option<PathBuf> {
+) -> Option<(PathBuf, bool)> {
     let base = work_dir
         .map(|p| p.to_path_buf())
         .unwrap_or_else(crate::paths::services_dir);
@@ -66,7 +66,11 @@ pub fn clone_repo(
     if !status.ok {
         return None;
     }
-    Some(dir)
+    // Fresh = the materializer just wrote every blob from the pin (the
+    // worktree is pristine upstream content); a reuse may carry the
+    // previous build's output.
+    let fresh = status.last_message == "source tree download complete";
+    Some((dir, fresh))
 }
 
 /// Fill recipe start command placeholders with concrete paths.
@@ -98,53 +102,13 @@ fn resolve_project_step(step: &str, project_dir: &Path) -> String {
     step.replace("{project}", &project_dir.to_string_lossy())
 }
 
-/// Patch SearXNG settings.yml: real secret key, loopback bind, chosen port.
-fn prepare_searxng_config(project_dir: &Path, port: u16) -> anyhow::Result<()> {
-    let settings = project_dir.join("searx/settings.yml");
-    let Ok(content) = std::fs::read_to_string(&settings) else {
-        return Ok(());
-    };
-
-    let secret_key = random_hex(32)?;
-    let patched: Vec<String> = content
-        .lines()
-        .map(|line| {
-            let indent_len = line.len() - line.trim_start().len();
-            let indent = &line[..indent_len];
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("secret_key:") {
-                format!("{indent}secret_key: \"{secret_key}\"")
-            } else if trimmed.starts_with("bind_address:") {
-                format!("{indent}bind_address: \"127.0.0.1\"")
-            } else if trimmed.starts_with("http_address:") && trimmed.contains(':') {
-                // Some SearXNG versions use uwsgi-style http_address.
-                format!("{indent}http_address: \"127.0.0.1:{port}\"")
-            } else if trimmed.starts_with("port:") {
-                format!("{indent}port: {port}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
-
-    std::fs::write(settings, patched.join("\n") + "\n")?;
-    Ok(())
-}
-
-/// `bytes` random bytes from the kernel CSPRNG as lowercase hex. No weak
-/// fallback: a deployment secret derived from time+pid would be guessable, so
-/// a failure to read `/dev/urandom` aborts instead of degrading.
-fn random_hex(bytes: usize) -> anyhow::Result<String> {
-    use std::io::Read;
-    let mut buf = vec![0u8; bytes];
-    std::fs::File::open("/dev/urandom")?
-        .read_exact(&mut buf)
-        .context("reading /dev/urandom")?;
-    let mut out = String::with_capacity(bytes * 2);
-    for b in &buf {
-        out.push_str(&format!("{b:02x}"));
-    }
-    Ok(out)
+/// Placeholders in `run.env` values: `{port}` is the deploy's chosen port
+/// and `{secret}` the deploy's generated hex (same value for every entry —
+/// if two vars must match, they do). Validation guarantees no other tokens.
+fn resolve_env_value(value: &str, port: u16, secret: &str) -> String {
+    value
+        .replace("{port}", &port.to_string())
+        .replace("{secret}", secret)
 }
 
 /// Stop a previously deployed instance before replacing it, WITHOUT tearing
@@ -164,6 +128,14 @@ fn stop_existing(service_name: &str) {
     if unit.is_file() {
         let _ = Command::new("systemctl")
             .args(["--user", "stop", service_name])
+            .status();
+    }
+    // The netns deny-all companion socket holds the host-facing port; it
+    // must go too or the next bind (redeploy, other apps) fails.
+    let socket = crate::paths::user_unit_dir().join(format!("{service_name}.socket"));
+    if socket.is_file() {
+        let _ = Command::new("systemctl")
+            .args(["--user", "stop", &format!("{service_name}.socket")])
             .status();
     }
 }
@@ -190,9 +162,11 @@ fn screen_line(line: &str) -> bool {
     let t = line.trim_start();
     t.starts_with('!')
         || t.starts_with("warn: ")
+        || t.starts_with("auto-repair: ")
         || t.starts_with("sandbox: ")
         || t.starts_with("source: ")
         || t.starts_with("provision: ")
+        || t.starts_with("egress: ")
         || t.contains("listening on ")
 }
 
@@ -266,7 +240,8 @@ fn toolbox_needs(
 /// this reuses the audited pipeline verbatim via
 /// [`super::manifest::to_leaked_recipe`].
 pub fn run_manifest_deployment(
-    manifest: &super::manifest::ServiceManifest,
+    mut manifest: super::manifest::ServiceManifest,
+    patch_path: Option<&Path>,
     log: &dyn Fn(String),
 ) -> DeployOutcome {
     let screen = |line: String| {
@@ -275,7 +250,7 @@ pub fn run_manifest_deployment(
         }
     };
     // Subject-first order: the `source:` line, then gate verdicts.
-    screen(source_line(manifest));
+    screen(source_line(&manifest));
     match super::sandbox::sandbox_grade() {
         super::sandbox::SandboxGrade::Full => {
             screen("sandbox: FULL".into());
@@ -301,7 +276,12 @@ pub fn run_manifest_deployment(
             "warn: GHOSTPROVIDER_NO_NETLOG — outbound requests are not written to net.log".into(),
         );
     }
-    let recipe = super::manifest::to_leaked_recipe(manifest);
+    // The initial recipe serves the gates (preflight, journal, analysis
+    // language); the loop below re-derives it per attempt so an applied
+    // auto-repair takes effect. The retry deliberately skips preflight:
+    // tools a repair just derived are provisioned by the toolbox inside
+    // the deploy.
+    let recipe = super::manifest::to_leaked_recipe(&manifest);
     let url = manifest.source.git.clone();
     let (owner, name) = manifest
         .owner_name()
@@ -343,14 +323,72 @@ pub fn run_manifest_deployment(
         return DeployOutcome::Rejected("exiting");
     }
 
-    let result = deploy_service(
-        &analysis,
-        &recipe,
-        None,
-        DeployHooks {
-            on_status: Some(&|line| screen(line.to_string())),
-        },
-    );
+    // ── deploy, with ONE auto-repair retry ──
+    // A failed attempt may return a repair instead of errors ("the tree
+    // declares frontend build steps this manifest lacks"): patch the
+    // manifest on disk and run the whole deployment again. A second
+    // repair request, or a patch that will not persist, is a failure —
+    // never a success.
+    let mut repaired = false;
+    let result = loop {
+        let recipe = super::manifest::to_leaked_recipe(&manifest);
+        let result = deploy_service(
+            &analysis,
+            &recipe,
+            None,
+            DeployHooks {
+                on_status: Some(&|line| screen(line.to_string())),
+            },
+        );
+        if let Some(repair) = result.repair.clone() {
+            if !repaired {
+                repaired = true;
+                apply_repair(&mut manifest, &repair);
+                match persist_manifest(&manifest, patch_path, "auto-repair") {
+                    Ok(()) => {
+                        screen("auto-repair: manifest patched — retrying the deploy once".into());
+                        continue;
+                    }
+                    Err(e) => {
+                        let mut result = result;
+                        result
+                            .errors
+                            .push(format!("auto-repair: cannot patch the manifest: {e:#}"));
+                        break result;
+                    }
+                }
+            }
+            let mut result = result;
+            result
+                .errors
+                .push("auto-repair: repair budget exhausted — manual fix required".into());
+            break result;
+        }
+        break result;
+    };
+
+    // ── auto-egress: the deploy opened hosts the tree declared ──
+    // Persist them into the manifest (allow + auto=Some(true)) so the unit
+    // renders them from now on and a redeploy keeps the same list even
+    // without re-detecting. Only on a clean success and only when the
+    // manifest's allow is still empty — a concurrent manual edit wins.
+    if result.ok() && !result.egress.is_empty() && manifest.egress.allow.is_empty() {
+        manifest.egress.allow = result.egress.clone();
+        manifest.egress.auto = Some(true);
+        match persist_manifest(&manifest, patch_path, "auto-egress") {
+            Ok(()) => {
+                screen(format!(
+                    "egress: auto-detected {} host(s) — saved to the manifest (editable in the Egress menu)",
+                    result.egress.len()
+                ));
+            }
+            Err(e) => {
+                screen(format!(
+                    "warn: egress: cannot save the auto-detected list: {e:#}"
+                ));
+            }
+        }
+    }
 
     for u in &result.urls {
         screen(format!("listening on {u}"));
@@ -376,7 +414,7 @@ pub fn run_manifest_file(path: &Path, log: &dyn Fn(String)) -> DeployOutcome {
             for line in m.plan_text().lines() {
                 log(line.to_string());
             }
-            run_manifest_deployment(&m, log)
+            run_manifest_deployment(m, Some(path), log)
         }
         Err(e) => {
             let msg = format!("! invalid manifest {}: {e:#}", path.display());
@@ -448,7 +486,7 @@ pub fn deploy_service(
     };
 
     emit("cloning repository...");
-    let Some(project_dir) = clone_repo(analysis, work_dir, Some(&pin)) else {
+    let Some((project_dir, fresh_clone)) = clone_repo(analysis, work_dir, Some(&pin)) else {
         result
             .errors
             .push("git clone failed after retries (check network connection)".into());
@@ -485,6 +523,18 @@ pub fn deploy_service(
             return result;
         }
     }
+
+    // ── go:embed placeholder snapshot (content honesty) ──
+    // A go:embed binary whose frontend build never ran serves the git-
+    // shipped placeholder page with a happy HTTP 200 — a port/HTTP
+    // healthcheck alone calls that success. Snapshot the placeholder
+    // pages NOW, before the build can rewrite them; the post-start probe
+    // compares the live response against these.
+    let placeholder_pages = if recipe.language == "Go" {
+        git_placeholder_pages(&project_dir, fresh_clone)
+    } else {
+        Vec::new()
+    };
     emit("build...");
 
     // ── tool doctor: manifest requirements vs installed tools ──
@@ -731,7 +781,7 @@ pub fn deploy_service(
     // unit holds the port and would push every redeploy one port up, silently
     // breaking the previously announced URL.
     stop_existing(recipe.service_name);
-    let port = match find_free_port(recipe.port, 50) {
+    let mut port = match find_free_port(recipe.port, 50) {
         Ok(p) => p,
         Err(e) => {
             report_err(&mut result, e.to_string());
@@ -739,13 +789,6 @@ pub fn deploy_service(
             return result;
         }
     };
-    if recipe.searxng
-        && let Err(e) = prepare_searxng_config(&project_dir, port)
-    {
-        report_err(&mut result, format!("searxng config failed: {e}"));
-        rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
-        return result;
-    }
     let exec_start = resolve_start(recipe, &project_dir, port);
 
     emit(&format!(
@@ -753,10 +796,32 @@ pub fn deploy_service(
         recipe.service_name
     ));
 
-    // Demo recipes carry no secrets, so this resolves to Ok(None) and the
-    // unit gets no EnvironmentFile line. The writer itself is live code in
-    // the full version; its escaping rules stay pinned by secrets.rs tests.
-    let env_map: BTreeMap<String, String> = BTreeMap::new();
+    // Runtime env from `run.env`: values resolve here — `{port}` is the
+    // chosen port and `{secret}` one fresh 16-byte hex for the whole deploy
+    // (shared by every entry, never written to the manifest — only to the
+    // 0600 EnvironmentFile). An empty map resolves to Ok(None) and the unit
+    // gets no EnvironmentFile line.
+    let need_secret = recipe.run_env.iter().any(|(_, v)| v.contains("{secret}"));
+    let secret = if need_secret {
+        match crate::atomic::random_hex(16) {
+            Ok(s) => s,
+            Err(e) => {
+                report_err(
+                    &mut result,
+                    format!("run.env secret generation failed: {e}"),
+                );
+                rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
+                return result;
+            }
+        }
+    } else {
+        String::new()
+    };
+    let env_map: BTreeMap<String, String> = recipe
+        .run_env
+        .iter()
+        .map(|(k, v)| (k.to_string(), resolve_env_value(v, port, &secret)))
+        .collect();
     let env_file = write_env_file(recipe.service_name, &env_map).ok().flatten();
 
     // IPAddressAllow= takes bare addresses only — hostnames would refuse
@@ -764,15 +829,57 @@ pub fn deploy_service(
     // any unit file is written (fail closed: one unresolvable name aborts
     // the deploy and rolls the project back; a redeploy re-resolves, which
     // is also how DNS drift is corrected).
-    let egress_ips = match crate::hoster::egress::resolve_egress_hosts(recipe.egress_allow) {
+    //
+    // When the manifest never chose a list (allow empty AND auto still
+    // None), the tree's own declaration may suggest one — detect it from
+    // the cloned project, resolve each host individually (an unreachable
+    // suggestion is dropped with a warn, never fails the deploy: an
+    // auto-suggestion is best-effort), and open what survived.
+    let mut autofilled: Vec<String> = Vec::new();
+    let egress_hosts: Vec<String> = if recipe.egress_may_autofill {
+        match crate::hoster::egress_detect::detect_egress(&project_dir) {
+            Some(plan) => {
+                let mut kept: Vec<String> = Vec::new();
+                for h in &plan.hosts {
+                    match crate::hoster::egress::resolve_egress_hosts(&[h.as_str()]) {
+                        Ok(_) => kept.push(h.clone()),
+                        Err(_) => emit(&format!("warn: egress: {h} does not resolve — skipped")),
+                    }
+                }
+                if !kept.is_empty() {
+                    emit(&format!(
+                        "egress: auto-detected {} host(s) — editable in the Egress menu",
+                        kept.len()
+                    ));
+                }
+                if let Some(note) = &plan.note {
+                    emit(&format!("egress: {note}"));
+                }
+                autofilled = kept;
+                autofilled.clone()
+            }
+            None => recipe.egress_allow.iter().map(|s| s.to_string()).collect(),
+        }
+    } else {
+        recipe.egress_allow.iter().map(|s| s.to_string()).collect()
+    };
+    let egress_strs: Vec<&str> = egress_hosts.iter().map(String::as_str).collect();
+    let egress_ips = match crate::hoster::egress::resolve_egress_hosts(&egress_strs) {
         Ok(ips) => ips,
         Err(e) => {
+            // Manual lists stay fail-closed; the auto path only ever
+            // contains pre-resolved hosts, so this Err is the manual case.
             report_err(&mut result, format!("egress host resolution failed: {e}"));
             rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
             return result;
         }
     };
     let egress_refs: Vec<&str> = egress_ips.iter().map(String::as_str).collect();
+    result.egress = autofilled;
+    // Empty allowlist → the unit gets a real deny-all (private network
+    // namespace + socket-activation shim); non-empty keeps the IP filter,
+    // which this kernel may or may not enforce (see the emit below).
+    let netns_mode = egress_ips.is_empty();
 
     let spec = UnitSpec {
         service_name: recipe.service_name,
@@ -783,55 +890,43 @@ pub fn deploy_service(
         extra_env: &[],
         res: recipe.res,
         egress_allow: &egress_refs,
+        port,
     };
     if let Err(e) = create_unit(&spec) {
         report_err(&mut result, format!("unit creation failed: {e:#}"));
         rollback_failed(&mut result, recipe.service_name, &project_dir, None, &emit);
         return result;
     }
+    if netns_mode {
+        emit(
+            "egress: REAL deny-all — private network namespace (no outbound route; loopback only via socket activation)",
+        );
+    } else if !super::egress::kernel_enforces_ip_filter() {
+        emit(
+            "warn: egress: allowlist is best-effort on this host (unprivileged eBPF disabled) — the kernel does not enforce the unit IP filter; a host firewall is needed for a hard deny",
+        );
+    }
 
     // ── start + verify (polling; see units.rs / FINDINGS.md) ──
-    // A non-zero exit from `systemctl --user start` means the unit/job was
-    // rejected outright (bad unit, dead user manager), not merely slow to
-    // activate — with `--no-block` that must not be masked as a later
-    // activation check (same discipline as selftest.rs). Fail closed.
-    // wait_until_active budgets a grace period for the queued async job, so a
-    // healthy unit whose first is-active poll wins the race is not miscounted
-    // as a crash.
+    // start_unit activates the .socket companion first when one exists
+    // (netns deny-all mode — systemd only passes the listening fd when the
+    // socket is already up), then starts the service --no-block. A non-zero
+    // exit means the unit/job was rejected outright (bad unit, dead user
+    // manager), not merely slow to activate — fail closed (same discipline
+    // as selftest.rs). wait_until_active budgets a grace period for the
+    // queued async job, so a healthy unit whose first is-active poll wins
+    // the race is not miscounted as a crash.
     emit("starting service...");
-    let started = Command::new("systemctl")
-        .args(["--user", "start", "--no-block", recipe.service_name])
-        .status();
-    match started {
-        Ok(status) if status.success() => {}
-        Ok(_) => {
-            report_err(
-                &mut result,
-                format!(
-                    "systemctl start rejected the unit {} (non-zero exit)",
-                    recipe.service_name
-                ),
-            );
-            rollback_failed(
-                &mut result,
-                recipe.service_name,
-                &project_dir,
-                Some(port),
-                &emit,
-            );
-            return result;
-        }
-        Err(_) => {
-            report_err(&mut result, "failed to invoke systemctl start".into());
-            rollback_failed(
-                &mut result,
-                recipe.service_name,
-                &project_dir,
-                Some(port),
-                &emit,
-            );
-            return result;
-        }
+    if let Err(e) = start_unit(recipe.service_name) {
+        report_err(&mut result, format!("{e:#}"));
+        rollback_failed(
+            &mut result,
+            recipe.service_name,
+            &project_dir,
+            Some(port),
+            &emit,
+        );
+        return result;
     }
 
     match wait_until_active(recipe.service_name) {
@@ -840,23 +935,71 @@ pub fn deploy_service(
             // inside a brief active window between restarts. Only report the
             // service as up when its port really accepts connections, so
             // `done: ok` / `listening on` never print for a dead port.
-            if !wait_until_port_open(port, super::units::START_BUDGET) {
-                let logs = service_logs(recipe.service_name, 20);
-                report_err(
-                    &mut result,
-                    format!(
-                        "Service became active but never accepted connections on 127.0.0.1:{port} (crash-loop? recent logs):\n{}",
-                        short(&logs)
-                    ),
-                );
-                rollback_failed(
-                    &mut result,
-                    recipe.service_name,
-                    &project_dir,
-                    Some(port),
-                    &emit,
-                );
-                return result;
+            // Netns deny-all mode binds the host port via the .socket
+            // companion immediately — a plain port probe would false-positive;
+            // the tunnel probe goes through the shim to the app inside the
+            // namespace instead.
+            let port_ok = if netns_mode {
+                super::port::wait_until_tunnel_open(port, super::units::START_BUDGET)
+            } else {
+                wait_until_port_open(port, super::units::START_BUDGET)
+            };
+            if !port_ok {
+                if netns_mode {
+                    // Port adoption (ss scan) cannot see inside the private
+                    // network namespace — an honest failure, not a guess.
+                    let logs = service_logs(recipe.service_name, 20);
+                    report_err(
+                        &mut result,
+                        format!(
+                            "Service became active but the tunnel never reached the app inside its namespace on 127.0.0.1:{port} (crash-loop? wrong port? recent logs):\n{}",
+                            short(&logs)
+                        ),
+                    );
+                    rollback_failed(
+                        &mut result,
+                        recipe.service_name,
+                        &project_dir,
+                        Some(port),
+                        &emit,
+                    );
+                    return result;
+                }
+                // The app ignored the assigned port and bound one of its
+                // own (hardcoded ListenAndServe, its own config): instead
+                // of killing a live service, adopt where it actually went.
+                // Attribution is PID-strict — only this unit's processes
+                // count — and the port must answer a real connect.
+                if let Some(actual) = super::port::discover_unit_port(recipe.service_name, port) {
+                    emit(&format!(
+                        "note: the service binds port {actual} (not the assigned {port}) — healthcheck adopted it; manifest records {actual} for next deploy"
+                    ));
+                    if let Err(e) =
+                        crate::hoster::library::set_run_port(recipe.service_name, actual)
+                    {
+                        emit(&format!(
+                            "note: could not record port {actual} in the library manifest: {e}"
+                        ));
+                    }
+                    port = actual;
+                } else {
+                    let logs = service_logs(recipe.service_name, 20);
+                    report_err(
+                        &mut result,
+                        format!(
+                            "Service became active but never accepted connections on 127.0.0.1:{port} (crash-loop? recent logs):\n{}",
+                            short(&logs)
+                        ),
+                    );
+                    rollback_failed(
+                        &mut result,
+                        recipe.service_name,
+                        &project_dir,
+                        Some(port),
+                        &emit,
+                    );
+                    return result;
+                }
             }
         }
         StartOutcome::Failed => {
@@ -903,6 +1046,62 @@ pub fn deploy_service(
                 &emit,
             );
             return result;
+        }
+    }
+
+    // ── content honesty (go:embed placeholder) ──
+    // Port open + HTTP 200 is not enough: the embedded git placeholder
+    // page answers exactly that way. Compare the served body with the
+    // snapshot taken from the fresh clone.
+    if let Some(diag) = placeholder_probe(port, &placeholder_pages) {
+        // ── auto-repair ──
+        // The manifest may predate frontend detection (hand-written, or
+        // written by an older generator): re-detect from the clone, and
+        // when the tree declares frontend build steps the manifest
+        // lacks, ask the caller to patch the manifest and run ONE retry.
+        // The tree stays on disk for the retry's clone reuse.
+        match super::detect::detect_tree(&project_dir) {
+            Ok(detected) => {
+                if let Some(repair) = plan_repair(&detected, recipe.build_steps) {
+                    emit(&format!("auto-repair: {}", repair.summary));
+                    result.repair = Some(repair);
+                    return result;
+                }
+                // The tree ships an embed dir with NO frontend build
+                // script: those committed assets ARE the app (no build
+                // could ever change them) — serving them unchanged is by
+                // design, not a failed build. Honest warning, keep going.
+                if detected
+                    .notes
+                    .iter()
+                    .any(|n| n.contains("no frontend build script"))
+                {
+                    emit(&format!(
+                        "warn: {diag} — but the tree declares no frontend build script, so the committed embed content is the product; starting on it as-is"
+                    ));
+                } else {
+                    report_err(&mut result, diag);
+                    rollback_failed(
+                        &mut result,
+                        recipe.service_name,
+                        &project_dir,
+                        Some(port),
+                        &emit,
+                    );
+                    return result;
+                }
+            }
+            Err(_) => {
+                report_err(&mut result, diag);
+                rollback_failed(
+                    &mut result,
+                    recipe.service_name,
+                    &project_dir,
+                    Some(port),
+                    &emit,
+                );
+                return result;
+            }
         }
     }
 
@@ -966,6 +1165,302 @@ fn listens_non_loopback(port: u16) -> bool {
         .skip(1)
         .filter_map(crate::analyzer::probe::parse_ss_row)
         .any(|p| p.port == port && address_is_non_loopback(&p.address))
+}
+
+/// Snapshot the text files inside a freshly cloned tree's go:embed
+/// directories as (repo-relative path, trimmed content): the pages a
+/// go:embed binary serves WITHOUT a working frontend build.
+///
+/// Three sources, in trust order:
+/// * fresh clone — the materializer just wrote every blob from the pin,
+///   so the worktree IS the upstream content. HEAD is not usable here:
+///   embed dirs are often gitignored (`.gitignore: dist/`), so the local
+///   `git add -A` never stages the placeholder.
+/// * reuse — the worktree may hold the previous build's output; the side
+///   file written by the fresh deploy's snapshot is the truth.
+/// * legacy reuse without a side file — HEAD, for trees that tracked
+///   their embed dir (ignored elsewhere → empty → probe inert, which is
+///   the safe default).
+const PLACEHOLDER_SIDE_FILE: &str = ".ghost-placeholder.json";
+
+fn git_placeholder_pages(project_dir: &Path, fresh_clone: bool) -> Vec<(String, String)> {
+    let embeds = super::detect::go_embed_dirs(project_dir);
+    if embeds.is_empty() {
+        return Vec::new();
+    }
+    let mut pages: Vec<(String, String)> = Vec::new();
+    if fresh_clone {
+        for rel in &embeds {
+            collect_text_pages(&project_dir.join(rel), rel, &mut pages);
+        }
+        persist_pages(project_dir, &pages);
+        return pages;
+    }
+    if let Some(saved) = load_pages(project_dir) {
+        return saved;
+    }
+    for rel in &embeds {
+        collect_pristine_pages(project_dir, rel, &mut pages);
+    }
+    pages
+}
+
+/// Side file: the fresh deploy's snapshot, reusable by later redeploys
+/// whose worktree no longer holds the pristine content.
+fn persist_pages(project_dir: &Path, pages: &[(String, String)]) {
+    let entries: Vec<serde_json::Value> = pages
+        .iter()
+        .map(|(p, c)| serde_json::json!({ "path": p, "content": c }))
+        .collect();
+    let _ = std::fs::write(
+        project_dir.join(PLACEHOLDER_SIDE_FILE),
+        serde_json::Value::Array(entries).to_string(),
+    );
+}
+
+fn load_pages(project_dir: &Path) -> Option<Vec<(String, String)>> {
+    let text = std::fs::read_to_string(project_dir.join(PLACEHOLDER_SIDE_FILE)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let arr = value.as_array()?;
+    let mut pages = Vec::new();
+    for item in arr {
+        let p = item.get("path")?.as_str()?.to_string();
+        let c = item.get("content")?.as_str()?.to_string();
+        pages.push((p, c));
+    }
+    Some(pages)
+}
+
+fn collect_pristine_pages(project_dir: &Path, rel: &str, out: &mut Vec<(String, String)>) {
+    const MAX_FILES: usize = 16;
+    const MAX_BYTES: u64 = 16 * 1024;
+    if !project_dir.join(".git").is_dir() {
+        // No git at all (tarball fallback): the working tree is the only
+        // source there is.
+        collect_text_pages(&project_dir.join(rel), rel, out);
+        return;
+    }
+    let root = project_dir.to_string_lossy();
+    let listed = Command::new("git")
+        .args([
+            "-C",
+            &root,
+            "ls-tree",
+            "-r",
+            "--name-only",
+            "HEAD",
+            "--",
+            rel,
+        ])
+        .output();
+    let Ok(listed) = listed else {
+        return;
+    };
+    if !listed.status.success() {
+        return;
+    }
+    let Ok(names) = String::from_utf8(listed.stdout) else {
+        return;
+    };
+    for path in names.lines().take(MAX_FILES) {
+        if out.len() >= MAX_FILES {
+            return;
+        }
+        let path = path.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let Ok(blob) = Command::new("git")
+            .args(["-C", &root, "show", &format!("HEAD:{path}")])
+            .output()
+        else {
+            continue;
+        };
+        if !blob.status.success() || blob.stdout.len() as u64 > MAX_BYTES {
+            continue;
+        }
+        let Ok(text) = String::from_utf8(blob.stdout) else {
+            continue;
+        };
+        let text = text.trim();
+        // Tiny files ("<html></html>") are too generic to be a signature.
+        if text.chars().count() < 24 {
+            continue;
+        }
+        out.push((path.to_string(), text.to_string()));
+    }
+}
+
+fn collect_text_pages(dir: &Path, rel: &str, out: &mut Vec<(String, String)>) {
+    const SKIP: &[&str] = &["node_modules", ".git", "vendor"];
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.filter_map(|e| e.ok()) {
+        if out.len() >= 16 {
+            return;
+        }
+        let name = e.file_name().to_string_lossy().to_string();
+        let path = e.path();
+        if path.is_dir() {
+            if !name.starts_with('.') && !SKIP.contains(&name.as_str()) {
+                collect_text_pages(&path, &format!("{rel}/{name}"), out);
+            }
+            continue;
+        }
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() == 0 || meta.len() > 16 * 1024 {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let text = text.trim();
+        // Tiny files ("<html></html>") are too generic to be a signature.
+        if text.chars().count() < 24 {
+            continue;
+        }
+        out.push((format!("{rel}/{name}"), text.to_string()));
+    }
+}
+
+/// GET `path` over loopback HTTP/1.0 and return the response body.
+/// `None` = the probe could not run (nothing to judge); the port being
+/// open is already proven by the caller.
+fn http_get_body(port: u16, path: &str) -> Option<String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    s.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    let req = format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).ok()?;
+    // Chunked reads: a read timeout AFTER the response arrived must keep
+    // the bytes — `read_to_end` would discard them with its Err.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match s.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() >= 256 * 1024 {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8(buf).ok()?;
+    let (_head, body) = text.split_once("\r\n\r\n")?;
+    Some(body.to_string())
+}
+
+/// The served `/` must not BE the git placeholder page: a go:embed binary
+/// whose frontend build never took effect answers HTTP 200 with exactly
+/// the file the fresh clone shipped. Returns the diagnosis on a hit.
+fn placeholder_probe(port: u16, pages: &[(String, String)]) -> Option<String> {
+    if pages.is_empty() {
+        return None;
+    }
+    let body = http_get_body(port, "/")?;
+    let body = body.trim();
+    if body.chars().count() < 24 {
+        return None;
+    }
+    let (rel, _) = pages.iter().find(|(_, c)| body.contains(c.as_str()))?;
+    Some(format!(
+        "HTTP 200 but the server is serving the git placeholder page {rel} — the frontend build did not take effect (the binary embedded the placeholder). Fix the build steps, then redeploy."
+    ))
+}
+
+/// The wizard's rule, restated here: tool interpreters are derived from
+/// step heads, never hand-maintained.
+const KNOWN_TOOLS: &[&str] = &["bun", "pnpm", "go", "python3", "node"];
+
+/// Is the source tree's detected plan worth a patched retry? Only when
+/// the manifest LACKS frontend build steps the tree declares — retrying a
+/// plan that already contains every detected step cannot fix a
+/// placeholder, so that failure stays an honest one.
+fn plan_repair(
+    detected: &super::detect::Detected,
+    current_steps: &[&str],
+) -> Option<super::models::ManifestRepair> {
+    let missing_frontend = detected.build.iter().any(|s| {
+        (s.starts_with("pnpm ") || s.starts_with("bun ")) && !current_steps.contains(&s.as_str())
+    });
+    if !missing_frontend {
+        return None;
+    }
+    Some(super::models::ManifestRepair {
+        summary: format!(
+            "the manifest's build plan misses the frontend build — re-detected {} step(s), patching the manifest and redeploying once",
+            detected.prefetch.len() + detected.build.len()
+        ),
+        prefetch: detected.prefetch.clone(),
+        build_steps: detected.build.clone(),
+    })
+}
+
+/// Fold a repair into the manifest: new build plan, tools re-derived from
+/// the step heads (the wizard's rule).
+fn apply_repair(m: &mut super::manifest::ServiceManifest, r: &super::models::ManifestRepair) {
+    m.prefetch = r
+        .prefetch
+        .iter()
+        .map(|s| super::manifest::Step::Shell(s.clone()))
+        .collect();
+    m.build.steps = r
+        .build_steps
+        .iter()
+        .map(|s| super::manifest::Step::Shell(s.clone()))
+        .collect();
+    let mut tools: Vec<String> = Vec::new();
+    for step in m.prefetch.iter().chain(m.build.steps.iter()) {
+        let shell = step.to_shell();
+        let head = shell
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .rsplit('/')
+            .next()
+            .unwrap_or("");
+        if KNOWN_TOOLS.contains(&head) && !tools.iter().any(|t| t == head) {
+            tools.push(head.to_string());
+        }
+    }
+    m.tools = tools;
+}
+
+/// Write the patched manifest back: the file the deploy was started from,
+/// plus the library's copy when that is a different file (the panel
+/// redeploys from the library). Used for both auto-repair patches and the
+/// auto-egress fill.
+fn persist_manifest(
+    m: &super::manifest::ServiceManifest,
+    patch_path: Option<&Path>,
+    context: &str,
+) -> anyhow::Result<()> {
+    m.validate(context)?;
+    let yaml = serde_yaml::to_string(m).map_err(|e| anyhow::anyhow!("cannot render YAML: {e}"))?;
+    if let Some(p) = patch_path {
+        if let Some(dir) = p.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        crate::atomic::write_atomic(p, yaml.as_bytes())?;
+    }
+    if let Ok(lib) = super::library::file_path(&m.service.id)
+        && Some(lib.as_path()) != patch_path
+    {
+        if let Some(dir) = lib.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        crate::atomic::write_atomic(&lib, yaml.as_bytes())?;
+    }
+    Ok(())
 }
 
 /// Roll a failed deploy back completely — the README's "clean removal"
@@ -1068,6 +1563,9 @@ pub fn remove_unit_and_state(service_name: &str) {
     }
 
     crate::state::unregister(service_name).ok();
+    // Deletion is complete: the shelf manifest goes too, so no screen
+    // (My Services, Edit Service) keeps a row for a service that is gone.
+    let _ = super::library::remove(service_name);
     let _ = Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();
@@ -1175,9 +1673,29 @@ pub enum ReconcileBasis {
     Sweep,
 }
 
-/// `reconcile_stale` with the default history tag (a `Startup` pass).
-pub fn reconcile_stale(keep_if_inflight: bool) -> Vec<String> {
-    reconcile_stale_with_basis(keep_if_inflight, ReconcileBasis::Startup)
+/// The single entry-point reconciliation for processes that do not hold the
+/// deploy lock themselves: panel startup, panel exit, the scripted
+/// `__deploy` watchdog, the `tui_v2` exit paths. The journal is the only
+/// "there might be leftovers" signal, and the flock is the only "is the
+/// deploy behind them still alive" signal (see [`crate::hoster::lock`]) —
+/// asking both here means no caller can forget either: entries untouched
+/// while the lock is held (that tree belongs to a live deploy — sweeping
+/// it is how a running clone dies with `opening part
+/// …/.ghost-materialize/…: No such file or directory`), settled once it is
+/// free. Quiet when the journal is empty, so a healthy parallel deploy
+/// prints nothing.
+///
+/// The background timer ([`sweep_stale`]) and unit tests use the private
+/// `reconcile_stale_inner` — they already hold the lock, and a second
+/// flock in the same process would self-defer.
+pub fn reconcile_stale_locked(basis: ReconcileBasis) -> Vec<String> {
+    if crate::hoster::journal::entries().is_empty() {
+        return Vec::new();
+    }
+    let Some(_lock) = super::lock::try_lock_exclusive() else {
+        return vec!["cleanup: deferred — a deployment is live (deploy.lock held)".to_string()];
+    };
+    reconcile_stale_inner(false, basis)
 }
 
 /// Sweep leftover deploy-journal entries and clean their artifacts with a
@@ -1187,17 +1705,14 @@ pub fn reconcile_stale(keep_if_inflight: bool) -> Vec<String> {
 /// was in flight — but only *after* [`quiesce`] has stopped and waited for the
 /// in-process worker, so this removal is final rather than racing a writer.
 /// It never touches finished (`Registered`) or live (`Registering` with a
-/// registry slot) services. `keep_if_inflight = true` (used by the surviving
-/// `tui_v2` fork and unit tests) retains a still-running entry for the next
-/// launch to re-verify idempotently; the live exit paths always pass `false`
-/// because they have already quiesced. Returns human-readable notice lines for
+/// registry slot) services. Returns human-readable notice lines for
 /// the deploy log so the panel surfaces what it cleaned.
 ///
 /// Every entry this pass actually settles is appended to the Crash screen's
 /// history (`crash.log`), tagged by [`basis`](ReconcileBasis): an `Exit` pass
 /// records the deploy as aborted at exit; `Startup`/`Sweep` passes record it
 /// as recovered leftovers.
-pub fn reconcile_stale_with_basis(keep_if_inflight: bool, basis: ReconcileBasis) -> Vec<String> {
+fn reconcile_stale_inner(keep_if_inflight: bool, basis: ReconcileBasis) -> Vec<String> {
     let mut msgs = Vec::new();
     for (service, entry) in journal::entries() {
         if !stale_action(entry.state, crate::state::get(&service).is_some()) {
@@ -1278,7 +1793,7 @@ fn interrupted() -> bool {
 /// deploy's host-side descendants (a running `git clone`/build step) and stops
 /// any orphaned `ghost-*` transient build units, then lets the worker notice and
 /// return. Once this returns, no deploy-owned process is still writing into the
-/// tree that `reconcile_stale` is about to wipe.
+/// tree that the reconcile pass is about to wipe.
 pub fn quiesce(timeout: std::time::Duration) {
     let deadline = std::time::Instant::now() + timeout;
     while deploy_in_flight() && std::time::Instant::now() < deadline {
@@ -1377,7 +1892,7 @@ pub fn sweep_stale() -> SweepOutcome {
         return SweepOutcome::Deferred;
     };
     let killed = stop_ghost_units();
-    let mut msgs = reconcile_stale_with_basis(false, ReconcileBasis::Sweep);
+    let mut msgs = reconcile_stale_inner(false, ReconcileBasis::Sweep);
     if killed > 0 {
         let line = format!("cleanup: stopped {killed} orphaned ghost build/probe unit(s)");
         crate::tui::workers::append_deploy_log(&line);
@@ -1506,11 +2021,15 @@ mod tests {
     fn screen_line_keeps_verdicts_and_warnings_only() {
         let kept = [
             "! pre-flight failed, aborting",
+            "auto-repair: the manifest's build plan misses the frontend build — re-detected 4 step(s), patching the manifest and redeploying once",
+            "auto-repair: manifest patched — retrying the deploy once",
             "source: usememos/memos @ 245e5e3 (profile go, tools [pnpm, go])",
             "sandbox: FULL",
             "sandbox: offline build — no network from here",
             "! sandbox: ALMOST — GHOSTPROVIDER_BUILD_USER set but unusable; refusing to deploy without full isolation",
             "! sandbox: NO — refusing to build without isolation (the sandbox is mandatory)",
+            "egress: auto-detected 4 host(s) — editable in the Egress menu",
+            "egress: truncated to 8 of 12 detected host(s) — extend the list in the Egress menu",
             "listening on http://localhost:8888",
             "! public-test-token leaked in output",
             "provision: bun 1.4.2 (glibc) → .ghost-cache/toolbox/bin",
@@ -1695,6 +2214,25 @@ mod tests {
         assert!(stale_action(DeployState::Deploying, false));
     }
 
+    /// `run.env` value placeholders: `{port}` is the chosen port, `{secret}`
+    /// the deploy's shared hex, anything else passes through untouched
+    /// (validation rejects other tokens before we ever get here).
+    #[test]
+    fn resolve_env_value_fills_port_and_secret() {
+        assert_eq!(resolve_env_value("{port}", 8888, "abc"), "8888");
+        assert_eq!(resolve_env_value("prefix-{secret}", 1, "s3c"), "prefix-s3c");
+        assert_eq!(
+            resolve_env_value("p={port}&s={secret}", 4242, "hx"),
+            "p=4242&s=hx"
+        );
+        assert_eq!(resolve_env_value("literal", 7, "x"), "literal");
+        // Same secret for every entry of one deploy: pure substitution.
+        assert_eq!(
+            resolve_env_value("{secret}", 9, "same"),
+            resolve_env_value("{secret}", 9, "same")
+        );
+    }
+
     /// Point every XDG root at a fresh temp dir so a reconcile pass can run
     /// against isolated journal/registry/clone/unit paths (real systemctl
     /// calls still fail harmlessly because the unit does not exist).
@@ -1727,7 +2265,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("file.txt"), "clone").unwrap();
 
-        let msgs = reconcile_stale(false);
+        let msgs = reconcile_stale_inner(false, ReconcileBasis::Startup);
 
         assert!(!project.exists(), "clone tree must be removed");
         assert!(journal::entries().is_empty(), "entry settled after removal");
@@ -1747,7 +2285,7 @@ mod tests {
         let (tmp, _env) = isolated_env("settle");
         journal::begin("demo-memos", "https://github.com/usememos/memos");
 
-        let msgs = reconcile_stale(false);
+        let msgs = reconcile_stale_inner(false, ReconcileBasis::Startup);
 
         assert!(journal::entries().is_empty(), "silent entries are settled");
         assert_eq!(msgs.len(), 1, "one closure line: {msgs:?}");
@@ -1771,7 +2309,7 @@ mod tests {
         std::fs::write(project.join("file.txt"), "clone").unwrap();
 
         DEPLOY_IN_FLIGHT.store(true, Ordering::Relaxed);
-        let keep = reconcile_stale(true);
+        let keep = reconcile_stale_inner(true, ReconcileBasis::Startup);
         DEPLOY_IN_FLIGHT.store(false, Ordering::Relaxed);
 
         assert!(
@@ -1784,7 +2322,7 @@ mod tests {
             "entry retained for next launch"
         );
 
-        let settle = reconcile_stale(false);
+        let settle = reconcile_stale_inner(false, ReconcileBasis::Startup);
         assert!(
             journal::entries().is_empty(),
             "next launch settles the entry"
@@ -1860,6 +2398,330 @@ ghost-build-1a2b.service                 loaded active running   (dup row)
                 .any(|m| m.contains("demo-memos") && m.contains("removed")),
             "notices must report the removal: {msgs:?}"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The entry-point reconcile (panel startup / panel exit) must defer the
+    /// same way the sweep does: with the deploy lock held, the journal entry
+    /// belongs to a live deploy in another process and its tree is not a
+    /// leftover — sweeping it is what makes a running clone die with
+    /// `opening part …/.ghost-materialize/…: No such file or directory`.
+    /// Freeing the lock lets the next pass settle it normally.
+    #[test]
+    #[allow(unsafe_code)] // test-only env mutation
+    fn reconcile_stale_locked_defers_while_lock_held() {
+        let (tmp, _env) = isolated_env("lockeddefer");
+        journal::begin("demo-memos", "https://github.com/usememos/memos");
+        let project = crate::paths::services_dir().join("memos");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("file.txt"), "clone").unwrap();
+
+        let held = super::super::lock::try_lock_exclusive().expect("hold the deploy lock");
+        let msgs = reconcile_stale_locked(ReconcileBasis::Startup);
+        assert!(project.exists(), "a live tree must survive the deferral");
+        assert_eq!(journal::entries().len(), 1, "entry kept for a later pass");
+        assert!(msgs.iter().any(|m| m.contains("deferred")), "{msgs:?}");
+        drop(held);
+
+        let msgs = reconcile_stale_locked(ReconcileBasis::Startup);
+        assert!(!project.exists(), "swept once the lock is free");
+        assert!(journal::entries().is_empty(), "entry settled");
+        assert!(
+            !msgs.iter().any(|m| m.contains("deferred")),
+            "no deferral line with a free lock: {msgs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Nothing to settle → the guarded pass prints nothing at all: a healthy
+    /// parallel deploy must not produce cleanup noise at panel startup.
+    #[test]
+    #[allow(unsafe_code)] // test-only env mutation
+    fn reconcile_stale_locked_is_silent_without_entries() {
+        let (tmp, _env) = isolated_env("lockedsilent");
+        let _held = super::super::lock::try_lock_exclusive().expect("hold the deploy lock");
+        let msgs = reconcile_stale_locked(ReconcileBasis::Startup);
+        assert!(msgs.is_empty(), "no journal, no notices: {msgs:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// One-shot loopback HTTP server: reads the request, serves `body`,
+    /// closes. Returns the port it listens on.
+    fn serve_once(body: &str) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resp = format!(
+            "HTTP/1.0 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    /// The probe's whole point: a live server answering HTTP 200 with the
+    /// git placeholder page is a FAILED deploy, not a success.
+    #[test]
+    fn placeholder_probe_flags_served_git_page() {
+        let page = "<html><body>No embeddable frontend found.</body></html>";
+        let port = serve_once(page);
+        let pages = vec![(
+            "server/frontend/dist/index.html".to_string(),
+            page.to_string(),
+        )];
+        let diag = placeholder_probe(port, &pages).expect("placeholder must be flagged");
+        assert!(
+            diag.contains("server/frontend/dist/index.html")
+                && diag.contains("frontend build did not take effect"),
+            "{diag}"
+        );
+    }
+
+    /// A real UI (different body) passes the probe untouched.
+    #[test]
+    fn placeholder_probe_passes_a_real_ui() {
+        let port = serve_once(
+            "<!doctype html><html><head><title>Memos</title></head><body>app shell with real assets</body></html>",
+        );
+        let pages = vec![(
+            "server/frontend/dist/index.html".to_string(),
+            "<html><body>No embeddable frontend found.</body></html>".to_string(),
+        )];
+        assert_eq!(placeholder_probe(port, &pages), None);
+    }
+
+    /// No snapshot (no embed dirs, non-Go profile) → the probe is inert.
+    #[test]
+    fn placeholder_probe_without_pages_is_inert() {
+        assert_eq!(placeholder_probe(1, &[]), None);
+    }
+
+    /// The snapshot walks the go:embed directories of a fresh clone and
+    /// keeps the trimmed text files big enough to be a signature.
+    #[test]
+    fn git_placeholder_pages_reads_embed_dirs() {
+        let dir =
+            std::env::temp_dir().join(format!("dgp-ph-{}-{}", std::process::id(), "embedsnap"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("server/frontend/dist")).unwrap();
+        std::fs::write(
+            dir.join("main.go"),
+            "package main\n\nimport \"embed\"\n\n//go:embed server/frontend/dist/*\nvar ui embed.FS\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("server/frontend/dist/index.html"),
+            "<html><body>No embeddable frontend found.</body></html>\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("server/frontend/dist/tiny"), "x").unwrap();
+        let pages = git_placeholder_pages(&dir, true);
+        assert_eq!(
+            pages,
+            vec![(
+                "server/frontend/dist/index.html".to_string(),
+                "<html><body>No embeddable frontend found.</body></html>".to_string(),
+            )],
+            "tiny files are too generic to be signatures: {pages:?}"
+        );
+        assert!(
+            dir.join(".ghost-placeholder.json").is_file(),
+            "a fresh snapshot is persisted for later redeploys"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Reuse never trusts the worktree (it holds the previous build's
+    /// output) — the fresh deploy's side file is the source of truth.
+    #[test]
+    fn side_file_beats_a_dirty_worktree_on_reuse() {
+        let dir = std::env::temp_dir().join(format!("dgp-ph-{}-side", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("server/frontend/dist")).unwrap();
+        std::fs::write(
+            dir.join("main.go"),
+            "package main\n\nimport \"embed\"\n\n//go:embed server/frontend/dist/*\nvar ui embed.FS\n",
+        )
+        .unwrap();
+        let placeholder = "<html><body>No embeddable frontend found.</body></html>";
+        std::fs::write(dir.join("server/frontend/dist/index.html"), placeholder).unwrap();
+        // Fresh: snapshot from the pristine worktree, side file written.
+        let fresh_pages = git_placeholder_pages(&dir, true);
+        assert_eq!(fresh_pages.len(), 1);
+        // The previous build rewrote the tree...
+        std::fs::write(
+            dir.join("server/frontend/dist/index.html"),
+            "<!doctype html><html><head><title>Real UI</title></head><body>built</body></html>",
+        )
+        .unwrap();
+        // ...but reuse reads the side file, not the dirty file.
+        let reuse_pages = git_placeholder_pages(&dir, false);
+        assert_eq!(
+            reuse_pages, fresh_pages,
+            "reuse must serve the fresh snapshot, not the build output"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reused checkout's embed dir holds the PREVIOUS build's output,
+    /// not the placeholder: the snapshot must read HEAD, or every healthy
+    /// redeploy would be flagged as serving a placeholder.
+    #[test]
+    fn snapshot_prefers_head_over_a_dirty_worktree() {
+        let dir = std::env::temp_dir().join(format!("dgp-ph-{}-dirty", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("server/frontend/dist")).unwrap();
+        std::fs::write(
+            dir.join("main.go"),
+            "package main\n\nimport \"embed\"\n\n//go:embed server/frontend/dist/*\nvar ui embed.FS\n",
+        )
+        .unwrap();
+        let placeholder = "<html><body>No embeddable frontend found.</body></html>";
+        std::fs::write(dir.join("server/frontend/dist/index.html"), placeholder).unwrap();
+        let run = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-C", &dir.to_string_lossy()])
+                .args(args)
+                .env_remove("GIT_ASKPASS")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["add", "-A"]);
+        run(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-q",
+            "-m",
+            "pin",
+        ]);
+        // The previous deploy's build rewrote the working tree.
+        std::fs::write(
+            dir.join("server/frontend/dist/index.html"),
+            "<!doctype html><html><head><title>Real UI</title></head><body>built shell</body></html>",
+        )
+        .unwrap();
+        let pages = git_placeholder_pages(&dir, false);
+        assert_eq!(
+            pages,
+            vec![(
+                "server/frontend/dist/index.html".to_string(),
+                placeholder.to_string(),
+            )],
+            "HEAD content, not the dirty working tree: {pages:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn detected_frontend_plan() -> crate::hoster::detect::Detected {
+        crate::hoster::detect::Detected {
+            profile: "go".into(),
+            prefetch: vec!["pnpm --dir web fetch --store-dir {project}/.ghost-cache/pnpm".into()],
+            build: vec![
+                "pnpm --dir web install --offline --store-dir {project}/.ghost-cache/pnpm".into(),
+                "pnpm --dir web run release".into(),
+                "go build -o ghost-server ./cmd/memos".into(),
+            ],
+            run_cmd: "{bin} --addr 127.0.0.1 --port {port}".into(),
+            port: "0".into(),
+            memory_max: "1024M".into(),
+            tasks_max: "512".into(),
+            build_env: vec![],
+            plugins: vec![],
+            notes: vec![],
+            confident: true,
+            run_env: vec![],
+        }
+    }
+
+    /// A manifest that lacks frontend steps the tree declares justifies one
+    /// patched retry; the repaired plan itself must NOT request another —
+    /// that is what keeps the retry budget at exactly one.
+    #[test]
+    fn plan_repair_only_when_frontend_steps_are_missing() {
+        let d = detected_frontend_plan();
+        let bare = &["go build -o ghost-server ./cmd/memos"];
+        let repair = plan_repair(&d, bare).expect("missing frontend steps → repair");
+        assert!(repair.summary.contains("frontend"), "{}", repair.summary);
+        assert_eq!(repair.build_steps, d.build);
+        assert_eq!(repair.prefetch, d.prefetch);
+        let now: Vec<&str> = d.build.iter().map(|s| s.as_str()).collect();
+        assert!(
+            plan_repair(&d, &now).is_none(),
+            "an already-complete plan fails honestly, no loop"
+        );
+        let no_frontend = crate::hoster::detect::Detected {
+            build: vec!["go build -o ghost-server .".into()],
+            prefetch: vec![],
+            ..detected_frontend_plan()
+        };
+        assert!(
+            plan_repair(&no_frontend, bare).is_none(),
+            "no frontend in the plan → honest failure, nothing to patch"
+        );
+    }
+
+    /// The patch lands in the manifest: new build plan, tools re-derived
+    /// from the step heads, still valid.
+    #[test]
+    fn apply_repair_rewrites_plan_and_derives_tools() {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/examples/memos.yaml");
+        let mut m = super::super::manifest::ServiceManifest::load_from_file(&path)
+            .unwrap_or_else(|e| panic!("example must load: {e}"));
+        // Simulate the hand-written, frontend-blind manifest.
+        m.prefetch = vec![];
+        m.build.steps = vec![super::super::manifest::Step::Shell(
+            "go build -o ghost-server ./cmd/memos".into(),
+        )];
+        m.tools = vec!["go".into()];
+        let d = detected_frontend_plan();
+        let repair = plan_repair(&d, &["go build -o ghost-server ./cmd/memos"])
+            .expect("fixture requests repair");
+        apply_repair(&mut m, &repair);
+        assert_eq!(m.prefetch.len(), 1);
+        assert_eq!(m.build.steps.len(), 3);
+        assert_eq!(
+            m.tools,
+            vec!["pnpm".to_string(), "go".to_string()],
+            "tools follow the step heads: {:?}",
+            m.tools
+        );
+        m.validate("repair-test")
+            .expect("patched manifest must validate");
+    }
+
+    /// The patched plan is written where the deploy came from, loadable,
+    /// and the library copy (different file) receives it too.
+    #[test]
+    fn persist_repair_writes_both_copies() {
+        let (tmp, _env) = isolated_env("repairpatch");
+        let example =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/examples/memos.yaml");
+        let mut m = super::super::manifest::ServiceManifest::load_from_file(&example).unwrap();
+        let patch_path = tmp.join("manifests/usememos-memos.yaml");
+        std::fs::create_dir_all(patch_path.parent().unwrap()).unwrap();
+        std::fs::write(&patch_path, "placeholder").unwrap();
+        let repair = plan_repair(&detected_frontend_plan(), &["go build"]).unwrap();
+        apply_repair(&mut m, &repair);
+        persist_manifest(&m, Some(&patch_path), "auto-repair").unwrap();
+        let reloaded =
+            super::super::manifest::ServiceManifest::load_from_file(&patch_path).unwrap();
+        assert_eq!(reloaded.build.steps.len(), 3, "patched file reloads");
+        let lib = super::super::library::file_path(&m.service.id).unwrap();
+        assert_ne!(lib, patch_path, "fixture must exercise the second copy");
+        let lib_m = super::super::manifest::ServiceManifest::load_from_file(&lib).unwrap();
+        assert_eq!(lib_m.tools, vec!["pnpm".to_string(), "go".to_string()]);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

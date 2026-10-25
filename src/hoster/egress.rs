@@ -176,6 +176,19 @@ pub fn verify_runtime_egress() -> EgressVerdict {
     verify_egress_for(&[]).verdict
 }
 
+/// Whether THIS kernel can actually enforce a unit `IPAddressDeny=` filter:
+/// systemd loads an eBPF cgroup program, which unprivileged user managers
+/// cannot do when `kernel.unprivileged_bpf_disabled` is 1 or 2 (Ubuntu's
+/// default). Only the value `0` means enforceable; a missing/unreadable
+/// sysctl reads as "cannot confirm" (false) — an honest allowlist display
+/// must never claim enforcement it cannot prove. Used by the deploy
+/// pipeline (best-effort warning) and the Egress screen (policy marker).
+pub fn kernel_enforces_ip_filter() -> bool {
+    std::fs::read_to_string("/proc/sys/kernel/unprivileged_bpf_disabled")
+        .map(|s| s.trim() == "0")
+        .unwrap_or(false)
+}
+
 /// systemd's `IPAddressAllow=` parses bare addresses (optionally
 /// `ADDRESS/PREFIXLENGTH`) and the special names `any`/`localhost`/
 /// `link-local`/`multicast` — never hostnames: a name in the directive makes
