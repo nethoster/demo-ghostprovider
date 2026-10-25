@@ -9,6 +9,14 @@ version = 2
 # No stale ignores: the TUI stack now sits on ratatui 0.30 (lru 0.18.4), which
 # cleared the previously-ignored RUSTSEC-2024-0436/paste and the lru "unsound"
 # advisories. Keep this list empty unless a real, justified exception exists.
+ignore = [
+    # RUSTSEC-2024-0449 (unmaintained, not a vulnerability): serde_yaml is
+    # deprecated upstream and every API-compatible fork (serde_yaml_ng) still
+    # pulls unsafe-libyaml, so there is nothing to upgrade to today. The crate
+    # is only used through serde's safe Value API (manifest handling). Drop
+    # this entry once the YAML stack is migrated to a libyaml-free parser.
+    { id = "RUSTSEC-2024-0449" },
+]
 
 [bans]
 multiple-versions = "allow"

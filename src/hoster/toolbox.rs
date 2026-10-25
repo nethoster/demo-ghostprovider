@@ -525,7 +525,7 @@ fn zip_bin_entry(bytes: &[u8], tool: &str) -> anyhow::Result<Vec<u8>> {
     let mut hit: Option<(String, Vec<u8>)> = None;
     for i in 0..archive.len() {
         let mut file = archive.by_index(i).context("reading zip entry")?;
-        let path = file.name().to_string();
+        let path = file.name().context("reading zip entry name")?.to_string();
         if path.starts_with("__MACOSX") {
             continue;
         }

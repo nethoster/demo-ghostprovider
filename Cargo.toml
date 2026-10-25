@@ -23,7 +23,7 @@ signal-hook = "0.3"
 webpki-roots = "1"
 tar = "0.4"
 ureq = { version = "3.4.1", default-features = false, features = ["rustls", "gzip", "charset"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [[bin]]
 name = "demo-test"
