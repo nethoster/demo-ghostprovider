@@ -42,6 +42,7 @@ pub(crate) const WARN_YELLOW: Color = Color::Rgb(255, 184, 0); // input / warnin
 pub(crate) const ERR_RED: Color = Color::Rgb(255, 85, 85); // failures
 pub(crate) const VIOLET: Color = Color::Rgb(171, 130, 255); // scan sections
 pub(crate) const BLUE: Color = Color::Rgb(97, 143, 255); // services screen theme
+pub(crate) const ORANGE: Color = Color::Rgb(255, 140, 60); // edit-service theme
 const DIM: Color = Color::Rgb(110, 118, 129); // secondary text
 const BODY: Color = Color::Rgb(205, 213, 224); // regular text
 const BODY_ALT: Color = Color::Rgb(150, 160, 174); // zebra rows (no background)
@@ -74,6 +75,12 @@ pub(crate) const MAIN_MENU: &[(&str, &str, &str, Color)] = &[
         VIOLET,
     ),
     ("♥", "My Services", "your added services", BLUE),
+    (
+        "✎",
+        "Edit Service",
+        "edit a deployed service — name, port",
+        ORANGE,
+    ),
     ("⇄", "Egress", "allowed outbound per service", ERR_RED),
     (
         "≡",
@@ -83,46 +90,51 @@ pub(crate) const MAIN_MENU: &[(&str, &str, &str, Color)] = &[
     ),
 ];
 
-/// "GHOST PROVIDER" in the Pagga font — the exact three-line art the user
-/// picked in ~/Documents/style. Rendered verbatim: the "░" grid is part of
-/// the glyph layout, never trim or reflow it.
-const MAIN_ART: [&str; 3] = [
-    "░█▀▀░█░█░█▀█░█▀▀░▀█▀░░░█▀█░█▀▄░█▀█░█░█░▀█▀░█▀▄░█▀▀░█▀▄",
-    "░█░█░█▀█░█░█░▀▀█░░█░░░░█▀▀░█▀▄░█░█░▀▄▀░░█░░█░█░█▀▀░█▀▄",
-    "░▀▀▀░▀░▀░▀▀▀░▀▀▀░░▀░░░░▀░░░▀░▀░▀▀▀░░▀░░▀▀▀░▀▀░░▀▀▀░▀░▀",
+/// Row labels of the Edit Service form — the six manifest knobs the field
+/// editor exposes; [`edit_fields_of`] / [`apply_edit`] map rows ↔ manifest.
+const EDIT_FIELDS: [&str; 6] = ["name", "description", "commit", "port", "memory", "tasks"];
+
+/// Row indices into [`EDIT_FIELDS`].
+const EDIT_NAME: usize = 0;
+const EDIT_DESC: usize = 1;
+const EDIT_COMMIT: usize = 2;
+const EDIT_PORT: usize = 3;
+const EDIT_MEMORY: usize = 4;
+const EDIT_TASKS: usize = 5;
+
+/// "GHOST PROVIDER" in the ANSI Shadow font — the exact six-line art the
+/// user picked in ~/Documents/style. Rendered verbatim: the outline frame
+/// (═║╔╗╚╝) is part of the glyph layout, never trim or reflow it.
+const MAIN_ART: &[&str] = &[
+    " ██████╗ ██╗  ██╗ ██████╗ ███████╗████████╗    ██████╗ ██████╗  ██████╗ ██╗   ██╗██╗██████╗ ███████╗██████╗ ",
+    "██╔════╝ ██║  ██║██╔═══██╗██╔════╝╚══██╔══╝    ██╔══██╗██╔══██╗██╔═══██╗██║   ██║██║██╔══██╗██╔════╝██╔══██╗",
+    "██║  ███╗███████║██║   ██║███████╗   ██║       ██████╔╝██████╔╝██║   ██║██║   ██║██║██║  ██║█████╗  ██████╔╝",
+    "██║   ██║██╔══██║██║   ██║╚════██║   ██║       ██╔═══╝ ██╔══██║██║   ██║╚██╗ ██╔╝██║██║  ██║██╔══╝  ██╔══██╗",
+    "╚██████╔╝██║  ██║╚██████╔╝███████║   ██║       ██║     ██║  ██║╚██████╔╝ ╚████╔╝ ██║██████╔╝███████╗██║  ██║",
+    " ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝       ╚═╝     ╚═╝  ╚═╝ ╚═════╝   ╚═══╝  ╚═╝╚═════╝ ╚══════╝╚═╝  ╚═╝",
 ];
 
-/// The maximum art scale: 4× turns the 57-cell Pagga into 228 columns,
-/// which fills an ultrawide terminal without outgrowing typical heights.
+/// The maximum art scale: 4× turns the 108-cell ANSI Shadow banner into
+/// 432 columns, which fills an ultrawide terminal; narrower terminals
+/// condense the art to the window width (see `art_scale`, `shrink_art`).
 const ART_MAX_SCALE: u16 = 4;
 
-/// Repeat each Pagga cell into an n×n block: the same letterforms, at any
-/// scale. At 1× the art is rendered verbatim — the half-block ▀/▄ glyphs
-/// are part of the letterforms. At ≥2× the half-blocks are decomposed into
-/// full ░/█ blocks (a true pixel zoom): naively repeating a ▀ row would
-/// stack top-half glyphs n times and stripe the letterforms with
-/// comb-like gaps.
-fn expand_art(art: &[&str; 3], n: u16) -> Vec<String> {
+/// Repeat each art cell into an n×n block — a nearest-neighbour zoom of
+/// the exact style-file bitmap: every glyph cell (═║╔╗╚╝ outline frame
+/// included) simply repeats n times, so the banner grows without ever
+/// changing font or shape. At 1× the art is rendered verbatim.
+fn expand_art(art: &[&str], n: u16) -> Vec<String> {
     let n = n.max(1);
     if n == 1 {
         return art.iter().map(|l| l.to_string()).collect();
     }
     let n = n as usize;
-    let ink_rows = n.div_ceil(2); // top half of an ▀ cell (bottom half of ▄)
-    let mut out = Vec::with_capacity(3 * n);
+    let mut out = Vec::with_capacity(art.len() * n);
     for line in art {
-        for sub in 0..n {
+        for _sub in 0..n {
             let scaled: String = line
                 .chars()
-                .flat_map(|c| {
-                    let fill = match c {
-                        '█' => '█',
-                        '▀' if sub < ink_rows => '█',
-                        '▄' if sub >= ink_rows => '█',
-                        _ => '░',
-                    };
-                    std::iter::repeat_n(fill, n)
-                })
+                .flat_map(|c| std::iter::repeat_n(c, n))
                 .collect();
             out.push(scaled);
         }
@@ -130,14 +142,36 @@ fn expand_art(art: &[&str; 3], n: u16) -> Vec<String> {
     out
 }
 
-/// Largest scale (1..=ART_MAX_SCALE) whose art fits the terminal both ways:
-/// width must hold `base × n`, and height must hold the whole composition
-/// (art 3n + subtitle 3 + gap/menu 2+7 + gap/description 2). The layout
-/// itself never changes with the window — only this scale does.
+/// Condense the art to `dst_w` columns as a nearest-neighbour resample
+/// of the same bitmap, width-only: every output cell COPIES one source
+/// cell from the centre of its column span, and every glyph row is
+/// kept — the letterforms and the outline frame (═║╔╗╚╝) stay the
+/// same font, merely narrower. No pooling, no re-drawing, no
+/// plain-text fallback, never a different typeface.
+fn shrink_art(art: &[&str], dst_w: u16) -> Vec<String> {
+    let src_w = art[0].chars().count();
+    let dst_w = (dst_w as usize).clamp(1, src_w);
+    let grid: Vec<Vec<char>> = art.iter().map(|l| l.chars().collect()).collect();
+    grid.iter()
+        .map(|row| {
+            (0..dst_w)
+                .map(|c| {
+                    let sx = ((2 * c + 1) * src_w / (2 * dst_w)).min(src_w - 1);
+                    row[sx]
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Largest scale (1..=ART_MAX_SCALE) whose art fits the terminal both
+/// ways: width must hold `108 × n`, and height must hold the whole
+/// composition (art 6n + subtitle 3 + gap/menu 2+8 + gap/description
+/// 2). The layout itself never changes with the window.
 fn art_scale(area: ratatui::prelude::Rect) -> u16 {
     let base_w = MAIN_ART[0].chars().count() as u16;
     let mut n = (area.width / base_w).clamp(1, ART_MAX_SCALE);
-    let content_h = |n: u16| 3 * n + 3 + 2 + MAIN_MENU.len() as u16 + 2;
+    let content_h = |n: u16| MAIN_ART.len() as u16 * n + 3 + 2 + MAIN_MENU.len() as u16 + 2;
     while n > 1 && content_h(n) > area.height {
         n -= 1;
     }
@@ -367,6 +401,41 @@ pub(crate) enum Screen {
         selected: usize,
         message: Option<String>,
     },
+    /// Deployed services ready for in-place manifest edits (menu
+    /// "Edit Service"): every id from state.json annotated with the library
+    /// manifest behind it — pick one to edit name, commit, port, limits.
+    EditService {
+        rows: Vec<EditRow>,
+        selected: usize,
+        message: Option<String>,
+    },
+    /// Field editor for one deployed manifest. Row order is [`EDIT_FIELDS`];
+    /// Enter edits the selected row inline (seeded with its value), Enter
+    /// commits it through the field check, `s` saves the whole manifest, `r`
+    /// saves and redeploys, `e` opens the raw yaml in $EDITOR for everything
+    /// beyond the six rows.
+    EditServiceForm {
+        id: String,
+        fields: Vec<String>,
+        sel: usize,
+        buffer: String,
+        editing: bool,
+        error: Option<String>,
+        message: Option<String>,
+    },
+}
+
+/// One Edit Service list row: a deployed id with its live URL and the
+/// library manifest behind it (`None` = deployed some other way, e.g. an
+/// external path — such units cannot be edited here).
+pub(crate) struct EditRow {
+    pub id: String,
+    /// `service.name` from the manifest, falling back to the id.
+    pub name: String,
+    pub url: String,
+    pub path: Option<std::path::PathBuf>,
+    /// The manifest file exists and parses.
+    pub valid: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -735,18 +804,50 @@ fn event_loop(
                                         };
                                     }
                                     workers::DetectRoute::Auto => {
-                                        match auto_store(&mut ready.draft, &ready.suggested_id) {
-                                            Ok(target) => start_deploy_screen(app, target),
-                                            // Manifest would not validate:
-                                            // open the wizard on the same
-                                            // draft with the reason, so the
-                                            // user fixes exactly what failed.
-                                            Err(e) => {
-                                                app.screen = Screen::WzId {
-                                                    buffer: ready.suggested_id,
-                                                    error: Some(e),
-                                                    draft: ready.draft,
+                                        // Autopilot only when the detection is
+                                        // both confident (the repo declared its
+                                        // run command) and clean (no warn notes,
+                                        // e.g. a shipped placeholder secret the
+                                        // app will refuse to boot with). A known
+                                        // problem goes to the wizard for review.
+                                        let warned = ready
+                                            .draft
+                                            .notes
+                                            .iter()
+                                            .any(|n| n.starts_with("warn: "));
+                                        if ready.confident && !warned {
+                                            match auto_store(&mut ready.draft, &ready.suggested_id)
+                                            {
+                                                Ok(target) => start_deploy_screen(app, target),
+                                                // Manifest would not validate:
+                                                // open the wizard on the same
+                                                // draft with the reason, so the
+                                                // user fixes exactly what failed.
+                                                Err(e) => {
+                                                    app.screen = Screen::WzId {
+                                                        buffer: ready.suggested_id,
+                                                        error: Some(e),
+                                                        draft: ready.draft,
+                                                    }
                                                 }
+                                            }
+                                        } else {
+                                            // Nothing declared how this app runs,
+                                            // or its config ships a placeholder
+                                            // secret: never deploy that silently —
+                                            // open the wizard so the user reviews
+                                            // and confirms.
+                                            if !ready.confident {
+                                                ready.draft.notes.insert(
+                                                    0,
+                                                    "detected by guessing — review before deploying"
+                                                        .into(),
+                                                );
+                                            }
+                                            app.screen = Screen::WzId {
+                                                buffer: ready.suggested_id,
+                                                error: None,
+                                                draft: ready.draft,
                                             }
                                         }
                                     }
@@ -955,7 +1056,7 @@ fn command_char(key: KeyCode) -> Option<char> {
 /// false` so the entry is *settled now* — the clone/build tree (the whole
 /// `services/<name>` folder) is wiped and the journal entry removed, rather than
 /// deferred to the next launch. Safe to call when no deploy is running —
-/// `reconcile_stale` is a no-op then.
+/// `reconcile_stale_locked` is a no-op then.
 fn exit_with_reconcile(app: &mut App) -> anyhow::Result<()> {
     // Reconcile may run systemctl commands for seconds — tell the stall
     // watchdog this block is legitimate (see `WATCHDOG_PAUSE`).
@@ -981,10 +1082,8 @@ fn exit_with_reconcile(app: &mut App) -> anyhow::Result<()> {
         // appear twice in deploy.log.
         crate::tui::workers::wait_deploy_worker(std::time::Duration::from_secs(2));
     }
-    let msgs = crate::hoster::deploy::reconcile_stale_with_basis(
-        false,
-        crate::hoster::deploy::ReconcileBasis::Exit,
-    );
+    let msgs =
+        crate::hoster::deploy::reconcile_stale_locked(crate::hoster::deploy::ReconcileBasis::Exit);
     app.exit_notices.extend(msgs);
     if worker_live {
         // The worker suppresses its own done line when exiting, so this is the
@@ -1048,6 +1147,28 @@ fn edit_file_suspended(
                 .into_iter()
                 .map(|(name, _)| name)
                 .collect();
+            *message = Some(msg);
+        }
+        Screen::EditServiceForm {
+            id,
+            fields,
+            sel,
+            error,
+            message,
+            ..
+        } => {
+            // The external editor just rewrote the yaml: refill the rows so
+            // the form shows what is actually on disk now.
+            match crate::hoster::library::load(id) {
+                Ok(m) => {
+                    *fields = edit_fields_of(&m);
+                    *error = None;
+                }
+                Err(e) => *error = Some(workers::short_error_for(&e)),
+            }
+            if *sel >= fields.len() {
+                *sel = fields.len().saturating_sub(1);
+            }
             *message = Some(msg);
         }
         _ => {}
@@ -1386,7 +1507,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 };
             } else if exit {
                 stop_log_tailers(app);
-                app.screen = Screen::Main { selected: 6 };
+                app.screen = Screen::Main { selected: 7 };
             }
         }
         Screen::ConfirmClear {
@@ -1609,15 +1730,11 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             && let Some(f) = files.get(i).cloned()
                         {
                             if armed_delete.as_deref() == Some(f.id.as_str()) {
-                                match crate::hoster::library::remove(&f.id) {
-                                    Ok(true) => {
-                                        *message = Some(format!("removed {} from library", f.id));
-                                    }
-                                    Ok(false) => {
-                                        *message = Some(format!("{} is already gone", f.id));
-                                    }
-                                    Err(e) => *message = Some(format!("! {e:#}")),
-                                }
+                                // A delete is complete — unit, env file,
+                                // clone, registry entry and this manifest:
+                                // the service disappears from Logs, Edit
+                                // Service and here alike.
+                                *message = Some(workers::service_action(&f.id, "delete"));
                                 *armed_delete = None;
                                 *files = crate::hoster::library::list();
                                 let last = lib_row_count(files.len()).saturating_sub(1);
@@ -1626,8 +1743,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                                 }
                             } else {
                                 *armed_delete = Some(f.id.clone());
-                                *message =
-                                    Some(format!("press d again to delete {} from library", f.id));
+                                *message = Some(format!("press d again to fully delete {}", f.id));
                             }
                         }
                     }
@@ -1788,6 +1904,162 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 },
             }
         }
+        Screen::EditService {
+            rows,
+            selected,
+            message,
+        } => {
+            let count = rows.len();
+            match key {
+                KeyCode::Esc => app.screen = Screen::Main { selected: 5 },
+                KeyCode::Up if count > 0 => {
+                    *selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down if count > 0 => {
+                    *selected = (*selected + 1).min(count - 1);
+                }
+                KeyCode::Enter if count > 0 => {
+                    if let Some(row) = rows.get(*selected) {
+                        match row.path.as_ref() {
+                            None => {
+                                *message = Some(format!(
+                                    "{} has no library manifest — import it via Add Service",
+                                    row.id
+                                ))
+                            }
+                            Some(_) => match crate::hoster::library::load(&row.id) {
+                                Ok(m) => {
+                                    app.screen = Screen::EditServiceForm {
+                                        id: row.id.clone(),
+                                        fields: edit_fields_of(&m),
+                                        sel: 0,
+                                        buffer: String::new(),
+                                        editing: false,
+                                        error: None,
+                                        message: None,
+                                    };
+                                }
+                                Err(e) => *message = Some(workers::short_error_for(&e)),
+                            },
+                        }
+                    }
+                }
+                _ => match cmd {
+                    Some('q') => app.screen = Screen::Main { selected: 5 },
+                    Some('k') if count > 0 => {
+                        *selected = selected.saturating_sub(1);
+                    }
+                    Some('j') if count > 0 => {
+                        *selected = (*selected + 1).min(count - 1);
+                    }
+                    Some('r') => {
+                        *rows = edit_service_rows();
+                        if *selected >= rows.len() {
+                            *selected = rows.len().saturating_sub(1);
+                        }
+                        *message = Some("refreshed".into());
+                    }
+                    _ => {}
+                },
+            }
+        }
+        Screen::EditServiceForm {
+            id,
+            fields,
+            sel,
+            buffer,
+            editing,
+            error,
+            message,
+        } => match key {
+            KeyCode::Esc if *editing => {
+                *editing = false;
+                *error = None;
+            }
+            KeyCode::Esc => {
+                let rows = edit_service_rows();
+                let at = rows.iter().position(|r| r.id == *id).unwrap_or(0);
+                app.screen = Screen::EditService {
+                    rows,
+                    selected: at,
+                    message: None,
+                };
+            }
+            KeyCode::Up if !*editing => {
+                *sel = sel.saturating_sub(1);
+            }
+            KeyCode::Down if !*editing => {
+                *sel = (*sel + 1).min(fields.len().saturating_sub(1));
+            }
+            KeyCode::Tab if !*editing => {
+                *sel = (*sel + 1) % fields.len();
+            }
+            KeyCode::Backspace if *editing => {
+                buffer.pop();
+            }
+            KeyCode::Enter if *editing => match commit_edit_field(*sel, buffer) {
+                Ok(v) => {
+                    fields[*sel] = v;
+                    *editing = false;
+                    *error = None;
+                }
+                Err(e) => *error = Some(e),
+            },
+            // Enter on a browsing row starts editing it, seeded with the
+            // current value (EgressHosts convention; saving is `s`, like
+            // the wizard review's "s save only").
+            KeyCode::Enter => {
+                *buffer = fields[*sel].clone();
+                *editing = true;
+                *error = None;
+            }
+            KeyCode::Char(c) if *editing => buffer.push(c),
+            _ => match cmd {
+                Some('q') if !*editing => {
+                    let rows = edit_service_rows();
+                    let at = rows.iter().position(|r| r.id == *id).unwrap_or(0);
+                    app.screen = Screen::EditService {
+                        rows,
+                        selected: at,
+                        message: None,
+                    };
+                }
+                Some('s') if !*editing => match save_edit(id, fields) {
+                    Ok(_) => {
+                        *message = Some("saved — applies on next deploy".into());
+                        *error = None;
+                    }
+                    Err(e) => *error = Some(e),
+                },
+                Some('r') if !*editing => match save_edit(id, fields) {
+                    Ok(path) => {
+                        let input = path.display().to_string();
+                        match workers::classify_deploy_input(&input) {
+                            Ok(target) => {
+                                // The explicit r is the consent to redeploy —
+                                // same as the wizard's Enter save + deploy. An
+                                // outdated build re-execs first and resumes
+                                // this deploy on the fresh code.
+                                if crate::paths::binary_is_stale() {
+                                    restart_with_pending(&crate::paths::PendingAction {
+                                        payload: input,
+                                        route: crate::paths::PendingRoute::PathDeploy,
+                                    });
+                                }
+                                start_deploy_screen(app, target);
+                            }
+                            Err(e) => *error = Some(e),
+                        }
+                    }
+                    Err(e) => *error = Some(e),
+                },
+                Some('e') if !*editing => match crate::hoster::library::file_path(id) {
+                    Ok(path) => return Flow::EditFile(path),
+                    Err(e) => *error = Some(workers::short_error_for(&e)),
+                },
+                _ => {}
+            },
+        },
         Screen::Egress {
             files,
             deployed,
@@ -1799,7 +2071,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
         } => {
             let count = files.len();
             match key {
-                KeyCode::Esc => app.screen = Screen::Main { selected: 5 },
+                KeyCode::Esc => app.screen = Screen::Main { selected: 6 },
                 KeyCode::Up if count > 0 => {
                     *selected = selected.saturating_sub(1);
                 }
@@ -1829,7 +2101,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     }
                 }
                 _ => match cmd {
-                    Some('q') => app.screen = Screen::Main { selected: 5 },
+                    Some('q') => app.screen = Screen::Main { selected: 6 },
                     Some('k') if count > 0 => {
                         *selected = selected.saturating_sub(1);
                     }
@@ -2374,7 +2646,20 @@ fn move_main_selection(selected: &mut usize, key: KeyCode) {
 
 /// Switch to the streaming Deploy screen for an already-classified target
 /// (and kick the worker off first, so the first lines never get dropped).
+/// An outdated build hands the exact target over to the fresh binary first:
+/// starting the pipeline on a stale image is what forced manual relaunches
+/// mid-deploy, and a relaunch while a worker runs races the recovery pass
+/// (the new process sweeps the live tree → clone dies with ENOENT). Only
+/// returns when the takeover could not happen (no disk copy, exec refused,
+/// or a deploy is already winding down); the pipeline then starts on the
+/// running build as before.
 fn start_deploy_screen(app: &mut App, target: workers::DeployTarget) {
+    if crate::paths::binary_is_stale() {
+        restart_with_pending(&crate::paths::PendingAction {
+            payload: target.back_to_input(),
+            route: crate::paths::PendingRoute::PathDeploy,
+        });
+    }
     let label = target.describe();
     workers::start_target_deployment(app.tx.clone(), target);
     app.screen = Screen::Deploy {
@@ -2501,6 +2786,121 @@ fn resume_pending_action(app: &mut App) {
     }
 }
 
+/// Rows for the Edit Service menu: every deployed id (state.json) paired
+/// with its library manifest. `state.json` is a BTreeMap, so rows are id-ordered.
+fn edit_service_rows() -> Vec<EditRow> {
+    crate::state::list()
+        .into_iter()
+        .map(|(id, entry)| {
+            let path = crate::hoster::library::file_path(&id)
+                .ok()
+                .filter(|p| p.exists());
+            let loaded = path
+                .as_ref()
+                .and_then(|_| crate::hoster::library::load(&id).ok());
+            let name = loaded
+                .as_ref()
+                .map(|m| m.service.name.trim())
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| id.clone());
+            // `entry.url` is the source repo; the live endpoint lives in
+            // `urls` — show what the service actually answers on.
+            let live = entry
+                .urls
+                .first()
+                .cloned()
+                .unwrap_or_else(|| entry.url.clone());
+            EditRow {
+                id,
+                name,
+                url: live,
+                valid: loaded.is_some(),
+                path,
+            }
+        })
+        .collect()
+}
+
+/// The six row buffers of [`Screen::EditServiceForm`] from a loaded
+/// manifest. Missing optional values render empty (the schema still
+/// requires memory and tasks, so an empty row only survives until save).
+fn edit_fields_of(m: &crate::hoster::manifest::ServiceManifest) -> Vec<String> {
+    vec![
+        m.service.name.clone(),
+        m.service.description.clone(),
+        m.source.commit.clone(),
+        m.run.port.to_string(),
+        m.resources.memory_max.clone().unwrap_or_default(),
+        m.resources.tasks_max.clone().unwrap_or_default(),
+    ]
+}
+
+/// Field-level check when a row leaves edit mode: the value must parse on
+/// its own — the full schema revalidation waits for save.
+fn commit_edit_field(sel: usize, value: &str) -> Result<String, String> {
+    let v = value.trim().to_string();
+    match sel {
+        EDIT_COMMIT => {
+            wizard::check_commit(&v)?;
+            Ok(v)
+        }
+        EDIT_PORT => {
+            wizard::check_port(&v)?;
+            Ok(v)
+        }
+        EDIT_MEMORY => {
+            wizard::check_memory(&v)?;
+            Ok(v)
+        }
+        EDIT_TASKS => {
+            wizard::check_tasks(&v)?;
+            Ok(v)
+        }
+        _ => Ok(v),
+    }
+}
+
+/// Patch a manifest with the six [`EDIT_FIELDS`] values and revalidate the
+/// whole schema — build steps, env, egress and plugins pass through untouched.
+fn apply_edit(
+    manifest: &mut crate::hoster::manifest::ServiceManifest,
+    fields: &[String],
+) -> Result<(), String> {
+    if fields.len() != EDIT_FIELDS.len() {
+        return Err(format!(
+            "internal: expected {} fields, got {}",
+            EDIT_FIELDS.len(),
+            fields.len()
+        ));
+    }
+    manifest.service.name = fields[EDIT_NAME].trim().to_string();
+    manifest.service.description = fields[EDIT_DESC].trim().to_string();
+    let commit = fields[EDIT_COMMIT].trim().to_string();
+    wizard::check_commit(&commit)?;
+    manifest.source.commit = commit;
+    manifest.run.port = wizard::check_port(&fields[EDIT_PORT])?;
+    wizard::check_memory(&fields[EDIT_MEMORY])?;
+    manifest.resources.memory_max = Some(fields[EDIT_MEMORY].trim().to_string());
+    wizard::check_tasks(&fields[EDIT_TASKS])?;
+    manifest.resources.tasks_max = Some(fields[EDIT_TASKS].trim().to_string());
+    manifest
+        .validate("edit")
+        .map_err(|e| workers::short_error_for(&e))
+}
+
+/// Load, patch, validate and replace the manifest in place; returns the
+/// library path (for the caller's redeploy) or the error for the form.
+fn save_edit(id: &str, fields: &[String]) -> Result<std::path::PathBuf, String> {
+    let mut manifest =
+        crate::hoster::library::load(id).map_err(|e| workers::short_error_for(&e))?;
+    apply_edit(&mut manifest, fields)?;
+    let yaml = serde_yaml::to_string(&manifest).map_err(|e| format!("cannot render YAML: {e}"))?;
+    crate::hoster::library::replace(id, yaml.as_bytes())
+        .map_err(|e| workers::short_error_for(&e))?;
+    crate::hoster::library::file_path(id).map_err(|e| workers::short_error_for(&e))
+}
+
 fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
     match selected {
         0 => {
@@ -2549,6 +2949,13 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
             };
         }
         5 => {
+            app.screen = Screen::EditService {
+                rows: edit_service_rows(),
+                selected: 0,
+                message: None,
+            };
+        }
+        6 => {
             let snap = workers::egress_snapshot();
             app.screen = Screen::Egress {
                 files: snap.files,
@@ -2560,7 +2967,7 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                 message: None,
             };
         }
-        6 => {
+        7 => {
             // Deploy logs: single shared file is the source of truth so every
             // window streams the same live deploy. File survives across processes.
             let mut deploy_lines = workers::read_deploy_log();
@@ -2902,6 +3309,35 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         } => {
             draw_user_services(f, chunks[0], files, deployed, *selected, message.as_deref());
         }
+        Screen::EditService {
+            rows,
+            selected,
+            message,
+        } => {
+            draw_edit_service(f, chunks[0], rows, *selected, message.as_deref());
+        }
+        Screen::EditServiceForm {
+            id,
+            fields,
+            sel,
+            buffer,
+            editing,
+            error,
+            message,
+        } => {
+            draw_edit_service_form(
+                f,
+                chunks[0],
+                id,
+                fields,
+                *sel,
+                buffer,
+                *editing,
+                error.as_deref(),
+                message.as_deref(),
+                app.tick,
+            );
+        }
         Screen::Egress {
             files,
             deployed,
@@ -3072,11 +3508,17 @@ fn draw_main_menu(f: &mut ratatui::Frame, area: ratatui::prelude::Rect, selected
     }
     let selected = selected.min(MAIN_MENU.len() - 1);
 
-    // Scale the Pagga art to the terminal (1×–4×): the largest size whose
-    // width and the whole composition's height still fit. The layout below
-    // is fixed — same rows, same spacing, packed menu — at every scale;
-    // only the banner grows or shrinks with the window.
-    let art = expand_art(&MAIN_ART, art_scale(area));
+    // The banner scales WITH the window while keeping the exact style
+    // glyphs: wide enough — a nearest-neighbour zoom (each glyph cell
+    // repeats n×n, 1×–4×, height-capped); narrower — a width-only
+    // nearest-neighbour condense that copies the same glyph cells and
+    // keeps all six rows. Same font at every size; the layout below
+    // never changes.
+    let art = if area.width >= MAIN_ART[0].chars().count() as u16 {
+        expand_art(MAIN_ART, art_scale(area))
+    } else {
+        shrink_art(MAIN_ART, area.width)
+    };
 
     // The whole composition — art, subtitle, mark, menu — is one block,
     // centered in the body both ways; the selected description anchors the
@@ -3924,6 +4366,171 @@ fn draw_user_services(
     f.render_widget(List::new(items).block(block_widget), area);
 }
 
+/// Deployed services with their manifest status: id, [ready/invalid/no
+/// manifest], display name and live URL. All rows are deployed by
+/// construction, so the mark carries the manifest health instead.
+fn draw_edit_service(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    rows: &[EditRow],
+    selected: usize,
+    message: Option<&str>,
+) {
+    if rows.is_empty() {
+        let mut text = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                " No deployed services yet.",
+                Style::default().fg(BODY),
+            )),
+            Line::from(Span::styled(
+                " Deploy one from “Deploy Service” — this menu edits units you already run.",
+                Style::default().fg(DIM),
+            )),
+        ];
+        if let Some(m) = message {
+            text.push(Line::from(""));
+            text.push(Line::from(Span::styled(
+                format!(" {m}"),
+                Style::default().fg(WARN_YELLOW),
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(text)
+                .wrap(Wrap { trim: false })
+                .block(block("Edit Service", ORANGE)),
+            area,
+        );
+        return;
+    }
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let sel = i == selected;
+            let (status, hue) = if row.path.is_none() {
+                ("no manifest", ERR_RED)
+            } else if row.valid {
+                ("ready", OK_GREEN)
+            } else {
+                ("invalid", ERR_RED)
+            };
+            let mut spans = vec![
+                Span::styled(if sel { " » " } else { "   " }, Style::default().fg(ORANGE)),
+                Span::styled(
+                    row.id.clone(),
+                    Style::default()
+                        .fg(if sel { Color::White } else { BODY })
+                        .add_modifier(if sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(format!("  [{status}]"), Style::default().fg(hue)),
+            ];
+            if row.name != row.id {
+                spans.push(Span::styled(
+                    format!("  {}", row.name),
+                    Style::default().fg(BODY_ALT),
+                ));
+            }
+            if !row.url.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", row.url),
+                    Style::default().fg(DIM),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut block_widget = block("Edit Service", ORANGE);
+    if let Some(m) = message {
+        block_widget = block_widget.title_bottom(Span::styled(
+            format!(" {m} "),
+            Style::default().fg(WARN_YELLOW),
+        ));
+    }
+    f.render_widget(List::new(items).block(block_widget), area);
+}
+
+/// The six [`EDIT_FIELDS`] rows of one manifest: the selected row shows the
+/// inline buffer with a blinking cursor while editing; errors (red) and the
+/// last save result (yellow) hang under the list.
+#[allow(clippy::too_many_arguments)]
+fn draw_edit_service_form(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    id: &str,
+    fields: &[String],
+    sel: usize,
+    buffer: &str,
+    editing: bool,
+    error: Option<&str>,
+    message: Option<&str>,
+    tick: u64,
+) {
+    let mut text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " Edit the manifest fields below — build steps, env, egress and",
+            Style::default().fg(DIM),
+        )),
+        Line::from(Span::styled(
+            " plugins stay untouched. Saving applies on the next deploy.",
+            Style::default().fg(DIM),
+        )),
+        Line::from(""),
+    ];
+    for (i, label) in EDIT_FIELDS.iter().enumerate() {
+        let row_sel = i == sel;
+        let mut spans = vec![
+            Span::styled(
+                if row_sel { " » " } else { "   " },
+                Style::default().fg(ORANGE),
+            ),
+            Span::styled(format!("{label}: "), Style::default().fg(DIM)),
+        ];
+        if row_sel && editing {
+            spans.push(Span::styled(
+                buffer.to_string(),
+                Style::default().fg(Color::White),
+            ));
+            spans.push(cursor_span(tick));
+        } else {
+            let value = &fields[i];
+            if value.is_empty() {
+                spans.push(Span::styled("—", Style::default().fg(DIM)));
+            } else {
+                spans.push(Span::styled(
+                    value.clone(),
+                    Style::default().fg(if row_sel { Color::White } else { BODY }),
+                ));
+            }
+        }
+        text.push(Line::from(spans));
+    }
+    if let Some(e) = error {
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled(
+            format!(" x {e}"),
+            Style::default().fg(ERR_RED),
+        )));
+    }
+    if let Some(m) = message {
+        text.push(Line::from(Span::styled(
+            format!(" {m}"),
+            Style::default().fg(WARN_YELLOW),
+        )));
+    }
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .block(block(&format!("Edit · {id}"), ORANGE)),
+        area,
+    );
+}
+
 /// Human byte counter for the Egress matrix (unit IP accounting).
 fn human_bytes(n: u64) -> String {
     const KB: u64 = 1024;
@@ -3976,13 +4583,19 @@ fn draw_egress(
             Style::default().fg(ERR_RED),
         );
         // Allow list, re-read from the validated file (cheap, always fresh).
-        let allow: Vec<String> = crate::hoster::library::load(&e.id)
-            .map(|m| m.egress.allow)
+        let (allow, auto): (Vec<String>, Option<bool>) = crate::hoster::library::load(&e.id)
+            .map(|m| (m.egress.allow, m.egress.auto))
             .unwrap_or_default();
         let policy = if allow.is_empty() {
-            "deny-all (loopback only)".to_string()
+            "deny-all: REAL (private netns)".to_string()
         } else {
-            format!("allow: {}", allow.join(", "))
+            let auto_marker = if auto == Some(true) { " (auto)" } else { "" };
+            let best = if crate::hoster::egress::kernel_enforces_ip_filter() {
+                ""
+            } else {
+                " · best-effort"
+            };
+            format!("allow: {}{auto_marker}{best}", allow.join(", "))
         };
         let traffic = match counters.get(&e.id) {
             Some((out, inn)) => {
@@ -4803,11 +5416,12 @@ fn draw_services(
                 _ => ERR_RED,
             };
             // Read-only status rows (tailscale) carry a [vpn] tag instead of
-            // the plain managed-unit name column.
+            // the plain managed-unit name column. The left column is the
+            // human name; the unit id always trails the URL in parens.
             let name_col = if row.managed {
-                format!("{:<16}", row.name)
+                format!("{:<16}", row.display)
             } else {
-                format!("[vpn] {:<10}", row.name)
+                format!("[vpn] {:<10}", row.display)
             };
             ListItem::new(Line::from(vec![
                 Span::styled(
@@ -4830,6 +5444,7 @@ fn draw_services(
                 Span::styled("● ", Style::default().fg(status_color)),
                 Span::styled(row.status.clone(), Style::default().fg(status_color)),
                 Span::styled(format!("  {}", row.url), Style::default().fg(url_fg)),
+                Span::styled(format!("  ({})", row.name), Style::default().fg(DIM)),
             ]))
         })
         .collect();
@@ -5074,6 +5689,25 @@ fn hint_line(screen: &Screen) -> Line<'static> {
             ("d delete", ERR_RED),
             ("Esc back", WARN_YELLOW),
         ],
+        Screen::EditService { .. } => vec![
+            ("↑↓ select", ORANGE),
+            ("Enter edit", OK_GREEN),
+            ("r refresh", BLUE),
+            ("Esc back", WARN_YELLOW),
+        ],
+        Screen::EditServiceForm { editing, .. } => {
+            if *editing {
+                vec![("Enter confirm", OK_GREEN), ("Esc cancel", WARN_YELLOW)]
+            } else {
+                vec![
+                    ("Enter edit row", OK_GREEN),
+                    ("s save", VIOLET),
+                    ("r redeploy", MAGENTA),
+                    ("e editor", VIOLET),
+                    ("Esc back", WARN_YELLOW),
+                ]
+            }
+        }
         // Wizard hints name their destination: after Enter the next screen
         // must be predictable, not a surprise.
         Screen::WzId { .. } => vec![("Enter → source", OK_GREEN), ("Esc back", WARN_YELLOW)],
@@ -5207,10 +5841,11 @@ mod tests {
     }
 
     /// The menu is the single source of truth: Self-Hosting manages units,
-    /// My Services lists the user's own added services. Navigation caps derive
-    /// from MAIN_MENU so this guards desync.
+    /// My Services lists the user's own added services, Edit Service edits
+    /// the deployed ones. Navigation caps derive from MAIN_MENU so this
+    /// guards desync.
     #[test]
-    fn main_menu_lists_seven_items_ending_with_egress_and_logs() {
+    fn main_menu_lists_eight_items_with_edit_service_after_my_services() {
         let titles: Vec<&str> = MAIN_MENU.iter().map(|(_, t, _, _)| *t).collect();
         assert_eq!(
             titles,
@@ -5220,24 +5855,29 @@ mod tests {
                 "Deploy Service",
                 "Add Service",
                 "My Services",
+                "Edit Service",
                 "Egress",
                 "Logs"
             ]
         );
     }
 
-    /// The brand art is the exact Pagga rendering picked in ~/Documents/style:
-    /// three equal-width lines, verbatim (the "░" grid is part of the glyphs).
+    /// The brand art is the exact ANSI Shadow rendering picked in
+    /// ~/Documents/style: six equal-width lines, verbatim (the outline
+    /// frame ═║╔╗╚╝ is part of the glyphs).
     #[test]
-    fn main_art_is_three_equal_pagga_lines() {
-        assert_eq!(MAIN_ART.len(), 3);
+    fn main_art_is_six_equal_ansi_shadow_lines() {
+        assert_eq!(MAIN_ART.len(), 6);
         let w = MAIN_ART[0].chars().count();
-        assert!(w >= 50, "art should span a full headline, got {w} cols");
+        assert!(w >= 100, "art should span a full headline, got {w} cols");
         for line in MAIN_ART {
             assert_eq!(line.chars().count(), w, "all art lines share one width");
         }
-        assert!(MAIN_ART[0].starts_with("░█▀▀"), "starts with G");
-        assert!(MAIN_ART[0].ends_with("█▀▄"), "ends with R");
+        assert!(
+            MAIN_ART[0].trim_start().starts_with("██████╗"),
+            "starts with G"
+        );
+        assert!(MAIN_ART[5].trim_end().ends_with("╚═╝"), "ends with R");
     }
 
     /// Arrows step through the centered list one item at a time.
@@ -5259,75 +5899,51 @@ mod tests {
         assert_eq!(last, MAIN_MENU.len() - 1, "down clamps at the last item");
     }
 
-    /// The scaled art is the same letterforms at n×n cells per glyph. At 1×
-    /// it is verbatim (half-blocks intact); at ≥2× the half-blocks are
-    /// decomposed into full ░/█ blocks so vertically stacked rows never
-    /// stripe the letterforms with comb-like gaps.
+    /// The scaled art is a nearest-neighbour zoom of the exact same
+    /// bitmap: each glyph cell (outline frame included) repeats n×n —
+    /// bigger, never re-drawn. Sampling every n-th cell of every n-th
+    /// row must give the original style-file art back exactly.
     #[test]
-    fn pagga_art_scales_to_n_times_the_size() {
+    fn ansi_shadow_art_scales_to_n_times_the_size() {
         for n in 1..=4u16 {
-            let big = expand_art(&MAIN_ART, n);
-            assert_eq!(big.len(), 3 * n as usize);
+            let big = expand_art(MAIN_ART, n);
+            assert_eq!(big.len(), MAIN_ART.len() * n as usize);
             let w = MAIN_ART[0].chars().count() * n as usize;
             assert_eq!(big[0].chars().count(), w);
-            assert!(big[0].starts_with(&"░".repeat(n as usize)), "G scaled");
             if n == 1 {
                 assert_eq!(big[0], MAIN_ART[0], "1x is verbatim");
                 continue;
             }
-            // No half-block glyphs survive the zoom: only ░/█ cells, so a
-            // terminal renders every row fully opaque or fully empty.
-            for row in &big {
-                assert!(
-                    row.chars().all(|c| c == '░' || c == '█'),
-                    "scaled art must be ░/█ only, got {row:?}"
-                );
+            for (j, line) in MAIN_ART.iter().enumerate() {
+                let sampled: String = big[j * n as usize].chars().step_by(n as usize).collect();
+                assert_eq!(sampled.as_str(), *line, "row {j} at {n}x samples to 1x");
             }
-            // ▀ (source row 0, col 2) splits into ink on the top rows and
-            // background on the bottom rows of its n-row block — the
-            // pixel-zoom semantics, not n copies of the top-half glyph.
-            // Full cells (█ at col 1) fill the whole block instead.
-            assert_eq!(big[0].chars().nth(n as usize), Some('█'), "█ fills top");
-            assert_eq!(
-                big[n as usize - 1].chars().nth(n as usize),
-                Some('█'),
-                "█ fills bottom"
-            );
-            assert_eq!(
-                big[0].chars().nth(2 * n as usize),
-                Some('█'),
-                "▀ ink on top"
-            );
-            assert_eq!(
-                big[n as usize - 1].chars().nth(2 * n as usize),
-                Some('░'),
-                "▀ background on the bottom"
-            );
         }
     }
 
     /// The scale follows the terminal: wider gets bigger (up to 4×), but a
     /// short terminal caps the art so the (always packed) menu still fits.
+    /// Base width is 108 cells: 2× needs 216+, 3× 324+, 4× 432+ columns.
     #[test]
     fn art_scale_grows_with_width_and_shrinks_with_height() {
         let s = |w, h| art_scale(ratatui::prelude::Rect::new(0, 0, w, h));
-        assert_eq!(s(80, 40), 1, "narrow: 1x");
-        assert_eq!(s(114, 40), 2, "2x width fits at 114");
-        assert_eq!(s(200, 50), 3, "3x width fits at 171+");
-        assert_eq!(s(250, 60), 4, "wide: 4x");
-        assert_eq!(s(250, 18), 1, "short: 1x even when wide");
+        assert_eq!(s(120, 40), 1, "narrow: 1x");
+        assert_eq!(s(220, 50), 2, "2x width fits at 216+");
+        assert_eq!(s(330, 60), 3, "3x width fits at 324+");
+        assert_eq!(s(440, 80), 4, "wide: 4x");
+        assert_eq!(s(440, 30), 2, "short: capped so the menu fits");
         assert_eq!(s(50, 10), 1, "tiny: never below 1x");
     }
 
-    /// The main screen renders the Pagga art and subtitle as one block with
-    /// the free space split into thirds (above brand / between brand and
-    /// menu / below menu); menu items share a common left edge (the block is
-    /// centered, not each line); the selected description sits on the very
-    /// bottom row.
+    /// The main screen renders the ANSI Shadow art and subtitle as one block
+    /// with the free space split into thirds (above brand / between brand
+    /// and menu / below menu); menu items share a common left edge (the
+    /// block is centered, not each line); the selected description sits on
+    /// the very bottom row.
     #[test]
     fn main_menu_screen_renders_art_subtitles_and_list() {
         use ratatui::backend::TestBackend;
-        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
         term.draw(|f| draw_main_menu(f, f.area(), 2)).unwrap();
         let buf = term.backend().buffer();
         let mut text = String::new();
@@ -5391,15 +6007,70 @@ mod tests {
         assert_eq!(scan_col, deploy_col, "menu items align as a block");
         // The selected description is anchored to the bottom row.
         assert_eq!(desc_row, Some(buf.area.height - 1));
-        // Narrow terminals keep the original art size.
-        assert!(!text.contains(&expand_art(&MAIN_ART, 2)[0]));
     }
 
-    /// A wide terminal scales the brand art up.
+    /// Condense-fidelity test: shrinking is width-only nearest
+    /// neighbour — all glyph rows survive, the output is drawn from the
+    /// source font's own characters, and shrinking to the native width
+    /// is the identity.
     #[test]
-    fn wide_main_menu_screen_scales_the_art_up() {
+    fn shrink_art_keeps_every_glyph_row() {
+        let native: Vec<String> = MAIN_ART.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            shrink_art(MAIN_ART, 108),
+            native,
+            "native width is identity"
+        );
+        let source: std::collections::HashSet<char> =
+            MAIN_ART.iter().flat_map(|l| l.chars()).collect();
+        for w in [107u16, 98, 83, 50, 30] {
+            let small = shrink_art(MAIN_ART, w);
+            assert_eq!(small.len(), MAIN_ART.len(), "all glyph rows at {w}");
+            let charset: std::collections::HashSet<char> =
+                small.iter().flat_map(|r| r.chars()).collect();
+            assert!(charset.is_subset(&source), "only source glyphs at {w}");
+            assert!(
+                small.iter().any(|r| r
+                    .chars()
+                    .any(|c| matches!(c, '═' | '║' | '╔' | '╗' | '╚' | '╝'))),
+                "the outline frame survives at {w}"
+            );
+        }
+    }
+
+    /// A window narrower than the 108-cell art condenses the SAME glyph
+    /// cells to its width (nearest-neighbour, all six rows kept) —
+    /// never a plain-text substitute, never a different font.
+    #[test]
+    fn narrow_main_menu_keeps_the_ascii_art() {
         use ratatui::backend::TestBackend;
-        let mut term = Terminal::new(TestBackend::new(120, 36)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(90, 30)).unwrap();
+        term.draw(|f| draw_main_menu(f, f.area(), 0)).unwrap();
+        let buf = term.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        let small = shrink_art(MAIN_ART, 90);
+        assert!(
+            text.contains(&small[0]),
+            "the condensed banner renders whole at 90 cols"
+        );
+        assert!(
+            !text.contains("GHOST PROVIDER"),
+            "no plain-text substitute for the art"
+        );
+        assert!(text.contains("System Scan"), "menu stays");
+    }
+
+    /// A wide terminal zooms the same glyph cells up (2× tile).
+    #[test]
+    fn wide_main_menu_scales_the_art_up() {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(220, 50)).unwrap();
         term.draw(|f| draw_main_menu(f, f.area(), 0)).unwrap();
         let buf = term.backend().buffer();
         let mut text = String::new();
@@ -5410,17 +6081,17 @@ mod tests {
             text.push('\n');
         }
         assert!(
-            text.contains(&expand_art(&MAIN_ART, 2)[0]),
-            "2x art on 120 cols"
+            text.contains(&expand_art(MAIN_ART, 2)[0]),
+            "2x tiled art on 220 cols"
         );
         assert!(!text.contains(MAIN_ART[0]), "1x art replaced");
     }
 
-    /// An ultrawide terminal uses the largest scale the height allows.
+    /// An ultrawide terminal uses the largest tile the height allows.
     #[test]
     fn ultrawide_main_menu_scales_art_to_the_max() {
         use ratatui::backend::TestBackend;
-        let mut term = Terminal::new(TestBackend::new(250, 50)).unwrap();
+        let mut term = Terminal::new(TestBackend::new(440, 80)).unwrap();
         term.draw(|f| draw_main_menu(f, f.area(), 0)).unwrap();
         let buf = term.backend().buffer();
         let mut text = String::new();
@@ -5431,16 +6102,15 @@ mod tests {
             text.push('\n');
         }
         assert!(
-            text.contains(&expand_art(&MAIN_ART, 4)[0]),
-            "4x art on 250x50"
+            text.contains(&expand_art(MAIN_ART, 4)[0]),
+            "4x tiled art on 440x80"
         );
     }
 
     /// Style is constant across window sizes: menu items stay packed
-    /// back-to-back at every art scale — resizing grows/shrinks the banner
-    /// and never re-spaces the list.
+    /// back-to-back everywhere — resizing never re-spaces the list.
     #[test]
-    fn menu_stays_packed_at_every_art_scale() {
+    fn menu_stays_packed_at_every_window_size() {
         use ratatui::backend::TestBackend;
         for (w, h) in [(100u16, 30u16), (120, 36), (200, 50), (250, 50)] {
             let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -5604,6 +6274,26 @@ mod tests {
             }),
             None
         );
+        assert_eq!(
+            wizard_step(&Screen::EditService {
+                rows: vec![],
+                selected: 0,
+                message: None,
+            }),
+            None
+        );
+        assert_eq!(
+            wizard_step(&Screen::EditServiceForm {
+                id: "x".into(),
+                fields: vec![String::new(); EDIT_FIELDS.len()],
+                sel: 0,
+                buffer: String::new(),
+                editing: false,
+                error: None,
+                message: None,
+            }),
+            None
+        );
     }
 
     /// The chain marks past steps ✓, the current one »bold, the rest dim —
@@ -5710,6 +6400,220 @@ mod tests {
         assert!(!second.contains("PUB_VERTD_URL"), "{second}");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The Edit Service list is state.json ∩ reality: every deployed id
+    /// shows up; rows with a library manifest are editable, rows deployed
+    /// some other way are marked so Enter can explain instead of failing.
+    #[test]
+    fn edit_service_rows_list_deployed_ids_with_and_without_manifest() {
+        let _guard = crate::paths::ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("dgp-editrows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        #[allow(unsafe_code)] // test-only env mutation (XDG_DATA_HOME + XDG_STATE_HOME)
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &tmp);
+            std::env::set_var("XDG_STATE_HOME", &tmp);
+        }
+
+        // A deployed service whose manifest lives in the library…
+        let mut draft = wizard::Draft {
+            id: "svc-demo".into(),
+            git: "https://github.com/example/svc-demo.git".into(),
+            commit: "c".repeat(40),
+            ..Default::default()
+        };
+        assert!(wizard::apply_profile_defaults(&mut draft, "bun"));
+        draft.port = "4173".into();
+        let mut m = wizard::build_manifest(&draft).expect("manifest builds");
+        m.service.name = "VERT demo".into();
+        let yaml = serde_yaml::to_string(&m).unwrap();
+        crate::hoster::library::save(&m, &yaml).expect("store manifest");
+
+        // …and a deployed one without any library file (external path).
+        let state_path = crate::paths::state_file();
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &state_path,
+            r#"{
+              "svc-demo": {
+                "unit_name": "svc-demo.service",
+                "project_dir": "/tmp/svc-demo",
+                "url": "https://github.com/example/svc-demo.git",
+                "urls": ["http://localhost:4173"]
+              },
+              "svc-raw": {
+                "unit_name": "svc-raw.service",
+                "project_dir": "/tmp/svc-raw",
+                "url": "http://localhost:9999",
+                "urls": []
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let rows = edit_service_rows();
+        assert_eq!(rows.len(), 2, "every deployed id is listed");
+        assert_eq!(rows[0].id, "svc-demo", "BTreeMap id order");
+        assert!(rows[0].path.is_some());
+        assert!(rows[0].valid);
+        assert_eq!(rows[0].name, "VERT demo", "row shows service.name");
+        assert_eq!(rows[0].url, "http://localhost:4173");
+        assert_eq!(rows[1].id, "svc-raw");
+        assert!(rows[1].path.is_none(), "no manifest → not editable");
+        assert!(!rows[1].valid);
+        assert_eq!(rows[1].name, "svc-raw", "falls back to the id");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The six edited rows patch exactly six manifest fields; build steps,
+    /// env, profile and prefetch survive untouched (lossless edit), and a
+    /// bad value fails the field's own check before any save happens.
+    #[test]
+    fn apply_edit_patches_the_six_rows_and_keeps_the_rest() {
+        let mut draft = wizard::Draft {
+            id: "edit-demo".into(),
+            git: "https://github.com/example/edit-demo.git".into(),
+            commit: "c".repeat(40),
+            ..Default::default()
+        };
+        assert!(wizard::apply_profile_defaults(&mut draft, "bun"));
+        draft.build_env = vec![("PUB_KEEP_ME".into(), "1".into())];
+        let mut m = wizard::build_manifest(&draft).expect("manifest builds");
+        let prefetch_before = m.prefetch.clone();
+
+        let mut fields = edit_fields_of(&m);
+        assert_eq!(fields.len(), EDIT_FIELDS.len());
+        fields[EDIT_NAME] = "Renamed".into();
+        fields[EDIT_DESC] = "panel demo".into();
+        fields[EDIT_COMMIT] = "main".into();
+        fields[EDIT_PORT] = "8080".into();
+        fields[EDIT_MEMORY] = "512M".into();
+        fields[EDIT_TASKS] = "64".into();
+        apply_edit(&mut m, &fields).expect("valid patch");
+
+        assert_eq!(m.service.name, "Renamed");
+        assert_eq!(m.service.description, "panel demo");
+        assert_eq!(m.source.commit, "main");
+        assert_eq!(m.run.port, 8080);
+        assert_eq!(m.resources.memory_max.as_deref(), Some("512M"));
+        assert_eq!(m.resources.tasks_max.as_deref(), Some("64"));
+        // Everything outside the six rows stays exactly as it was.
+        assert_eq!(m.prefetch, prefetch_before, "prefetch untouched");
+        assert_eq!(m.build.profile, "bun", "profile untouched");
+        assert!(m.build.env.contains_key("PUB_KEEP_ME"), "env untouched");
+
+        let mut reject = |value: &str, row: usize, hint: &str| {
+            let mut f = edit_fields_of(&m);
+            f[row] = value.into();
+            let err = apply_edit(&mut m, &f).expect_err(hint);
+            assert!(err.contains(hint), "{hint} not in: {err}");
+        };
+        reject("abc", EDIT_PORT, "port");
+        reject("lots", EDIT_MEMORY, "memory");
+        reject("", EDIT_MEMORY, "memory");
+        reject("", EDIT_TASKS, "task");
+
+        let mut f = edit_fields_of(&m);
+        f[EDIT_COMMIT] = "bad commit!".into();
+        assert!(
+            apply_edit(&mut m, &f).is_err(),
+            "unparseable commit rejected"
+        );
+        f[EDIT_COMMIT] = "c".repeat(40);
+        assert!(apply_edit(&mut m, &f).is_ok(), "full sha accepted");
+
+        let short = vec!["only-one".to_string()];
+        let err = apply_edit(&mut m, &short).expect_err("field count guard");
+        assert!(err.contains("internal"), "{err}");
+    }
+
+    /// save_edit goes through load → patch → validate → replace: the file
+    /// on disk gains the new fields, keeps everything else, and is left
+    /// untouched when validation fails.
+    #[test]
+    fn save_edit_replaces_the_file_and_leaves_it_on_failure() {
+        let _guard = crate::paths::ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("dgp-saveedit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        #[allow(unsafe_code)] // test-only env mutation (XDG_DATA_HOME)
+        unsafe {
+            std::env::set_var("XDG_DATA_HOME", &tmp);
+        }
+
+        let mut draft = wizard::Draft {
+            id: "save-demo".into(),
+            git: "https://github.com/example/save-demo.git".into(),
+            commit: "c".repeat(40),
+            ..Default::default()
+        };
+        assert!(wizard::apply_profile_defaults(&mut draft, "bun"));
+        draft.build_env = vec![("PUB_SAVED".into(), "kept".into())];
+        let m = wizard::build_manifest(&draft).expect("manifest builds");
+        let yaml = serde_yaml::to_string(&m).unwrap();
+        crate::hoster::library::save(&m, &yaml).expect("store manifest");
+
+        let mut fields = edit_fields_of(&m);
+        fields[EDIT_NAME] = "Saved name".into();
+        fields[EDIT_PORT] = "8080".into();
+        let path = save_edit("save-demo", &fields).expect("save succeeds");
+        assert!(path.ends_with("save-demo.yaml"), "{}", path.display());
+
+        let reloaded = crate::hoster::library::load("save-demo").expect("reload");
+        assert_eq!(reloaded.service.name, "Saved name");
+        assert_eq!(reloaded.run.port, 8080);
+        assert!(
+            reloaded.build.env.contains_key("PUB_SAVED"),
+            "lossless round-trip"
+        );
+
+        // A bad value fails BEFORE replace: the stored file stays as saved.
+        fields[EDIT_PORT] = "nope".into();
+        let err = save_edit("save-demo", &fields).expect_err("bad port");
+        assert!(err.contains("port"), "{err}");
+        let after = crate::hoster::library::load("save-demo").expect("reload");
+        assert_eq!(after.run.port, 8080, "file untouched on failure");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The Edit form hints switch with the editing toggle: navigation keys
+    /// while browsing, confirm/cancel while typing.
+    #[test]
+    fn edit_form_hints_switch_with_the_editing_toggle() {
+        let text = |s: &Screen| -> String {
+            hint_line(s)
+                .spans
+                .iter()
+                .map(|sp| sp.content.to_string())
+                .collect()
+        };
+        let form = |editing: bool| Screen::EditServiceForm {
+            id: "svc".into(),
+            fields: vec![String::new(); EDIT_FIELDS.len()],
+            sel: 0,
+            buffer: String::new(),
+            editing,
+            error: None,
+            message: None,
+        };
+        let browsing = text(&form(false));
+        assert!(browsing.contains("Enter edit row"), "{browsing}");
+        assert!(browsing.contains("s save"), "{browsing}");
+        assert!(browsing.contains("r redeploy"), "{browsing}");
+        assert!(browsing.contains("e editor"), "{browsing}");
+        let typing = text(&form(true));
+        assert!(typing.contains("Enter confirm"), "{typing}");
+        assert!(!typing.contains("r redeploy"), "{typing}");
+
+        let list = Screen::EditService {
+            rows: vec![],
+            selected: 0,
+            message: None,
+        };
+        let list_text = text(&list);
+        assert!(list_text.contains("Enter edit"), "{list_text}");
     }
 
     #[test]

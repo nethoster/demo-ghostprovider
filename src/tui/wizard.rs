@@ -11,10 +11,6 @@ use crate::hoster::manifest::{ServiceManifest, Step};
 pub const PROFILES: &[(&str, &str)] = &[
     ("bun", "JavaScript with Bun (e.g. SvelteKit / Vite apps)"),
     ("python", "Python with pip (venv, binary wheels)"),
-    (
-        "python-searxng",
-        "Python, SearXNG-style (settings patch + loopback bind)",
-    ),
     ("go", "Go (modules seeded on host, offline build)"),
 ];
 
@@ -37,6 +33,10 @@ pub struct Draft {
     /// Build-time env vars (name, value) carried into `build.env` —
     /// auto-detected from `$env/static/public` imports for SvelteKit apps.
     pub build_env: Vec<(String, String)>,
+    /// Runtime env vars (name, value) carried into `run.env` — the repo's
+    /// own declarations (Dockerfile `ENV`, documented `${VAR}` overrides
+    /// beside placeholder secrets).
+    pub run_env: Vec<(String, String)>,
     /// Remote inlang/paraglide modules pinned by content hash
     /// (url, sha256) — auto-detected so the offline build compiles real
     /// messages instead of an empty (broken) module.
@@ -80,20 +80,6 @@ pub fn defaults_for_profile(profile: &str) -> Option<ProfileDefaults> {
             run_cmd: "{venv} -m http.server {port} --bind 127.0.0.1".into(),
             port: "8000".into(),
             memory_max: "1024M".into(),
-            tasks_max: "512".into(),
-        }),
-        | "python-searxng" => Some(ProfileDefaults {
-            prefetch: vec![
-                "python3 -m pip download -r requirements.txt -d .ghost-cache/pip-wheelhouse --only-binary=:all:"
-                    .into(),
-            ],
-            build: vec![
-                "python3 -m venv --clear .venv".into(),
-                ".venv/bin/pip install --no-cache-dir -r requirements.txt".into(),
-            ],
-            run_cmd: "{venv} -m searx.webapp".into(),
-            port: "8888".into(),
-            memory_max: "1536M".into(),
             tasks_max: "512".into(),
         }),
         | "go" => Some(ProfileDefaults {
@@ -215,7 +201,7 @@ pub fn check_tasks(tasks: &str) -> Result<(), String> {
 pub fn build_manifest(draft: &Draft) -> Result<ServiceManifest, String> {
     if PROFILES.iter().all(|(id, _)| *id != draft.profile) {
         return Err(format!(
-            "unknown profile '{}' (pick one of: bun, python, python-searxng, go)",
+            "unknown profile '{}' (pick one of: bun, python, go)",
             draft.profile
         ));
     }
@@ -276,6 +262,7 @@ pub fn build_manifest(draft: &Draft) -> Result<ServiceManifest, String> {
         run: crate::hoster::manifest::RunSpec {
             command: run_argv,
             port,
+            env: draft.run_env.iter().cloned().collect(),
         },
         resources: crate::hoster::manifest::ResourcesSpec {
             memory_high: None,
@@ -294,7 +281,6 @@ pub fn build_manifest(draft: &Draft) -> Result<ServiceManifest, String> {
                 sha256: sha256.clone(),
             })
             .collect(),
-        searxng: draft.profile == "python-searxng",
         tools,
         egress: Default::default(),
     };
@@ -474,6 +460,23 @@ mod tests {
         let yaml = preview_yaml(&d).unwrap();
         assert!(yaml.contains("wz-demo"));
         ServiceManifest::load_from_str(&yaml, "preview").unwrap();
+    }
+
+    /// Detected `run.env` pairs survive draft → yaml → manifest.
+    #[test]
+    fn draft_run_env_lands_in_the_manifest() {
+        let mut d = filled("python");
+        d.run_env = vec![("SEARXNG_SECRET".into(), "{secret}".into())];
+        let yaml = preview_yaml(&d).unwrap();
+        let m = ServiceManifest::load_from_str(&yaml, "preview").unwrap();
+        assert_eq!(
+            m.run.env.get("SEARXNG_SECRET").map(String::as_str),
+            Some("{secret}")
+        );
+        // Empty run.env stays out of the yaml entirely.
+        let d = filled("python");
+        let yaml = preview_yaml(&d).unwrap();
+        assert!(!yaml.contains("run.env"), "{yaml}");
     }
 
     #[test]

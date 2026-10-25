@@ -22,6 +22,11 @@ use crate::hoster::deploy;
 pub struct DetectReady {
     pub suggested_id: String,
     pub draft: super::wizard::Draft,
+    /// Detection confidence: `true` when the run command/port came from a
+    /// declaration in the repo (Procfile, container command, console script,
+    /// app object + server dependency), `false` when it is a guess and the
+    /// wizard must review it before deploying.
+    pub confident: bool,
 }
 
 /// Where a detection result should go once it lands.
@@ -91,6 +96,7 @@ pub fn detect_url(url: &str) -> Result<DetectReady, String> {
         memory_max: d.memory_max,
         tasks_max: d.tasks_max,
         build_env: d.build_env,
+        run_env: d.run_env,
         plugins: d.plugins,
         detected: true,
         notes: d.notes,
@@ -99,6 +105,7 @@ pub fn detect_url(url: &str) -> Result<DetectReady, String> {
     Ok(DetectReady {
         suggested_id: sanitize_id(&format!("{owner}-{name}")),
         draft,
+        confident: d.confident,
     })
 }
 
@@ -621,6 +628,10 @@ pub(crate) fn wait_deploy_worker(timeout: std::time::Duration) {
 /// status lines — never routed through systemctl.
 pub(crate) struct ServiceRow {
     pub name: String,
+    /// Human name (`service.name` from the manifest, falling back to the id):
+    /// what the left column shows. `name` stays the unit id that s/t/d/r act
+    /// on.
+    pub display: String,
     pub status: String,
     pub url: String,
     pub managed: bool,
@@ -641,7 +652,12 @@ pub(crate) fn service_rows() -> Vec<ServiceRow> {
                     .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                     .unwrap_or_else(|_| "unknown".into());
                 let url = entry.urls.first().cloned().unwrap_or_default();
-                (name, active, url)
+                let display = crate::hoster::library::load(&name)
+                    .ok()
+                    .map(|m| m.service.name.trim().to_string())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| name.clone());
+                (name, active, url, display)
             })
             .collect(),
         crate::hoster::tailscale::probe(),
@@ -652,14 +668,15 @@ pub(crate) fn service_rows() -> Vec<ServiceRow> {
 /// a pre-probed [`crate::hoster::tailscale::TailscaleState`]. Split out so
 /// the mapping is testable without touching the live daemon.
 pub(crate) fn build_rows(
-    units: Vec<(String, String, String)>,
+    units: Vec<(String, String, String, String)>,
     tailscale: crate::hoster::tailscale::TailscaleState,
 ) -> Vec<ServiceRow> {
     use crate::hoster::tailscale::TailscaleState as Ts;
     let mut rows: Vec<ServiceRow> = units
         .into_iter()
-        .map(|(name, status, url)| ServiceRow {
+        .map(|(name, status, url, display)| ServiceRow {
             name,
+            display,
             status,
             url,
             managed: true,
@@ -675,6 +692,7 @@ pub(crate) fn build_rows(
     };
     rows.push(ServiceRow {
         name: "tailscale".into(),
+        display: "tailscale".into(),
         status,
         url,
         managed: false,
@@ -878,11 +896,12 @@ mod tests {
         assert!(classify_deploy_input("/tmp/does-not-exist-xyz.yaml").is_err());
     }
 
-    fn unit_row(name: &str) -> (String, String, String) {
+    fn unit_row(name: &str) -> (String, String, String, String) {
         (
             name.to_string(),
             "active".to_string(),
             format!("http://localhost:1/{name}"),
+            name.to_string(),
         )
     }
 
@@ -896,8 +915,10 @@ mod tests {
         );
         assert_eq!(rows.len(), 2);
         assert!(rows[0].managed);
+        assert_eq!(rows[0].display, "demo-searxng");
         let ts = &rows[1];
         assert_eq!(ts.name, "tailscale");
+        assert_eq!(ts.display, "tailscale");
         assert_eq!(ts.status, "running");
         assert_eq!(ts.url, "https://devbox.tailnet-abc.ts.net");
         assert!(!ts.managed);
