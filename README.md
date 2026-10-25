@@ -138,8 +138,10 @@ library (`~/.local/share/demo-ghostprovider/manifests/`) for one-key redeploys,
 or walks you through writing one with the built-in 9-step wizard (first row);
 the third row detects the stack of a GitHub URL and prefills the wizard.
 Menu item 5 (My Services) lists your added services with deploy status;
-item 6 (Egress) shows each service's runtime network allowlist with live
-verification; item 2 (Self-Hosting) manages the actually deployed units.
+item 6 (Edit Service) edits a deployed service's manifest in place — name,
+description, commit, port, limits; item 7 (Egress) shows each service's
+runtime network allowlist with live verification; item 2 (Self-Hosting)
+manages the actually deployed units.
 
 ## Install
 

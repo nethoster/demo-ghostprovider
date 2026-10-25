@@ -19,7 +19,7 @@ source:
 prefetch:                   # host phase (network allowed): downloaders only
   - ["bun", "install", "--frozen-lockfile", "--ignore-scripts"]
 build:
-  profile: bun              # bun | python | python-searxng | go | node
+  profile: bun              # bun | python | go | node
   steps:
     - ["bun", "run", "build"]
   # env:                    # optional: build-time env for every sandboxed
@@ -62,9 +62,16 @@ tools: ["bun"]
 * `pre_build`/`build.steps` (sandbox, network off) pass the same heuristic
   screen as before; the sandbox is the real boundary.
 * `run.command` is argv with `{bin}/{venv}/{self}/{project}/{port}`
-  placeholders. It must reference `{port}` (except `searxng: true`, where the
-  port is injected via `settings.yml`) and bind loopback (`__serve-static`
+  placeholders. It must reference `{port}` and bind loopback (`__serve-static`
   or `127.0.0.1`).
+* `run.env` (optional) is a map of runtime env vars, written to the unit's
+  per-service 0600 EnvironmentFile. Keys are `[A-Za-z_][A-Za-z0-9_]`
+  (≤64 vars); values ≤4096 chars, no NUL/newlines, and may hold two
+  placeholders: `{port}` (the deploy's chosen port) and `{secret}` (fresh
+  16-byte hex per deploy — one value shared by all entries, never stored in
+  the manifest). Unknown `{tokens}` fail validation. Typical use: an app
+  config that documents an env override for a committed placeholder secret
+  (see `examples/searxng.yaml` — `SEARXNG_SECRET: "{secret}"`).
 * `resources.memory_max` + `resources.tasks_max` are required.
 * `egress.allow` (optional, top level) is the per-service runtime egress
   allowlist: at most 8 bare hostnames or IPv4 addresses, normalized
@@ -147,9 +154,34 @@ ready service deploys it through the usual Confirm gate; Enter on a deployed
 one jumps to Self-Hosting with the cursor on its unit. Importing, creating
 and deleting stay in Add Service.
 
-## Egress (menu item 6)
+## Edit Service (menu item 6)
 
-Menu item 6 is the runtime egress matrix: one row per library service with
+Menu item 6 lists the deployed services (state.json) with their stored
+manifests and edits them in place — six rows: `name`, `description`,
+`commit` (full SHA or branch), `port`, `memory` and `tasks`. Everything
+else in the manifest (build steps, build env, prefetch, egress, plugins)
+passes through untouched.
+
+* Enter opens the form; Enter on a row starts inline editing seeded with
+  the current value, Enter again commits the row through its own field
+  check (port / memory / tasks / commit must parse before they are
+  accepted),
+* `s` saves the whole manifest through full schema validation —
+  `saved — applies on next deploy`,
+* `r` saves and immediately redeploys the service; an outdated build
+  re-execs the panel onto the fresh binary first and resumes the deploy
+  there,
+* `e` opens the raw `service.yaml` in `$EDITOR` for anything beyond the
+  six rows (the form reloads from the file when the editor returns),
+* `Esc` walks back: cancel a row edit, then return to the list,
+* `r` on the list refreshes it from state.json.
+
+A deployed service without a library manifest (deployed from an external
+path) is listed as `no manifest` — import it through Add Service first.
+
+## Egress (menu item 7)
+
+Menu item 7 is the runtime egress matrix: one row per library service with
 its policy (`deny-all (loopback only)` or `allow: …`), the `IPAccounting`
 byte counters of the deployed unit (`↑ … ↓ …`) and, after a check, the last
 verdict under the row (`BLOCKED` = the filter held, `OPEN` = the host was
@@ -176,8 +208,11 @@ report `open` through any network path the unit actually has, so treat
 
 ## Examples
 
-`docs/examples/{vert,searxng,memos}.yaml` are the three former hardcoded
-recipes expressed as manifests 1:1 — reference files, validated by the test
-suite, never embedded into the binary. Nothing deploys from a URL by itself
-anymore: paste a GitHub URL (panel Deploy input or `__deploy URL`) and the
-stack is detected into a `service.yaml` you review before deploying.
+`docs/examples/{vert,searxng,memos}.yaml` are three real-world repos
+expressed as manifests — reference files, validated by the test suite, never
+embedded into the binary. The searxng one is fully generic: a Python app
+whose run command is a plain `granian` argv (the same shape detection
+derives from the repo's own entrypoint declaration). Nothing deploys from a
+URL by itself anymore: paste a GitHub URL (panel Deploy input or
+`__deploy URL`) and the stack is detected into a `service.yaml` you review
+before deploying.
