@@ -378,9 +378,9 @@ impl ServiceManifest {
             anyhow::bail!("{}", at("service.id must not start/end with '-'"));
         }
         // Legacy ids `demo-vert`/`demo-searxng`/`demo-memos` stay valid on
-        // purpose: they name already-deployed units and the shipped examples
-        // (docs/examples/) — a redeploy of those must keep working. There is
-        // no curated catalog left to squat.
+        // purpose: they name already-deployed units and the test fixtures
+        // (`crate::hoster::fixtures`) — a redeploy of those must keep
+        // working. There is no curated catalog left to squat.
         // systemd unit safety (mirrors units::validate_unit_name, dots allowed
         // but leading dot forbidden).
         if self.service.id.starts_with('.') {
@@ -826,11 +826,12 @@ pub fn expand_manifest_path(input: &str) -> std::path::PathBuf {
     }
 }
 
-// ── built-in manifests were removed in v0.0.44 (demo-declutter): reference
-// examples live as plain files in `docs/examples/*.yaml` — validated by the
-// tests below, never embedded into the binary. Every deploy goes through a
-// user-provided `service.yaml`; a GitHub URL is input for stack detection
-// (Add Service → Detect / `__deploy URL`), never a deployable on its own.
+// ── built-in manifests were removed in v0.0.44 (demo-declutter): the former
+// reference examples now live as cfg(test) string fixtures
+// (`crate::hoster::fixtures`) — validated by the tests below, never embedded
+// into the binary. Every deploy goes through a user-provided `service.yaml`;
+// a GitHub URL is input for stack detection (Add Service → Detect /
+// `__deploy URL`), never a deployable on its own.
 
 /// Convert a validated manifest into the engine's recipe shape.
 ///
@@ -941,20 +942,18 @@ pub fn to_leaked_recipe(m: &ServiceManifest) -> super::recipes::DemoRecipe {
 mod tests {
     use super::*;
 
-    /// Reference example (docs/examples/<name>.yaml) loaded from disk —
-    /// examples are validated in tests, never embedded into the binary.
+    /// Fixture dispatch — formerly `docs/examples/<name>.yaml`, now inline
+    /// test data (see `super::super::fixtures`), never embedded into the
+    /// binary.
     fn example(id: &str) -> ServiceManifest {
-        let file = match id {
-            "demo-vert" => "vert.yaml",
-            "demo-searxng" => "searxng.yaml",
-            "demo-memos" => "memos.yaml",
-            other => panic!("unknown example {other}"),
+        let yaml = match id {
+            "demo-vert" => super::super::fixtures::VERT_YAML,
+            "demo-searxng" => super::super::fixtures::SEARXNG_YAML,
+            "demo-memos" => super::super::fixtures::MEMOS_YAML,
+            other => panic!("unknown fixture {other}"),
         };
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("docs/examples")
-            .join(file);
-        ServiceManifest::load_from_file(&path)
-            .unwrap_or_else(|e| panic!("{id} example must validate: {e}"))
+        ServiceManifest::load_from_str(yaml, id)
+            .unwrap_or_else(|e| panic!("{id} fixture must validate: {e}"))
     }
 
     fn example_ids() -> [&'static str; 3] {
@@ -1023,7 +1022,7 @@ mod tests {
             let m = example(id);
             let r = to_leaked_recipe(&m);
             for step in r.prefetch_steps {
-                // `touch` marker tails carry no interpreter (see searxng.yaml).
+                // `touch` marker tails carry no interpreter (searxng fixture).
                 if step.starts_with("touch ") {
                     continue;
                 }

@@ -883,8 +883,13 @@ mod tests {
         }
         // Not a manifest path and not a GitHub URL → rejected at the input.
         assert!(classify_deploy_input("just some text").is_err());
-        let example = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/examples/vert.yaml");
-        match classify_deploy_input(example).unwrap() {
+        // An existing, valid manifest path → Manifest target (fixture on
+        // disk, since classify only takes paths).
+        let vert =
+            std::env::temp_dir().join(format!("gp-classify-{}-vert.yaml", std::process::id()));
+        std::fs::write(&vert, crate::hoster::fixtures::VERT_YAML).unwrap();
+        let vert_path = vert.to_string_lossy().into_owned();
+        match classify_deploy_input(&vert_path).unwrap() {
             DeployTarget::Manifest {
                 service_id, plan, ..
             } => {
@@ -893,6 +898,7 @@ mod tests {
             }
             other => panic!("expected Manifest, got {other:?}"),
         }
+        let _ = std::fs::remove_file(&vert);
         assert!(classify_deploy_input("/tmp/does-not-exist-xyz.yaml").is_err());
     }
 

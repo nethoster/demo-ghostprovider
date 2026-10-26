@@ -1,6 +1,6 @@
 //! Deploy sequence for service manifests (user `service.yaml` files — the
-//! built-in URL catalog was removed in v0.0.44; examples live in
-//! `docs/examples/`).
+//! built-in URL catalog and the shipped reference examples were removed in
+//! v0.0.44).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -2057,10 +2057,11 @@ mod tests {
     /// filter so the sandbox verdict below it reads in context.
     #[test]
     fn source_line_names_subject_and_passes_filter() {
-        let m = crate::hoster::manifest::ServiceManifest::load_from_file(
-            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/examples/memos.yaml"),
+        let m = crate::hoster::manifest::ServiceManifest::load_from_str(
+            crate::hoster::fixtures::MEMOS_YAML,
+            "demo-memos",
         )
-        .expect("memos example must validate");
+        .expect("memos fixture must validate");
         let line = source_line(&m);
         assert!(
             line.starts_with("source: usememos/memos @ "),
@@ -2675,10 +2676,11 @@ ghost-build-1a2b.service                 loaded active running   (dup row)
     /// from the step heads, still valid.
     #[test]
     fn apply_repair_rewrites_plan_and_derives_tools() {
-        let path =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/examples/memos.yaml");
-        let mut m = super::super::manifest::ServiceManifest::load_from_file(&path)
-            .unwrap_or_else(|e| panic!("example must load: {e}"));
+        let mut m = super::super::manifest::ServiceManifest::load_from_str(
+            super::super::fixtures::MEMOS_YAML,
+            "demo-memos",
+        )
+        .unwrap_or_else(|e| panic!("fixture must load: {e}"));
         // Simulate the hand-written, frontend-blind manifest.
         m.prefetch = vec![];
         m.build.steps = vec![super::super::manifest::Step::Shell(
@@ -2706,9 +2708,11 @@ ghost-build-1a2b.service                 loaded active running   (dup row)
     #[test]
     fn persist_repair_writes_both_copies() {
         let (tmp, _env) = isolated_env("repairpatch");
-        let example =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/examples/memos.yaml");
-        let mut m = super::super::manifest::ServiceManifest::load_from_file(&example).unwrap();
+        let mut m = super::super::manifest::ServiceManifest::load_from_str(
+            super::super::fixtures::MEMOS_YAML,
+            "demo-memos",
+        )
+        .unwrap();
         let patch_path = tmp.join("manifests/usememos-memos.yaml");
         std::fs::create_dir_all(patch_path.parent().unwrap()).unwrap();
         std::fs::write(&patch_path, "placeholder").unwrap();

@@ -28,3 +28,6 @@ pub mod toolbox;
 pub mod toolcheck;
 pub mod units;
 pub mod validate;
+
+#[cfg(test)]
+pub mod fixtures;
