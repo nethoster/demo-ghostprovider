@@ -81,17 +81,6 @@ cleanly:
 - **Panel never launched again** — the shipped `demo-ghostprovider-cleanup`
   timer sweeps leftovers in the background.
 
-The sweep is race-free: a deploy holds an exclusive `flock` (`deploy.lock`)
-from the moment its journal entry is written until it is cleared. The kernel
-releases the lock on any exit — including `SIGKILL` and power loss — so the
-timer only removes deploys whose process is provably dead. A deploy that
-*finished* is never touched: its service is registered and auto-starts on
-login; removing it is always an explicit act.
-
-A scripted deploy (`demo-ghostprovider __deploy --manifest service.yaml`) gets
-the same treatment: the first `SIGINT`/`SIGTERM`/`SIGHUP` triggers the removal
-path and exits `130`.
-
 ## Security Model
 
 - **All data stays local** — every request goes through an HTTPS client locked
