@@ -23,7 +23,6 @@ Private, local, no third parties.
 
 The service.yaml format is documented in [docs/MANIFEST.md](docs/MANIFEST.md).
 
-![Experience with GhostProvider](assets/user-experience.webp)
 
 
 ## The panel
