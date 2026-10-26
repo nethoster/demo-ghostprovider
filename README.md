@@ -16,10 +16,6 @@ In short: forking for yourself is fine; opening a pull request or making money w
 
 ![GHOST PROVIDER Panel](assets/GHOSTPROVIDER%20PANEL.JPEG)
 
-GhostProvider is a terminal panel for Linux. It takes a GitHub URL or a
-`service.yaml`, builds the project in a sandbox and runs it as a systemd
-**user** service on your machine. No root, no cloud, no third parties.
-
 ## One-Click Deploy
 
 Paste a GitHub URL or a path to `service.yaml` — deploy it as a systemd service.
