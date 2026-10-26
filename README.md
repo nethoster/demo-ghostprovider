@@ -145,34 +145,6 @@ elsewhere.
   loopback-only tunnel is active.
 - **Logs screen** — three tabs: **Deploy**, **Software** and **Crash**.
 
-## Service support
-
-Every service deploys from a `service.yaml` manifest — format documented in
-`docs/MANIFEST.md`.
-
-Nothing deploys from a URL by itself: paste a GitHub URL anywhere (panel
-Deploy input, `demo-ghostprovider __deploy URL`) and the stack is detected
-into a `service.yaml` you review before deploying — pressing **Enter** on a
-detected URL runs the autopilot (detect → store manifest → deploy). Same
-format for every service:
-
-```bash
-demo-ghostprovider __check-manifest service.yaml    # validate and print the plan
-demo-ghostprovider __deploy --manifest service.yaml # deploy it
-```
-
-Both go through the identical sandbox + loopback + cleanup pipeline.
-
-In the panel, menu item 4 (Add Service) imports `service.yaml` files into your
-library (`~/.local/share/demo-ghostprovider/manifests/`) for one-key redeploys,
-or walks you through writing one with the built-in 9-step wizard (first row);
-the third row detects the stack of a GitHub URL and prefills the wizard.
-Menu item 5 (My Services) lists your added services with deploy status;
-item 6 (Edit Service) edits a deployed service's manifest in place — name,
-description, commit, port, limits; item 7 (Egress) shows each service's
-runtime network allowlist with live verification; item 2 (Self-Hosting)
-manages the actually deployed units.
-
 ## Install
 
 One command:
