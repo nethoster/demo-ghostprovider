@@ -142,8 +142,6 @@ Before deploying, GhostProvider checks what is already on your machine:
 - **Prerequisites** — python3, cargo, git, systemd.
 - **Listening ports** — which ports are taken and by which process.
 - **Known services** — is VERT, SearXNG or Memos already running?
-- **Tailscale** — the `tailscale` binary is present (presence only; the tunnel
-  state is shown in the Self-Hosting panel).
 
 That avoids port conflicts and helps pick the right deploy strategy. The scan
 stays useless to anyone but you: no VPN login state, no service fingerprinting;
@@ -162,17 +160,11 @@ elsewhere.
   including an explicit `deny-all: REAL (private netns)` row while the
   loopback-only tunnel is active.
 - **Logs screen** — three tabs: **Deploy**, **Software** and **Crash**.
-- **Tailscale** — a read-only status row (`running` / `stopped` /
-  `needs login`) whenever the daemon is up; the panel never touches the tunnel.
 
 ## Service support
 
-This demo ships three reference `service.yaml` manifests in `docs/examples/`
-(format: `docs/MANIFEST.md`):
-
-- **VERT** - https://github.com/VERT-sh/VERT
-- **SearXNG** - https://github.com/searxng/searxng
-- **Memos** - https://github.com/usememos/memos
+Every service deploys from a `service.yaml` manifest — format documented in
+`docs/MANIFEST.md`.
 
 Nothing deploys from a URL by itself: paste a GitHub URL anywhere (panel
 Deploy input, `demo-ghostprovider __deploy URL`) and the stack is detected

@@ -27,7 +27,6 @@ build:
   #   # ...                # without which $env/static/public imports fail).
   #   # Keys: [A-Za-z_][A-Za-z0-9_], ≤64 vars, values ≤4096 chars, no
   #   # NUL/newlines. Runtime units never see these; PATH always wins.
-  #   # (The built-in vert.yaml sets the eight PUB_* VERT imports here.)
 run:
   command: ["{self}", "__serve-static", "{project}/build", "{port}"]
   port: 0                   # 0 = random free port, else 1024..65535
@@ -70,8 +69,8 @@ tools: ["bun"]
   placeholders: `{port}` (the deploy's chosen port) and `{secret}` (fresh
   16-byte hex per deploy — one value shared by all entries, never stored in
   the manifest). Unknown `{tokens}` fail validation. Typical use: an app
-  config that documents an env override for a committed placeholder secret
-  (see `examples/searxng.yaml` — `SEARXNG_SECRET: "{secret}"`).
+   config that documents an env override for a committed placeholder secret
+   (e.g. `SEARXNG_SECRET: "{secret}"` in the app's config file).
 * `resources.memory_max` + `resources.tasks_max` are required.
 * `egress.allow` (optional, top level) is the per-service runtime egress
   allowlist: at most 8 bare hostnames or IPv4 addresses, normalized
@@ -208,11 +207,8 @@ report `open` through any network path the unit actually has, so treat
 
 ## Examples
 
-`docs/examples/{vert,searxng,memos}.yaml` are three real-world repos
-expressed as manifests — reference files, validated by the test suite, never
-embedded into the binary. The searxng one is fully generic: a Python app
-whose run command is a plain `granian` argv (the same shape detection
-derives from the repo's own entrypoint declaration). Nothing deploys from a
-URL by itself anymore: paste a GitHub URL (panel Deploy input or
+There are no shipped reference files: every service deploys from a
+`service.yaml` you own, and the format is validated by the test suite,
+never embedded into the binary. Paste a GitHub URL (panel Deploy input or
 `__deploy URL`) and the stack is detected into a `service.yaml` you review
-before deploying.
+before deploying, or write one by hand with the in-panel 9-step wizard.
