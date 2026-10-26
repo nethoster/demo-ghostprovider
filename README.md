@@ -25,7 +25,7 @@ The service.yaml format is documented in [docs/MANIFEST.md](docs/MANIFEST.md).
 
 ![Experience with GhostProvider](assets/user-experience.webp)
 
-[Watch the full experience as video (user-experience.mp4)](assets/user-experience.mp4)
+[Watch the full experience as video (user-experience.mp4)](assets/user-experience-new.mp4)
 
 ## The panel
 
