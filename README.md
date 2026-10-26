@@ -126,7 +126,6 @@ Before deploying, GhostProvider checks what is already on your machine:
 
 - **Prerequisites** — python3, cargo, git, systemd.
 - **Listening ports** — which ports are taken and by which process.
-- **Known services** — is VERT, SearXNG or Memos already running?
 
 That avoids port conflicts and helps pick the right deploy strategy. The scan
 stays useless to anyone but you: no VPN login state, no service fingerprinting;
