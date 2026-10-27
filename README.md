@@ -23,6 +23,8 @@ Private, local, no third parties.
 
 The service.yaml format is documented in [docs/MANIFEST.md](docs/MANIFEST.md).
 
+[Watch the full experience as video (user-experience.mp4)](assets/user-experience.mp4)
+
 
 
 ## The panel
