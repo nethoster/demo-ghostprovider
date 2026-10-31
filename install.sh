@@ -60,6 +60,7 @@ HOST="github"
 ACTION="install"
 ALLOW_UNSIGNED=0
 ALLOW_CHECKSUM_ONLY=0
+INSTALL_CLOUDFLARED="${GHOST_INSTALL_CLOUDFLARED:-0}"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -69,6 +70,7 @@ while [ $# -gt 0 ]; do
         --mirror) HOST="codeberg" ;;   # also auto-fallback per file
         --allow-unsigned) ALLOW_UNSIGNED=1 ;;
         --allow-checksum-only) ALLOW_CHECKSUM_ONLY=1 ;;
+        --install-cloudflared) INSTALL_CLOUDFLARED=1 ;;
         *) printf 'unknown arg: %s\n' "$1" >&2; exit 2 ;;
     esac
     shift
@@ -80,6 +82,21 @@ warn() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
 die()  { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null || die "missing dependency: $1"; }
+
+# Read a yes/no answer from stdin. In a non-TTY pipe default is used silently,
+# so `curl ... | sh` stays unattended. CTRL-C aborts safely.
+prompt_yn() {
+    label="$1"
+    default="${2:-n}"
+    case "$default" in [Yy]*) default_y=1 ;; *) default_y=0 ;; esac
+    if [ ! -t 0 ]; then
+        if [ "$default_y" -eq 1 ]; then return 0; else return 1; fi
+    fi
+    printf '%s ' "$label" >&2
+    a=""
+    if ! read -r a </dev/tty; then return 1; fi
+    case "$a" in [Yy]*) return 0 ;; [Nn]*|'') [ "$default_y" -eq 1 ] ;; *) return 1 ;; esac
+}
 
 # Version of an already-installed binary, or empty when absent/unparsable.
 # Normalized to a `v`-prefixed tag (the binary may print `0.0.19` or `v0.0.19`).
@@ -98,6 +115,10 @@ old_version() {
 # is (now) available, 1 otherwise (the install still proceeds).
 ensure_git() {
     command -v git >/dev/null 2>&1 && return 0
+    if ! prompt_yn "git is required to deploy services. Install it now? [Y/n]" y; then
+        warn "git left uninstalled — deploy actions unavailable until git is installed manually"
+        return 1
+    fi
     if [ "$(id -u)" = "0" ]; then
         run_rooted() { "$@"; }
     elif command -v sudo >/dev/null 2>&1; then
@@ -119,6 +140,36 @@ ensure_git() {
         return 1
     fi
     command -v git >/dev/null 2>&1
+}
+
+ensure_cloudflared_if_requested() {
+    command -v cloudflared >/dev/null 2>&1 && return 0
+    if [ "${INSTALL_CLOUDFLARED:-0}" != "1" ] && ! prompt_yn "Install cloudflared for optional Quick Tunnel sharing? [y/N]" n; then
+        warn "cloudflared not installed — Quick Tunnel sharing stays disabled"
+        return 0
+    fi
+    if [ "$(id -u)" = "0" ]; then
+        run_rooted() { "$@"; }
+    elif command -v sudo >/dev/null 2>&1; then
+        run_rooted() { sudo "$@"; }
+    else
+        warn "cloudflared not found and no sudo/root — Quick Tunnel sharing remains disabled"
+        return 0
+    fi
+    warn "cloudflared not found — installing via your package manager..."
+    if command -v pacman >/dev/null 2>&1; then
+        run_rooted pacman -S --noconfirm cloudflared || return 0
+    elif command -v apt-get >/dev/null 2>&1; then
+        run_rooted apt-get update || true
+        run_rooted apt-get install -y cloudflared || return 0
+    elif command -v dnf >/dev/null 2>&1; then
+        run_rooted dnf install -y cloudflared || return 0
+    else
+        warn "no supported package manager — install cloudflared manually if you want tunnel sharing"
+        return 0
+    fi
+    command -v cloudflared >/dev/null 2>&1 || warn "cloudflared install failed; Quick Tunnel sharing stays disabled"
+    return 0
 }
 
 # Fetch the pinned static minisign verifier into $TMP. Returns 0 on success;
@@ -204,12 +255,13 @@ if [ "$ACTION" = "uninstall" ]; then
         systemctl --user reset-failed 2>/dev/null || true
     fi
 
+    if command -v demo-ghostprovider >/dev/null 2>&1; then demo-ghostprovider __networks-stop-all >/dev/null 2>&1 || true; fi
     for f in "$BIN_DIR/$BIN_NAME"; do
         if [ -e "$f" ]; then rm -f "$f" && ok "removed $f"; fi
     done
 
     if [ -d "$state_dir" ]; then
-        rm -rf "$state_dir" && ok "removed $state_dir (registry, net log, secrets)"
+    rm -rf "$state_dir" && ok "removed $state_dir (registry, net log, secrets)"
     fi
 
     if [ -d "$install_dir" ]; then
@@ -224,12 +276,16 @@ if [ "$ACTION" = "uninstall" ]; then
     exit 0
 fi
 
+printf '\033[38;5;214m┌──────────────────────────────────────────────┐\033[0m\n'
+printf '\033[38;5;214m│    GHOST PROVIDER — installer (Linux/x86_64)    │\033[0m\n'
+printf '\033[38;5;214m└──────────────────────────────────────────────┘\033[0m\n'
 for dep in curl sha256sum uname tar grep; do need "$dep"; done
 
 [ "$(uname -s)" = "Linux" ] || die "prebuilt binaries are Linux-only; build from source instead"
 [ "$(uname -m)" = "x86_64" ] || die "prebuilt binaries are x86_64-only; build from source instead"
 
 ensure_git || warn "continuing without git; you can install it later"
+ensure_cloudflared_if_requested || true
 
 # A release tag is `v<major>.<minor>.<patch>` — anything else (a sed
 # extraction mistake, a malicious redirect) must abort, not download.
