@@ -3894,12 +3894,12 @@ fn colorize_scan(report: &str) -> Vec<Line<'static>> {
                 ));
             }
             out.push(Line::from(spans));
-        } else if trimmed.starts_with("[x]") || trimmed.starts_with("[ ]") {
-            let ok = trimmed.starts_with("[x]");
+        } else if trimmed.starts_with("✓") || trimmed.starts_with("✗") {
+            let ok = trimmed.starts_with("✓");
             let (mark, mark_color, rest_color) = if ok {
-                ("+", OK_GREEN, BODY)
+                ("✓", OK_GREEN, BODY)
             } else {
-                ("x", ERR_RED, DIM)
+                ("✗", ERR_RED, DIM)
             };
             out.push(Line::from(vec![
                 Span::raw(" "),

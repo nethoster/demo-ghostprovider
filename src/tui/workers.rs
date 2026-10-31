@@ -192,15 +192,17 @@ pub(crate) fn spawn_scan(tx: Sender<Msg>, seq: u64) {
             "  scanned at {}\n",
             crate::netlog::format_utc(started)
         ));
-        let mark = |ok: bool| if ok { "[x]" } else { "[ ]" };
+        let mark = |ok: bool| if ok { "✓" } else { "✗" };
         out.push_str(&format!(
-            "{} systemd          {}\n{} systemd-nspawn   {}\n{} git              {}\n{} python3 / node   {} / {}\n{} network          {}\n{} tailscale         {}\n",
+            "{} systemd          {}\n{} systemd-nspawn   {}\n{} git              {}\n{} cloudflared      {}\n{} python3 / node   {} / {}\n{} network          {}\n{} tailscale         {}\n",
             mark(result.systemd),
             yesno(result.systemd, "found", "MISSING"),
             mark(result.systemd_nspawn),
             yesno(result.systemd_nspawn, "available", "not installed"),
             mark(result.git),
             yesno(result.git, "found", "MISSING"),
+            mark(result.cloudflared),
+            yesno(result.cloudflared, "found", "MISSING"),
             mark(result.python3 && result.node),
             found("python3"),
             found("node"),

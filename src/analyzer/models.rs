@@ -37,6 +37,7 @@ pub struct AnalysisResult {
     /// Boolean presence of the `tailscale` binary only — no login state, no
     /// status: the scan report must stay useless to attackers.
     pub tailscale: bool,
+    pub cloudflared: bool,
     pub interfaces: Vec<InterfaceInfo>,
     pub listening_ports: Vec<ListeningPort>,
     pub gateway: String,

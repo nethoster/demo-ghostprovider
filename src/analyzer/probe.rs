@@ -148,6 +148,7 @@ pub fn run_analysis() -> AnalysisResult {
         // Presence only — the scan never reports login state or peers; that
         // detail lives in the local Self-Hosting screen (hoster::tailscale).
         tailscale: which("tailscale"),
+        cloudflared: which("cloudflared"),
         interfaces,
         listening_ports: ports,
         gateway: get_gateway(),
