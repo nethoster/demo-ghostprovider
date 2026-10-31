@@ -4922,7 +4922,7 @@ fn draw_networks(
                             Modifier::empty()
                         }),
                 ),
-                Span::styled(format!("  ● {}", url), Style::default().fg(status_color)),
+                Span::styled(format!("  ● {url}"), Style::default().fg(status_color)),
                 Span::styled(format!("  ({})", row.local_url), Style::default().fg(DIM)),
             ]))
         })
