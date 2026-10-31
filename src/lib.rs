@@ -19,6 +19,7 @@ pub mod flags;
 pub mod hoster;
 pub mod netlog;
 pub mod netstatus;
+pub mod networks;
 pub mod output;
 pub mod paths;
 pub mod selftest;

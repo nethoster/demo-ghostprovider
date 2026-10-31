@@ -102,7 +102,12 @@ fn main() -> anyhow::Result<()> {
         // SIGKILL, shutdown/reboot) — but only while the deploy lock is free,
         // i.e. no deploy is genuinely live in this user session.
         Some("__cleanup") => {
+            demo_ghostprovider::networks::supervisor::stop_all();
             demo_ghostprovider::hoster::deploy::cleanup_cmd()?;
+        }
+        Some("__networks-stop-all") => {
+            demo_ghostprovider::networks::supervisor::stop_all();
+            return Ok(());
         }
         Some("__check-manifest") => {
             let path = args.get(1).context("usage: __check-manifest PATH")?;
@@ -119,6 +124,10 @@ fn main() -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             }
+        }
+        Some("__cloudflared-supervisor") => {
+            demo_ghostprovider::networks::supervisor::run_cli(&args[1..])?;
+            return Ok(());
         }
         Some("__recipe-edit") => {
             let id = args.get(1).context("usage: __recipe-edit SERVICE_ID")?;

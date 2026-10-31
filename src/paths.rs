@@ -77,6 +77,43 @@ pub fn deploy_lock_file() -> PathBuf {
     state_home().join("demo-ghostprovider/deploy.lock")
 }
 
+/// Runtime-only public sharing state (Cloudflare Quick Tunnel). No service
+/// configuration or secret is stored here; records disappear when sharing
+/// stops.
+pub fn networks_dir() -> PathBuf {
+    state_home().join("demo-ghostprovider/networks")
+}
+
+/// One JSON record per currently-or-recently shared service.
+pub fn networks_file() -> PathBuf {
+    state_home().join("demo-ghostprovider/networks.json")
+}
+
+/// Private per-share directory: supervisor/child pids, events, cloudflared log
+/// and the isolated HOME/TMPDIR handed to cloudflared.
+pub fn network_dir(service: &str) -> PathBuf {
+    networks_dir().join(safe_component(service))
+}
+
+/// Keep a service id from escaping `networks_dir` or colliding with path
+/// separators. Manifest ids already pass a stricter check; this is defence in
+/// depth for registry data edited by hand.
+pub fn safe_component(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "service".into()
+    } else {
+        out
+    }
+}
+
 /// systemd user unit directory.
 pub fn user_unit_dir() -> PathBuf {
     let cfg = std::env::var_os("XDG_CONFIG_HOME")

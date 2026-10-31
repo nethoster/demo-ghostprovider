@@ -61,6 +61,12 @@ pub(crate) const MAIN_MENU: &[(&str, &str, &str, Color)] = &[
         "probe interfaces and occupied ports",
         ACCENT,
     ),
+    (
+        "⊗",
+        "Networks",
+        "publish one service at a temporary https URL",
+        MAGENTA,
+    ),
     ("#", "Self-Hosting", "manage deployed units", OK_GREEN),
     (
         "^",
@@ -421,6 +427,12 @@ pub(crate) enum Screen {
         buffer: String,
         editing: bool,
         error: Option<String>,
+        message: Option<String>,
+    },
+    /// Public sharing via Cloudflare Quick Tunnel (`Networks` menu).
+    Networks {
+        rows: Vec<crate::networks::supervisor::NetworkRow>,
+        selected: usize,
         message: Option<String>,
     },
 }
@@ -886,6 +898,16 @@ fn event_loop(
             }
         }
 
+        if app.tick.is_multiple_of(12)
+            && let Screen::Networks { rows, selected, .. } = &mut app.screen
+        {
+            let fresh = crate::networks::supervisor::rows();
+            if *selected >= fresh.len() && !fresh.is_empty() {
+                *selected = fresh.len().saturating_sub(1);
+            }
+            *rows = fresh;
+        }
+
         // Self-heal: any stray glyph left by terminal desync (resize races,
         // tmux quirks, font-width lies) must not outlive ~2s — force a full
         // repaint periodically instead of trusting cell-diff forever.
@@ -1058,6 +1080,7 @@ fn command_char(key: KeyCode) -> Option<char> {
 /// deferred to the next launch. Safe to call when no deploy is running —
 /// `reconcile_stale_locked` is a no-op then.
 fn exit_with_reconcile(app: &mut App) -> anyhow::Result<()> {
+    crate::networks::supervisor::stop_all();
     // Reconcile may run systemctl commands for seconds — tell the stall
     // watchdog this block is legitimate (see `WATCHDOG_PAUSE`).
     WATCHDOG_PAUSE.store(true, Ordering::Relaxed);
@@ -1215,7 +1238,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 return Flow::Continue;
             }
             match key {
-                KeyCode::Esc => app.screen = Screen::Main { selected: 2 },
+                KeyCode::Esc => app.screen = Screen::Main { selected: 3 },
                 KeyCode::Backspace => {
                     buffer.pop();
                 }
@@ -1344,7 +1367,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
         Screen::Deploy { .. } => {
             let finished = matches!(app.screen, Screen::Deploy { done: Some(_), .. });
             if finished && (matches!(key, KeyCode::Enter | KeyCode::Esc) || cmd == Some('q')) {
-                app.screen = Screen::Main { selected: 2 };
+                app.screen = Screen::Main { selected: 3 };
             }
         }
         Screen::Services {
@@ -1355,11 +1378,11 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             let _ = message; // status messages surface via the actions below
             let count = rows.len();
             match key {
-                KeyCode::Esc => app.screen = Screen::Main { selected: 1 },
+                KeyCode::Esc => app.screen = Screen::Main { selected: 2 },
                 KeyCode::Up if count > 0 => *selected = selected.saturating_sub(1),
                 KeyCode::Down if count > 0 => *selected = (*selected + 1).min(count - 1),
                 _ => match cmd {
-                    Some('q') => app.screen = Screen::Main { selected: 1 },
+                    Some('q') => app.screen = Screen::Main { selected: 2 },
                     Some('k') if count > 0 => *selected = selected.saturating_sub(1),
                     Some('j') if count > 0 => *selected = (*selected + 1).min(count - 1),
                     Some('r') if count > 0 => {
@@ -1507,7 +1530,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 };
             } else if exit {
                 stop_log_tailers(app);
-                app.screen = Screen::Main { selected: 7 };
+                app.screen = Screen::Main { selected: 8 };
             }
         }
         Screen::ConfirmClear {
@@ -1641,7 +1664,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             // navigation disarms a pending delete.
             let last = lib_row_count(files.len()).saturating_sub(1);
             match key {
-                KeyCode::Esc => app.screen = Screen::Main { selected: 3 },
+                KeyCode::Esc => app.screen = Screen::Main { selected: 4 },
                 KeyCode::Up => {
                     *selected = selected.saturating_sub(1);
                     *armed_delete = None;
@@ -1688,7 +1711,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     None => {}
                 },
                 _ => match cmd {
-                    Some('q') => app.screen = Screen::Main { selected: 3 },
+                    Some('q') => app.screen = Screen::Main { selected: 4 },
                     Some('k') => {
                         *selected = selected.saturating_sub(1);
                         *armed_delete = None;
@@ -1837,7 +1860,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
         } => {
             let count = files.len();
             match key {
-                KeyCode::Esc => app.screen = Screen::Main { selected: 4 },
+                KeyCode::Esc => app.screen = Screen::Main { selected: 5 },
                 KeyCode::Up if count > 0 => {
                     *selected = selected.saturating_sub(1);
                 }
@@ -1877,7 +1900,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     }
                 }
                 _ => match cmd {
-                    Some('q') => app.screen = Screen::Main { selected: 4 },
+                    Some('q') => app.screen = Screen::Main { selected: 5 },
                     Some('k') if count > 0 => {
                         *selected = selected.saturating_sub(1);
                     }
@@ -1911,7 +1934,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
         } => {
             let count = rows.len();
             match key {
-                KeyCode::Esc => app.screen = Screen::Main { selected: 5 },
+                KeyCode::Esc => app.screen = Screen::Main { selected: 6 },
                 KeyCode::Up if count > 0 => {
                     *selected = selected.saturating_sub(1);
                 }
@@ -1945,7 +1968,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     }
                 }
                 _ => match cmd {
-                    Some('q') => app.screen = Screen::Main { selected: 5 },
+                    Some('q') => app.screen = Screen::Main { selected: 6 },
                     Some('k') if count > 0 => {
                         *selected = selected.saturating_sub(1);
                     }
@@ -2071,7 +2094,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
         } => {
             let count = files.len();
             match key {
-                KeyCode::Esc => app.screen = Screen::Main { selected: 6 },
+                KeyCode::Esc => app.screen = Screen::Main { selected: 7 },
                 KeyCode::Up if count > 0 => {
                     *selected = selected.saturating_sub(1);
                 }
@@ -2101,7 +2124,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                     }
                 }
                 _ => match cmd {
-                    Some('q') => app.screen = Screen::Main { selected: 6 },
+                    Some('q') => app.screen = Screen::Main { selected: 7 },
                     Some('k') if count > 0 => {
                         *selected = selected.saturating_sub(1);
                     }
@@ -2231,6 +2254,54 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                 _ => {}
             },
         },
+        Screen::Networks {
+            rows,
+            selected,
+            message,
+        } => {
+            let count = rows.len();
+            match key {
+                KeyCode::Esc => app.screen = Screen::Main { selected: 1 },
+                KeyCode::Up if count > 0 => *selected = selected.saturating_sub(1),
+                KeyCode::Down if count > 0 => *selected = (*selected + 1).min(count - 1),
+                _ => match cmd {
+                    Some('q') => app.screen = Screen::Main { selected: 1 },
+                    Some('k') if count > 0 => *selected = selected.saturating_sub(1),
+                    Some('j') if count > 0 => *selected = (*selected + 1).min(count - 1),
+                    Some('r') => {
+                        *rows = crate::networks::supervisor::rows();
+                        if *selected >= rows.len() && !rows.is_empty() {
+                            *selected = rows.len().saturating_sub(1);
+                        }
+                        *message = Some("refreshed".into());
+                    }
+                    Some('s') if count > 0 => {
+                        if let Some(row) = rows.get(*selected).cloned()
+                            && row.can_start()
+                        {
+                            if let Err(e) = crate::networks::supervisor::start(
+                                &row.service,
+                                &row.unit_name,
+                                &row.local_url,
+                            ) {
+                                *message = Some(format!("! {e}"));
+                            } else {
+                                *rows = crate::networks::supervisor::rows();
+                                *message = Some(format!("started sharing {}", row.service));
+                            }
+                        }
+                    }
+                    Some('x') if count > 0 => {
+                        if let Some(row) = rows.get(*selected).cloned() {
+                            crate::networks::supervisor::stop(&row.service);
+                            *rows = crate::networks::supervisor::rows();
+                            *message = Some(format!("stopped sharing {}", row.service));
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
         Screen::WzId {
             buffer,
             error,
@@ -2913,6 +2984,13 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
             };
         }
         1 => {
+            app.screen = Screen::Networks {
+                rows: crate::networks::supervisor::rows(),
+                selected: 0,
+                message: None,
+            };
+        }
+        2 => {
             let rows = workers::service_rows();
             app.screen = Screen::Services {
                 rows,
@@ -2920,14 +2998,14 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                 message: None,
             };
         }
-        2 => {
+        3 => {
             app.screen = Screen::UrlInput {
                 buffer: String::new(),
                 error: None,
                 busy: false,
             }
         }
-        3 => {
+        4 => {
             app.screen = Screen::AddService {
                 files: crate::hoster::library::list(),
                 selected: 0,
@@ -2935,7 +3013,7 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                 armed_delete: None,
             };
         }
-        4 => {
+        5 => {
             let files = crate::hoster::library::list();
             let deployed: Vec<String> = crate::state::list()
                 .into_iter()
@@ -2948,14 +3026,14 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                 message: None,
             };
         }
-        5 => {
+        6 => {
             app.screen = Screen::EditService {
                 rows: edit_service_rows(),
                 selected: 0,
                 message: None,
             };
         }
-        6 => {
+        7 => {
             let snap = workers::egress_snapshot();
             app.screen = Screen::Egress {
                 files: snap.files,
@@ -2967,7 +3045,7 @@ fn main_menu_activate(app: &mut App, selected: usize) -> Flow {
                 message: None,
             };
         }
-        7 => {
+        8 => {
             // Deploy logs: single shared file is the source of truth so every
             // window streams the same live deploy. File survives across processes.
             let mut deploy_lines = workers::read_deploy_log();
@@ -3382,6 +3460,13 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
                 message.as_deref(),
                 app.tick,
             );
+        }
+        Screen::Networks {
+            rows,
+            selected,
+            message,
+        } => {
+            draw_networks(f, chunks[0], rows, *selected, message.as_deref());
         }
         Screen::WzId { buffer, error, .. } => {
             draw_wz_input(
@@ -4730,6 +4815,130 @@ fn draw_egress_hosts(
     );
 }
 
+fn draw_networks(
+    f: &mut ratatui::Frame,
+    area: ratatui::prelude::Rect,
+    rows: &[crate::networks::supervisor::NetworkRow],
+    selected: usize,
+    message: Option<&str>,
+) {
+    let mut title = Line::from(vec![
+        Span::styled(" Networks ", Style::default().fg(MAGENTA)),
+        Span::styled("[", Style::default().fg(DIM)),
+        Span::styled("Enter", Style::default().fg(OK_GREEN)),
+        Span::styled("]configure ", Style::default().fg(DIM)),
+        Span::styled("[", Style::default().fg(DIM)),
+        Span::styled("s", Style::default().fg(OK_GREEN)),
+        Span::styled("]hare ", Style::default().fg(DIM)),
+        Span::styled("[", Style::default().fg(DIM)),
+        Span::styled("m", Style::default().fg(OK_GREEN)),
+        Span::styled("]ail ", Style::default().fg(DIM)),
+        Span::styled("[", Style::default().fg(DIM)),
+        Span::styled("x", Style::default().fg(ERR_RED)),
+        Span::styled("]stop ", Style::default().fg(DIM)),
+        Span::styled("[", Style::default().fg(DIM)),
+        Span::styled("r", Style::default().fg(ACCENT)),
+        Span::styled("]efresh", Style::default().fg(DIM)),
+    ]);
+    if let Some(m) = message {
+        title.push_span(Span::styled(
+            format!("  — {m}"),
+            Style::default().fg(WARN_YELLOW),
+        ));
+    }
+
+    if rows.is_empty() {
+        f.render_widget(
+            Paragraph::new(vec![Line::from(Span::styled(
+                " No deployed services to share.",
+                Style::default().fg(DIM),
+            ))])
+            .block(Block::default().borders(Borders::ALL).title(title)),
+            area,
+        );
+        return;
+    }
+
+    let footer: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(i, row)| {
+            if i != selected {
+                return None;
+            }
+            let mut out = Vec::new();
+            out.push(Line::from(vec![
+                Span::styled(" local: ", Style::default().fg(DIM)),
+                Span::styled(row.local_url.clone(), Style::default().fg(BODY)),
+            ]));
+            if let Some(url) = &row.public_url {
+                out.push(Line::from(vec![
+                    Span::styled(" public: ", Style::default().fg(DIM)),
+                    Span::styled(url.clone(), Style::default().fg(OK_GREEN)),
+                ]));
+            }
+            if let Some(msg) = &row.message {
+                out.push(Line::from(vec![
+                    Span::styled(" status: ", Style::default().fg(DIM)),
+                    Span::styled(msg.clone(), Style::default().fg(WARN_YELLOW)),
+                ]));
+            }
+            Some(out)
+        })
+        .flatten()
+        .collect();
+
+    let items: Vec<ListItem> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let sel = i == selected;
+            let status_color = match row.status {
+                crate::networks::registry::ShareStatus::Live => OK_GREEN,
+                crate::networks::registry::ShareStatus::Starting => WARN_YELLOW,
+                crate::networks::registry::ShareStatus::Error => ERR_RED,
+                crate::networks::registry::ShareStatus::Stopped => DIM,
+            };
+            let url = row
+                .public_url
+                .clone()
+                .unwrap_or_else(|| row.status.label().to_string());
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    if sel { " » " } else { "   " },
+                    Style::default().fg(MAGENTA).add_modifier(if sel {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+                ),
+                Span::styled(
+                    format!("{:<16}", row.service),
+                    Style::default()
+                        .fg(if sel { Color::White } else { BODY })
+                        .add_modifier(if sel {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                ),
+                Span::styled(format!("  ● {}", url), Style::default().fg(status_color)),
+                Span::styled(format!("  ({})", row.local_url), Style::default().fg(DIM)),
+            ]))
+        })
+        .collect();
+
+    let layout = Layout::vertical([Constraint::Min(1), Constraint::Length(6)]).split(area);
+    f.render_widget(
+        List::new(items).block(Block::default().borders(Borders::ALL).title(title)),
+        layout[0],
+    );
+    let bottom = Paragraph::new(footer)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::TOP));
+    f.render_widget(bottom, layout[1]);
+}
+
 fn draw_detect_input(
     f: &mut ratatui::Frame,
     area: ratatui::prelude::Rect,
@@ -5708,6 +5917,13 @@ fn hint_line(screen: &Screen) -> Line<'static> {
                 ]
             }
         }
+        Screen::Networks { .. } => vec![
+            ("↑↓ select", MAGENTA),
+            ("s share", OK_GREEN),
+            ("x stop", ERR_RED),
+            ("r refresh", ACCENT),
+            ("Esc back", WARN_YELLOW),
+        ],
         // Wizard hints name their destination: after Enter the next screen
         // must be predictable, not a surprise.
         Screen::WzId { .. } => vec![("Enter → source", OK_GREEN), ("Esc back", WARN_YELLOW)],
@@ -5845,12 +6061,13 @@ mod tests {
     /// the deployed ones. Navigation caps derive from MAIN_MENU so this
     /// guards desync.
     #[test]
-    fn main_menu_lists_eight_items_with_edit_service_after_my_services() {
+    fn main_menu_lists_networks_under_system_scan() {
         let titles: Vec<&str> = MAIN_MENU.iter().map(|(_, t, _, _)| *t).collect();
         assert_eq!(
             titles,
             vec![
                 "System Scan",
+                "Networks",
                 "Self-Hosting",
                 "Deploy Service",
                 "Add Service",
@@ -5944,7 +6161,7 @@ mod tests {
     fn main_menu_screen_renders_art_subtitles_and_list() {
         use ratatui::backend::TestBackend;
         let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        term.draw(|f| draw_main_menu(f, f.area(), 2)).unwrap();
+        term.draw(|f| draw_main_menu(f, f.area(), 3)).unwrap();
         let buf = term.backend().buffer();
         let mut text = String::new();
         let mut art_row = None;
@@ -6122,7 +6339,7 @@ mod tests {
                 let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
                 if let Some(col) = row.find("@ System Scan") {
                     scan = Some((y, col));
-                } else if let Some(col) = row.find("# Self-Hosting") {
+                } else if let Some(col) = row.find("⊗ Networks") {
                     next = Some((y, col));
                 }
             }

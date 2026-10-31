@@ -40,3 +40,13 @@ fn local_endpoints_are_loopback_only() {
         );
     }
 }
+
+#[test]
+fn cloudflare_quick_tunnel_host_is_not_in_allowlist() {
+    assert!(
+        !demo_ghostprovider::netlog::ALLOWED_ENDPOINTS
+            .iter()
+            .any(|h| h.contains("trycloudflare")),
+        "Cloudflare Quick Tunnel hosts must stay outside the compiled-in allowlist"
+    );
+}

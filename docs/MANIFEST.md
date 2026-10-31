@@ -212,3 +212,5 @@ There are no shipped reference files: every service deploys from a
 never embedded into the binary. Paste a GitHub URL (panel Deploy input or
 `__deploy URL`) and the stack is detected into a `service.yaml` you review
 before deploying, or write one by hand with the in-panel 9-step wizard.
+
+## Runtime state

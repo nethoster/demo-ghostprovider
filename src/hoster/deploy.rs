@@ -1536,6 +1536,7 @@ fn wipe_project_dir(project_dir: &str) -> bool {
 /// GhostProvider cleans up the resources it manages; applications may still
 /// leave their own state (databases, external sockets) elsewhere.
 pub fn remove_unit_and_state(service_name: &str) {
+    crate::networks::supervisor::stop(service_name);
     // Read the registry entry BEFORE unregistering: the port and project dir
     // we clean up come from it.
     let entry = crate::state::get(service_name);
@@ -1614,6 +1615,7 @@ impl CleanResult {
 /// caller can decide whether a journal entry should survive (leftovers may
 /// still be re-created by a living worker) or be settled right away.
 fn cleanup_stale(service: &str, url: &str) -> CleanResult {
+    crate::networks::supervisor::stop(service);
     let mut report = CleanResult::default();
 
     let unit_path = crate::paths::user_unit_dir().join(format!("{service}.service"));

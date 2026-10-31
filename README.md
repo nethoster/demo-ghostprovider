@@ -29,7 +29,7 @@ The service.yaml format is documented in [docs/MANIFEST.md](docs/MANIFEST.md).
 
 ## The panel
 
-Eight screens, one menu:
+Nine screens, one menu:
 
 | # | Screen | What it does |
 |---|--------|--------------|
@@ -40,7 +40,8 @@ Eight screens, one menu:
 | 5 | **My Services** | your added services with their deploy status |
 | 6 | **Edit Service** | change a deployed service — name, port, commit, limits |
 | 7 | **Egress** | what each service may reach outside, verified live |
-| 8 | **Logs** | three tabs: deploy, software and crash logs |
+| 8 | **Networks** | publish one already-deployed service at a temporary `https://*.trycloudflare.com` URL; opt-in, local service stays loopback |
+| 9 | **Logs** | three tabs: deploy, software and crash logs |
 
 ## Requirements
 
@@ -99,6 +100,14 @@ cleanly:
     tunnel and nothing else routes.
   Hosts are detected from the manifest (`auto: true`) and you review the list
   before deploying.
+
+- **Optional public sharing uses Cloudflare Quick Tunnel, never a reverse
+  proxy on the service**: `cloudflared` is an external agent, is NOT in the
+  compiled-in `ALLOWED_ENDPOINTS`, and is shown by `--show-endpoints` only as
+  “opt-in external agent”. A tunnel only runs after an explicit per-session
+  consent, publishes a systemd unit that stays bound to `127.0.0.1`, stops
+  automatically when the panel exits, and never rewrites `service.yaml`, its
+  ports or its resources. Check the current set with `demo-ghostprovider --show-endpoints`.
 
 - **DNS that survives broken VPN/TUN setups** — system `getaddrinfo` first;
   if that fails, a pinned DNS-over-HTTPS fallback at `cloudflare-dns.com`
