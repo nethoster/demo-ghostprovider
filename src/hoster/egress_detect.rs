@@ -93,7 +93,7 @@ pub fn detect_egress(dir: &Path) -> Option<EgressPlan> {
     let text = SETTINGS_CANDIDATES
         .iter()
         .find_map(|rel| std::fs::read_to_string(dir.join(rel)).ok())?;
-    let doc: serde_yaml::Value = serde_yaml::from_str(&text).ok()?;
+    let doc: serde_yaml_ng::Value = serde_yaml_ng::from_str(&text).ok()?;
     let engines = doc.get("engines")?.as_sequence()?;
     if engines.is_empty() {
         return None;
@@ -109,7 +109,7 @@ pub fn detect_egress(dir: &Path) -> Option<EgressPlan> {
         // Only mapping entries with a declaration key count — this keeps a
         // stray YAML doc with an unrelated `engines:` list from matching.
         let name_of = |k: &str| {
-            map.get(serde_yaml::Value::String(k.to_string()))
+            map.get(serde_yaml_ng::Value::String(k.to_string()))
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
         };
@@ -118,7 +118,7 @@ pub fn detect_egress(dir: &Path) -> Option<EgressPlan> {
         if engine.is_none()
             && label.is_none()
             && map
-                .get(serde_yaml::Value::String("search_url".into()))
+                .get(serde_yaml_ng::Value::String("search_url".into()))
                 .is_none()
         {
             return None;
@@ -126,11 +126,11 @@ pub fn detect_egress(dir: &Path) -> Option<EgressPlan> {
         // The repo's own opt-outs win: disabled/inactive engines are not
         // queried, so they must not open holes in the firewall.
         if map
-            .get(serde_yaml::Value::String("disabled".into()))
+            .get(serde_yaml_ng::Value::String("disabled".into()))
             .and_then(|v| v.as_bool())
             == Some(true)
             || map
-                .get(serde_yaml::Value::String("inactive".into()))
+                .get(serde_yaml_ng::Value::String("inactive".into()))
                 .and_then(|v| v.as_bool())
                 == Some(true)
         {
@@ -187,13 +187,13 @@ fn table_hosts(engine: &str) -> Option<(u8, &'static [&'static str])> {
 }
 
 /// All string values of `key` in an engine mapping (scalar or sequence).
-fn url_values(map: &serde_yaml::Mapping, key: &str) -> Vec<String> {
-    let Some(v) = map.get(serde_yaml::Value::String(key.to_string())) else {
+fn url_values(map: &serde_yaml_ng::Mapping, key: &str) -> Vec<String> {
+    let Some(v) = map.get(serde_yaml_ng::Value::String(key.to_string())) else {
         return Vec::new();
     };
     match v {
-        serde_yaml::Value::String(s) => vec![s.clone()],
-        serde_yaml::Value::Sequence(seq) => seq
+        serde_yaml_ng::Value::String(s) => vec![s.clone()],
+        serde_yaml_ng::Value::Sequence(seq) => seq
             .iter()
             .filter_map(|i| i.as_str().map(str::to_string))
             .collect(),

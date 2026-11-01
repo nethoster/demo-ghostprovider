@@ -153,7 +153,8 @@ pub fn set_egress_allow(id: &str, hosts: &[String]) -> anyhow::Result<()> {
     // empties the list back to deny-all.
     m.egress.auto = Some(false);
     m.validate(&format!("library:{id}"))?;
-    let yaml = serde_yaml::to_string(&m).map_err(|e| anyhow::anyhow!("cannot render YAML: {e}"))?;
+    let yaml =
+        serde_yaml_ng::to_string(&m).map_err(|e| anyhow::anyhow!("cannot render YAML: {e}"))?;
     crate::atomic::write_atomic(&file_path(id)?, yaml.as_bytes())?;
     Ok(())
 }
@@ -170,7 +171,8 @@ pub fn set_run_port(id: &str, port: u16) -> anyhow::Result<()> {
     }
     m.run.port = port;
     m.validate(&format!("library:{id}"))?;
-    let yaml = serde_yaml::to_string(&m).map_err(|e| anyhow::anyhow!("cannot render YAML: {e}"))?;
+    let yaml =
+        serde_yaml_ng::to_string(&m).map_err(|e| anyhow::anyhow!("cannot render YAML: {e}"))?;
     crate::atomic::write_atomic(&file_path(id)?, yaml.as_bytes())?;
     Ok(())
 }
@@ -356,7 +358,7 @@ tools: ["bun"]
         import(&src).unwrap();
         // Valid rewrite of the same id works.
         let m = ServiceManifest::load_from_str(GOOD, "test").unwrap();
-        let yaml = serde_yaml::to_string(&m).unwrap();
+        let yaml = serde_yaml_ng::to_string(&m).unwrap();
         replace("lib-demo", yaml.as_bytes()).unwrap();
         // Wrong id inside → refused, original untouched.
         let other = GOOD.replace("id: lib-demo", "id: other-svc");
@@ -374,7 +376,7 @@ tools: ["bun"]
     fn save_stores_validated_yaml() {
         let _env = isolated_data_home("save");
         let m = ServiceManifest::load_from_str(GOOD, "test").unwrap();
-        let yaml = serde_yaml::to_string(&m).unwrap();
+        let yaml = serde_yaml_ng::to_string(&m).unwrap();
         // Preview round-trips through the schema.
         ServiceManifest::load_from_str(&yaml, "preview").unwrap();
         assert_eq!(save(&m, &yaml).unwrap(), "lib-demo");

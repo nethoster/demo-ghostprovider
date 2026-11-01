@@ -1445,7 +1445,8 @@ fn persist_manifest(
     context: &str,
 ) -> anyhow::Result<()> {
     m.validate(context)?;
-    let yaml = serde_yaml::to_string(m).map_err(|e| anyhow::anyhow!("cannot render YAML: {e}"))?;
+    let yaml =
+        serde_yaml_ng::to_string(m).map_err(|e| anyhow::anyhow!("cannot render YAML: {e}"))?;
     if let Some(p) = patch_path {
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir)?;

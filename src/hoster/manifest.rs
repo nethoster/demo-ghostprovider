@@ -343,7 +343,7 @@ impl ServiceManifest {
         if text.len() > MAX_MANIFEST_BYTES {
             anyhow::bail!("manifest {origin} exceeds size limit");
         }
-        let m: ServiceManifest = serde_yaml::from_str(text)
+        let m: ServiceManifest = serde_yaml_ng::from_str(text)
             .map_err(|e| anyhow::anyhow!("manifest {origin}: invalid YAML/schema: {e}"))?;
         m.validate(origin)?;
         Ok(m)
@@ -1141,9 +1141,9 @@ mod tests {
                 .contains("egress:   loopback + duckduckgo.com (auto)")
         );
         // serde round-trip keeps the tri-state.
-        let yaml = serde_yaml::to_string(&m).unwrap();
+        let yaml = serde_yaml_ng::to_string(&m).unwrap();
         assert!(yaml.contains("auto: true"), "{yaml}");
-        let back: ServiceManifest = serde_yaml::from_str(&yaml).unwrap();
+        let back: ServiceManifest = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(back.egress.auto, Some(true));
     }
 

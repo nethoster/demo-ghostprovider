@@ -2753,7 +2753,8 @@ fn auto_store(
         draft.id = suggested_id.to_string();
     }
     let manifest = wizard::build_manifest(draft)?;
-    let yaml = serde_yaml::to_string(&manifest).map_err(|e| format!("cannot render YAML: {e}"))?;
+    let yaml =
+        serde_yaml_ng::to_string(&manifest).map_err(|e| format!("cannot render YAML: {e}"))?;
     let id = manifest.service.id.clone();
     let exists = crate::hoster::library::list().iter().any(|e| e.id == id);
     if exists {
@@ -2966,7 +2967,8 @@ fn save_edit(id: &str, fields: &[String]) -> Result<std::path::PathBuf, String> 
     let mut manifest =
         crate::hoster::library::load(id).map_err(|e| workers::short_error_for(&e))?;
     apply_edit(&mut manifest, fields)?;
-    let yaml = serde_yaml::to_string(&manifest).map_err(|e| format!("cannot render YAML: {e}"))?;
+    let yaml =
+        serde_yaml_ng::to_string(&manifest).map_err(|e| format!("cannot render YAML: {e}"))?;
     crate::hoster::library::replace(id, yaml.as_bytes())
         .map_err(|e| workers::short_error_for(&e))?;
     crate::hoster::library::file_path(id).map_err(|e| workers::short_error_for(&e))
@@ -6644,7 +6646,7 @@ mod tests {
         draft.port = "4173".into();
         let mut m = wizard::build_manifest(&draft).expect("manifest builds");
         m.service.name = "VERT demo".into();
-        let yaml = serde_yaml::to_string(&m).unwrap();
+        let yaml = serde_yaml_ng::to_string(&m).unwrap();
         crate::hoster::library::save(&m, &yaml).expect("store manifest");
 
         // …and a deployed one without any library file (external path).
@@ -6768,7 +6770,7 @@ mod tests {
         assert!(wizard::apply_profile_defaults(&mut draft, "bun"));
         draft.build_env = vec![("PUB_SAVED".into(), "kept".into())];
         let m = wizard::build_manifest(&draft).expect("manifest builds");
-        let yaml = serde_yaml::to_string(&m).unwrap();
+        let yaml = serde_yaml_ng::to_string(&m).unwrap();
         crate::hoster::library::save(&m, &yaml).expect("store manifest");
 
         let mut fields = edit_fields_of(&m);

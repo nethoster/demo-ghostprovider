@@ -291,7 +291,7 @@ pub fn build_manifest(draft: &Draft) -> Result<ServiceManifest, String> {
 /// Rendered `service.yaml` preview, or the reason it is not valid yet.
 pub fn preview_yaml(draft: &Draft) -> Result<String, String> {
     let m = build_manifest(draft)?;
-    serde_yaml::to_string(&m).map_err(|e| format!("cannot render YAML: {e}"))
+    serde_yaml_ng::to_string(&m).map_err(|e| format!("cannot render YAML: {e}"))
 }
 
 fn is_memory(s: &str) -> bool {
