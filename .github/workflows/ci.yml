@@ -36,6 +36,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Rustfmt
+        run: cargo fmt --check
       - name: Test (lib)
         run: cargo test --lib
 

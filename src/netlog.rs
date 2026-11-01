@@ -114,8 +114,19 @@ pub fn logging_disabled() -> bool {
     crate::flags::env_flag("GHOSTPROVIDER_NO_NETLOG")
 }
 
+/// Cap the in-memory request registry: a long-lived session (or a busy retry
+/// loop) must never grow this without bound. On-disk rotation (`net.log`) keeps
+/// the file small; this keeps the residency small too. When the cap is hit we
+/// drop the oldest quarter rather than one record at a time, to stay O(1)
+/// amortized.
+const MAX_IN_MEMORY_RECORDS: usize = 4_096;
+
 fn with_registry<T>(f: impl FnOnce(&mut Registry) -> T) -> T {
-    let mut guard = REGISTRY.lock().unwrap();
+    // Never abort the whole process just because one poisoned thread took the
+    // registry down with it: recover the inner state and keep auditing.
+    let mut guard = REGISTRY
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let reg = guard.get_or_insert_with(|| Registry {
         records: Vec::new(),
         file: if logging_disabled() {
@@ -197,6 +208,10 @@ pub fn record(host: &str, path: &str, outcome: Result<u16, String>) {
         }
     );
     with_registry(|reg| {
+        if reg.records.len() >= MAX_IN_MEMORY_RECORDS {
+            let drop = reg.records.len().saturating_sub(MAX_IN_MEMORY_RECORDS / 4);
+            reg.records.drain(0..drop);
+        }
         reg.records.push(rec);
         if let Some(file) = &reg.file {
             append_to_file(file, &line);
