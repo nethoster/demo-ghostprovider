@@ -63,6 +63,15 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Guard — checksums name this tag
+        run: |
+          set -eu
+          grep -q "  demo-ghostprovider-${VERSION}-x86_64-linux-musl$" release/SHA256SUMS || {
+            echo "::error::release/SHA256SUMS names another version: $(cat release/SHA256SUMS)"
+            echo "::error::run scripts/release-local.sh --sign on tag ${VERSION}"
+            exit 1
+          }
+
       - name: Build (--locked, static)
         run: |
           set -eu
