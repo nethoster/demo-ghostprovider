@@ -62,8 +62,14 @@ pub fn detect_tree(dir: &Path) -> Result<Detected, String> {
         detect_python(dir)?
     } else if dir.join("go.mod").is_file() {
         detect_go(dir)
+    } else if let Some(site) = detect_static(dir) {
+        site
     } else {
-        return Err("no supported stack markers found (looked for package.json, requirements.txt, pyproject.toml, go.mod)".into());
+        return Err(
+            "no supported stack markers found (looked for package.json, requirements.txt, \
+             pyproject.toml, go.mod and index.html)"
+                .into(),
+        );
     };
     // Repo-declared runtime env: `${VAR}` overrides documented beside a
     // flagged placeholder secret win; Dockerfile `ENV` fills the rest.
@@ -81,6 +87,106 @@ pub fn detect_tree(dir: &Path) -> Result<Detected, String> {
             .push(format!("runtime env from the repo: {}", names.join(", ")));
     }
     Ok(d)
+}
+
+/// A tree that is nothing but files to serve: no stack marker, but an
+/// `index.html` where a plain site keeps it. Served by the built-in static
+/// server (`__serve-static`) — no build step, no toolchain, no network.
+///
+/// Deliberately last in [`detect_tree`]: a tree carrying a real stack marker
+/// must be recognised as that stack, never downgraded to "just static files".
+/// Output directories (`build/`, `dist/`) are left to the node path, which
+/// knows the framework producing them.
+fn detect_static(dir: &Path) -> Option<Detected> {
+    let (root, note) = if dir.join("index.html").is_file() {
+        ("", "index.html at the repository root")
+    } else if dir.join("public/index.html").is_file() {
+        ("public", "index.html under public/")
+    } else if dir.join("site/index.html").is_file() {
+        ("site", "index.html under site/")
+    } else {
+        return None;
+    };
+    let serve = if root.is_empty() {
+        "{project}".to_string()
+    } else {
+        format!("{{project}}/{root}")
+    };
+    Some(Detected {
+        profile: "static".into(),
+        prefetch: Vec::new(),
+        build: Vec::new(),
+        run_cmd: format!("{{self}} __serve-static {serve} {{port}}"),
+        port: "8080".into(),
+        memory_max: "96M".into(),
+        tasks_max: "32".into(),
+        build_env: Vec::new(),
+        plugins: Vec::new(),
+        notes: vec![
+            format!("static site ({note}) — nothing to build"),
+            "served by the built-in static server: no toolchain to install".into(),
+            "change the port/root in the review step if the site expects another".into(),
+        ],
+        confident: true,
+        run_env: Vec::new(),
+    })
+}
+
+#[cfg(test)]
+mod static_detect_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("gp-static-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn bare_html_tree_is_detected_as_static() {
+        // The case that used to end in "no supported stack markers": a repo
+        // that is nothing but files. No build, no toolchain, our own server.
+        let d = tmp("root");
+        std::fs::write(d.join("index.html"), b"<h1>hi</h1>").unwrap();
+        let det = detect_tree(&d).unwrap();
+        assert_eq!(det.profile, "static");
+        assert!(det.build.is_empty());
+        assert!(det.prefetch.is_empty());
+        assert_eq!(det.run_cmd, "{self} __serve-static {project} {port}");
+        assert!(det.confident);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn public_layout_is_served_from_public() {
+        let d = tmp("public");
+        std::fs::create_dir_all(d.join("public")).unwrap();
+        std::fs::write(d.join("public/index.html"), b"<h1>hi</h1>").unwrap();
+        assert_eq!(
+            detect_tree(&d).unwrap().run_cmd,
+            "{self} __serve-static {project}/public {port}"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_real_stack_wins_over_a_stray_index_html() {
+        // Never downgrade a tree with a real stack marker to "static files".
+        let d = tmp("go");
+        std::fs::write(d.join("go.mod"), b"module x\n\ngo 1.22\n").unwrap();
+        std::fs::write(d.join("index.html"), b"<h1>hi</h1>").unwrap();
+        assert_ne!(detect_tree(&d).unwrap().profile, "static");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_empty_tree_still_errors_honestly() {
+        let d = tmp("empty");
+        let err = detect_tree(&d).unwrap_err();
+        assert!(err.contains("index.html"), "{err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }
 
 /// Evidence that a package.json describes an actual node app: a lockfile,

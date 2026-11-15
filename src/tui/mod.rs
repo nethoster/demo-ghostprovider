@@ -200,6 +200,18 @@ const MAX_DEPLOY_LINES: usize = 2000;
 /// lines once the cap is exceeded so the screen stays responsive on very
 /// long builds.
 fn push_deploy_line(lines: &mut Vec<String>, line: String) {
+    let line = line.replace('\r', "");
+    let line = line.trim_end().to_string();
+    let line = if line.chars().count() > 400 {
+        let mut s: String = line.chars().take(397).collect();
+        s.push_str("...");
+        s
+    } else {
+        line
+    };
+    if line.is_empty() {
+        return;
+    }
     lines.push(line);
     if lines.len() > MAX_DEPLOY_LINES {
         let overflow = lines.len() - MAX_DEPLOY_LINES;
@@ -318,6 +330,12 @@ pub(crate) enum Screen {
         buffer: String,
         error: Option<String>,
         busy: bool,
+        /// Stage the detect worker is in right now (empty until the first
+        /// report). Rendered as a live checklist instead of a bare spinner.
+        stage: String,
+        /// When the worker started: drives the elapsed clock, so a slow fetch
+        /// never looks frozen.
+        started: std::time::Instant,
     },
     /// New-service wizard: one question per screen, "Step n/9" in the title.
     /// Each screen carries the [`wizard::Draft`] built so far; Esc walks back.
@@ -491,6 +509,10 @@ pub(crate) enum Msg {
     DetectDone {
         res: Result<Box<workers::DetectReady>, String>,
         route: workers::DetectRoute,
+    },
+    /// Progress from the detect worker: the pipeline stage it just entered.
+    DetectStage {
+        label: String,
     },
     /// Egress live-check finished for one library service: rendered lines.
     EgressChecked {
@@ -798,6 +820,15 @@ fn event_loop(
                         crash_lines.clear();
                         crash_lines.push("Logs cleared.".into());
                         *scroll = 0;
+                    }
+                }
+                Msg::DetectStage { label } => {
+                    // Only while the screen is open and still working; a late
+                    // stage from a cancelled run must not repaint anything.
+                    if let Screen::DetectInput { busy, stage, .. } = &mut app.screen
+                        && *busy
+                    {
+                        *stage = label;
                     }
                 }
                 Msg::DetectDone { res, route } => {
@@ -1267,6 +1298,8 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                                     buffer: url.clone(),
                                     error: None,
                                     busy: true,
+                                    stage: String::new(),
+                                    started: std::time::Instant::now(),
                                 };
                                 workers::spawn_detect(
                                     app.tx.clone(),
@@ -1336,6 +1369,8 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             buffer: url.clone(),
                             error: None,
                             busy: true,
+                            stage: String::new(),
+                            started: std::time::Instant::now(),
                         };
                         workers::spawn_detect(app.tx.clone(), url, workers::DetectRoute::Wizard);
                     }
@@ -1692,6 +1727,8 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                             buffer: String::new(),
                             error: None,
                             busy: false,
+                            stage: String::new(),
+                            started: std::time::Instant::now(),
                         };
                     }
                     Some(LibRow::Entry(i)) => {
@@ -1819,6 +1856,7 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
             buffer,
             error,
             busy,
+            ..
         } => match key {
             KeyCode::Esc => {
                 app.screen = Screen::AddService {
@@ -2117,8 +2155,16 @@ fn on_key(app: &mut App, key: KeyCode, mods: KeyModifiers) -> Flow {
                                     message: None,
                                 };
                             }
-                            Err(e) => {
-                                *message = Some(workers::short_error_for(&e));
+                            Err(_) => {
+                                // Deployed from a URL: no manifest to edit.
+                                // Its allow-list is the unit's
+                                // IPAddressAllow= — say so instead of showing
+                                // a raw load error.
+                                *message = Some(format!(
+                                    "{} has no stored manifest — its allow-list lives in the \
+                                     unit's IPAddressAllow=. Redeploy from a manifest to edit it here.",
+                                    f.id
+                                ));
                             }
                         }
                     }
@@ -2829,6 +2875,8 @@ fn resume_pending_action(app: &mut App) {
                 buffer: pending.payload.clone(),
                 error: None,
                 busy: true,
+                stage: String::new(),
+                started: std::time::Instant::now(),
             };
             workers::spawn_detect(app.tx.clone(), pending.payload, route);
         }
@@ -3378,8 +3426,20 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             buffer,
             error,
             busy,
+            stage,
+            started,
         } => {
-            draw_detect_input(f, chunks[0], buffer, error.as_deref(), *busy, app.tick);
+            draw_detect_input(
+                f,
+                chunks[0],
+                buffer,
+                error.as_deref(),
+                *busy,
+                stage,
+                *started,
+                app.tick,
+                crate::netstatus::summary(),
+            );
         }
         Screen::UserServices {
             files,
@@ -4669,20 +4729,27 @@ fn draw_egress(
             if sel { " » " } else { "   " },
             Style::default().fg(ERR_RED),
         );
-        // Allow list, re-read from the validated file (cheap, always fresh).
-        let (allow, auto): (Vec<String>, Option<bool>) = crate::hoster::library::load(&e.id)
-            .map(|m| (m.egress.allow, m.egress.auto))
-            .unwrap_or_default();
-        let policy = if allow.is_empty() {
-            "deny-all: REAL (private netns)".to_string()
+        // Policy: the stored manifest when there is one (re-read from the
+        // validated file, always fresh), otherwise read back from the
+        // deployed unit — a service deployed straight from a GitHub URL
+        // stores no manifest at all.
+        let policy = match crate::hoster::library::load(&e.id) {
+            Ok(m) => crate::hoster::egress::describe_policy(&m.egress.allow, m.egress.auto),
+            Err(_) => {
+                let unit = crate::paths::user_unit_dir().join(format!("{}.service", e.id));
+                match crate::hoster::egress::policy_from_unit_file(&unit) {
+                    Some((allow, netns)) => format!(
+                        "{} (from unit)",
+                        crate::hoster::egress::describe_unit_policy(&allow, netns)
+                    ),
+                    None => "policy: unit file unreadable".to_string(),
+                }
+            }
+        };
+        let state_note = if deployed.iter().any(|d| d == &e.id) {
+            ""
         } else {
-            let auto_marker = if auto == Some(true) { " (auto)" } else { "" };
-            let best = if crate::hoster::egress::kernel_enforces_ip_filter() {
-                ""
-            } else {
-                " · best-effort"
-            };
-            format!("allow: {}{auto_marker}{best}", allow.join(", "))
+            " · not deployed"
         };
         let traffic = match counters.get(&e.id) {
             Some((out, inn)) => {
@@ -4703,7 +4770,10 @@ fn draw_egress(
                         Modifier::empty()
                     }),
             ),
-            Span::styled(format!("  {policy}{traffic}"), Style::default().fg(DIM)),
+            Span::styled(
+                format!("  {policy}{state_note}{traffic}"),
+                Style::default().fg(DIM),
+            ),
         ])));
         // Latest verification verdict under the row (first line: the
         // verdict itself; details re-appear on the next check).
@@ -4941,55 +5011,265 @@ fn draw_networks(
     f.render_widget(bottom, layout[1]);
 }
 
+/// Pipeline stages the detect worker walks through, in order. The labels are
+/// the exact strings `workers::detect_url_with` reports, so the checklist and
+/// the worker cannot drift apart silently.
+const DETECT_STAGES: &[&str] = &[
+    "resolving the GitHub URL",
+    "fetching source",
+    "resolving the commit pin",
+    "detecting the stack",
+    "preparing the draft",
+];
+
+/// Break one over-long token (a URL has no spaces to wrap on) into chunks.
+fn wrap_hard(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(8);
+    if s.chars().count() <= width {
+        return vec![s.to_string()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut n = 0usize;
+    for ch in s.chars() {
+        if n == width {
+            out.push(std::mem::take(&mut cur));
+            n = 0;
+        }
+        cur.push(ch);
+        n += 1;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn draw_detect_input(
     f: &mut ratatui::Frame,
     area: ratatui::prelude::Rect,
     buffer: &str,
     error: Option<&str>,
     busy: bool,
+    stage: &str,
+    started: std::time::Instant,
     tick: u64,
+    net: Option<crate::netstatus::NetSummary>,
 ) {
-    let mut text = vec![
-        Line::from(Span::styled(
-            " Paste a GitHub URL: it is cloned shallowly into a temp dir,",
-            Style::default().fg(DIM),
-        )),
-        Line::from(Span::styled(
-            " the stack is detected — autopilot deploys, the wizard reviews;",
-            Style::default().fg(DIM),
-        )),
-        Line::from(Span::styled(
-            " detection itself stores nothing.",
-            Style::default().fg(DIM),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled(" GitHub URL: ", Style::default().fg(VIOLET)),
+    let frame_block = block("Detect from GitHub URL", VIOLET);
+    let inner = frame_block.inner(area);
+    f.render_widget(frame_block, area);
+    // Text keeps a two-cell gutter on both sides: nothing touches the frame.
+    let body = ratatui::layout::Rect {
+        x: inner.x + 2,
+        y: inner.y + 1,
+        width: inner.width.saturating_sub(4),
+        height: inner.height.saturating_sub(1),
+    };
+    let width = body.width.max(12) as usize;
+    let label = Style::default().fg(DIM).add_modifier(Modifier::BOLD);
+    let mut text: Vec<Line<'static>> = Vec::new();
+
+    if busy {
+        let elapsed = started.elapsed();
+        text.push(Line::from(Span::styled("Repository", label)));
+        for chunk in wrap_hard(buffer, width.saturating_sub(2)) {
+            text.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(DIM)),
+                Span::styled(chunk, Style::default().fg(Color::White)),
+            ]));
+        }
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled("Progress", label)));
+        // Before the first report the first stage is the one in flight.
+        let current = DETECT_STAGES.iter().position(|s| *s == stage).unwrap_or(0);
+        for (i, name) in DETECT_STAGES.iter().enumerate() {
+            let line = if i < current {
+                Line::from(vec![
+                    Span::styled("  ✔ ", Style::default().fg(OK_GREEN)),
+                    Span::styled((*name).to_string(), Style::default().fg(DIM)),
+                ])
+            } else if i == current {
+                Line::from(vec![
+                    Span::styled(format!("  {} ", spinner_char(tick)), spinner_style(tick)),
+                    Span::styled(
+                        (*name).to_string(),
+                        Style::default()
+                            .fg(WARN_YELLOW)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("   {}", fmt_time(elapsed)),
+                        Style::default().fg(DIM),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled("  ○ ", Style::default().fg(DIM)),
+                    Span::styled((*name).to_string(), Style::default().fg(DIM)),
+                ])
+            };
+            text.push(line);
+        }
+        // The outage banner lives in the pinned footer below, not here: it
+        // appears and disappears on its own, and adding it to the flow made
+        // the checklist slide down every time the network flapped.
+        text.push(Line::from(""));
+        text.push(Line::from(vec![
+            Span::styled(
+                "  Esc",
+                Style::default()
+                    .fg(WARN_YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" cancel and go back", Style::default().fg(DIM)),
+        ]));
+    } else {
+        for hint in [
+            "Paste a GitHub URL: it is cloned shallowly into a temp dir,",
+            "the stack is detected — autopilot deploys, the wizard reviews;",
+            "detection itself stores nothing.",
+        ] {
+            text.push(Line::from(Span::styled(hint, Style::default().fg(DIM))));
+        }
+        text.push(Line::from(""));
+        text.push(Line::from(vec![
+            Span::styled(
+                "GitHub URL ",
+                Style::default().fg(VIOLET).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("› ", Style::default().fg(DIM)),
             Span::styled(buffer.to_string(), Style::default().fg(Color::White)),
             cursor_span(tick),
-        ]),
-    ];
-    if let Some(e) = error {
-        text.push(Line::from(Span::styled(
-            format!(" x {e}"),
-            Style::default().fg(ERR_RED),
-        )));
-    }
-    if busy {
-        text.push(Line::from(vec![
-            Span::styled(spinner_char(tick), spinner_style(tick)),
-            Span::styled(
-                " fetching source and detecting stack...",
-                Style::default().fg(WARN_YELLOW),
-            ),
         ]));
+        if let Some(e) = error {
+            text.push(Line::from(""));
+            for (i, chunk) in wrap_hard(e, width.saturating_sub(4))
+                .into_iter()
+                .enumerate()
+            {
+                text.push(Line::from(vec![
+                    Span::styled(
+                        if i == 0 { "  ✖ " } else { "    " },
+                        Style::default().fg(ERR_RED).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(chunk, Style::default().fg(ERR_RED)),
+                ]));
+            }
+        }
     }
-    f.render_widget(
-        Paragraph::new(text)
-            .wrap(Wrap { trim: false })
-            .block(block("Detect from GitHub URL", VIOLET)),
-        area,
-    );
+    // Pinned footer: two rows are reserved whether or not an outage is on.
+    // The checklist above keeps its row positions for the whole fetch.
+    let footer_h = 2u16.min(body.height.saturating_sub(3));
+    let split = Layout::vertical([Constraint::Min(3), Constraint::Length(footer_h)]).split(body);
+    f.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), split[0]);
+    if let Some(n) = net {
+        let warn = vec![
+            Line::from(vec![
+                Span::styled(
+                    "  ⚠ ",
+                    Style::default()
+                        .fg(WARN_YELLOW)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("network: {} host(s) unreachable", n.down_hosts),
+                    Style::default().fg(WARN_YELLOW),
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("    ", Style::default().fg(DIM)),
+                Span::styled(
+                    format!(
+                        "retrying by itself, outage {} — the fetch resumes on its own",
+                        fmt_time(n.since)
+                    ),
+                    Style::default().fg(DIM),
+                ),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(warn), split[1]);
+    }
+}
+
+/// Build output reaches the panel with ANSI colour codes, carriage-return
+/// progress rewrites and tabs. Rendered raw, one bun/cargo line turns into
+/// escape-sequence salad and the whole log looks broken.
+fn sanitize_log(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' => match chars.peek() {
+                // CSI: ESC [ … final byte in @..~
+                Some('[') => {
+                    chars.next();
+                    for c2 in chars.by_ref() {
+                        if ('@'..='~').contains(&c2) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] … terminated by BEL or ESC \\
+                Some(']') => {
+                    chars.next();
+                    while let Some(c2) = chars.next() {
+                        if c2 == '\x07' {
+                            break;
+                        }
+                        if c2 == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                _ => {
+                    chars.next();
+                }
+            },
+            '\r' => {}
+            '\t' => out.push_str("    "),
+            c if (c as u32) < 0x20 => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::{sanitize_log, wrap_hard};
+
+    #[test]
+    fn ansi_colours_are_stripped() {
+        assert_eq!(sanitize_log("\x1b[32mok\x1b[0m done"), "ok done");
+        assert_eq!(sanitize_log("\x1b[1;38;2;1;2;3mred\x1b[0m"), "red");
+    }
+
+    #[test]
+    fn carriage_returns_and_tabs_are_cleaned() {
+        assert_eq!(sanitize_log("50%\r100%"), "50%100%");
+        assert_eq!(sanitize_log("a\tb"), "a    b");
+    }
+
+    #[test]
+    fn osc_title_sequences_are_dropped() {
+        assert_eq!(sanitize_log("\x1b]0;title\x07body"), "body");
+    }
+
+    #[test]
+    fn long_tokens_wrap_without_losing_chars() {
+        let url = "https://github.com/searxng/searxng";
+        let parts = wrap_hard(url, 10);
+        assert!(parts.iter().all(|p| p.chars().count() <= 10));
+        assert_eq!(parts.concat(), url);
+    }
+
+    #[test]
+    fn short_tokens_stay_whole() {
+        assert_eq!(wrap_hard("abc", 10), vec!["abc".to_string()]);
+    }
 }
 
 fn draw_import(
@@ -5383,10 +5663,14 @@ fn draw_deploy(
     done: Option<bool>,
     net: Option<crate::netstatus::NetSummary>,
 ) {
+    // Fixed chrome. The banner row and the verdict row keep their height
+    // whether or not they have something to say: sizing them to 0/1 made the
+    // whole log block (and its frame) hop a row every time the network state
+    // flapped mid-deploy, which reads as the text sliding around the screen.
     let inner = Layout::vertical([
-        Constraint::Length(net.map_or(0, |_| 1)),
-        Constraint::Min(1),
-        Constraint::Length(done.map_or(0, |_| 1)),
+        Constraint::Length(1),
+        Constraint::Min(3),
+        Constraint::Length(1),
     ])
     .split(area);
     if let Some(n) = net {
@@ -5401,7 +5685,7 @@ fn draw_deploy(
                 ),
                 Span::styled(
                     format!(
-                        " {} host(s) unreachable — permanent retry, next probe is automatic (since {})",
+                        " network: {} host(s) unreachable — retrying by itself, nothing to do (outage {})",
                         n.down_hosts,
                         fmt_time(n.since)
                     ),
@@ -5434,11 +5718,19 @@ fn draw_deploy(
         spans.extend(log_lines(l));
         prev_doctor = is_doctor;
     }
+    // A deploy log is read from the tail: keep the newest line in view instead
+    // of rendering from the top and clipping everything that just happened.
+    let view = inner[1];
+    let wrap_width = view.width.saturating_sub(2).max(1) as usize;
+    let rows: usize = spans.iter().map(|l| wrapped_rows(l, wrap_width)).sum();
+    let visible = view.height.saturating_sub(2) as usize;
+    let scroll = rows.saturating_sub(visible).min(u16::MAX as usize) as u16;
     f.render_widget(
         Paragraph::new(spans)
             .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
             .block(block("Deployment", MAGENTA)),
-        inner[1],
+        view,
     );
     if let Some(ok) = done {
         let (label, fg) = if ok {
@@ -5460,6 +5752,39 @@ fn draw_deploy(
     }
 }
 
+/// Rows a rendered line occupies once word-wrapped to `width` cells.
+///
+/// Mirrors `Paragraph::wrap(Wrap { trim: false })` closely enough to scroll a
+/// log to its tail: greedy word fill, over-long words split at the boundary,
+/// widths measured in display cells (so CJK and box drawing count right).
+fn wrapped_rows(line: &Line<'_>, width: usize) -> usize {
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let w = width.max(1);
+    if text.trim().is_empty() {
+        return 1;
+    }
+    let mut rows = 1usize;
+    let mut col = 0usize;
+    for word in text.split(' ') {
+        let ww = Line::from(word).width();
+        if col > 0 && col + 1 + ww <= w {
+            col += 1 + ww;
+            continue;
+        }
+        if col > 0 {
+            rows += 1;
+        }
+        if ww <= w {
+            col = ww;
+        } else {
+            let full = (ww - 1) / w;
+            rows += full;
+            col = ww - full * w;
+        }
+    }
+    rows
+}
+
 fn fmt_time(d: std::time::Duration) -> String {
     let total = d.as_secs();
     if total >= 3600 {
@@ -5474,6 +5799,8 @@ fn fmt_time(d: std::time::Duration) -> String {
 /// Colorize one deployment log line; tool-doctor issues get structured
 /// multi-line treatment (problem / fix command / note).
 fn log_lines(line: &str) -> Vec<Line<'static>> {
+    let line = sanitize_log(line);
+    let line = line.as_str();
     let s = line.trim_start();
     if let Some(body) = s.strip_prefix("! ") {
         if doctor_body_markers(s) {
@@ -5878,7 +6205,7 @@ fn hint_line(screen: &Screen) -> Line<'static> {
         Screen::Import { .. } => vec![("Enter import", OK_GREEN), ("Esc back", WARN_YELLOW)],
         Screen::DetectInput { busy, .. } => {
             if *busy {
-                vec![("working…", WARN_YELLOW)]
+                vec![("Esc cancel", WARN_YELLOW), ("detect running", VIOLET)]
             } else {
                 vec![("Enter detect", OK_GREEN), ("Esc back", WARN_YELLOW)]
             }
@@ -7224,6 +7551,112 @@ mod tests {
         assert!(
             (left as i64 - right as i64).abs() <= 2,
             "roughly centered: left={left} right={right}"
+        );
+    }
+
+    /// Every deploy frame keeps the same chrome rows: the outage banner and
+    /// the verdict row are reserved even when empty, so the log block and its
+    /// frame never hop a row when the network flaps or the deploy finishes.
+    #[test]
+    fn deploy_layout_does_not_jump_between_frames() {
+        use ratatui::backend::TestBackend;
+        let outage = crate::netstatus::NetSummary {
+            down_hosts: 2,
+            since: std::time::Duration::from_secs(9),
+        };
+        let rows = |net: Option<crate::netstatus::NetSummary>, done: Option<bool>| {
+            let mut term = Terminal::new(TestBackend::new(120, 32)).unwrap();
+            let lines: Vec<String> = vec!["== deploy ==".into(), "clone: ok".into()];
+            term.draw(|f| draw_deploy(f, f.area(), &lines, done, net))
+                .unwrap();
+            let buf = term.backend().buffer();
+            let mut title = None;
+            let mut body = None;
+            for y in 0..buf.area.height {
+                let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                if title.is_none() && row.contains("Deployment") {
+                    title = Some(y);
+                }
+                if row.contains("clone: ok") {
+                    body = Some(y);
+                }
+            }
+            (title.unwrap(), body.unwrap())
+        };
+        let quiet = rows(None, None);
+        assert_eq!(
+            quiet,
+            rows(Some(outage), None),
+            "the outage banner must not move the log block"
+        );
+        assert_eq!(
+            quiet,
+            rows(None, Some(true)),
+            "the verdict row must not move the log block"
+        );
+    }
+
+    /// A deploy log is read from the tail: the newest line stays visible
+    /// without scrolling, and the oldest ones roll off the top.
+    #[test]
+    fn deploy_log_follows_the_tail() {
+        use ratatui::backend::TestBackend;
+        let mut lines: Vec<String> = (0..80).map(|i| format!("step {i:02} done")).collect();
+        lines.push("listening on http://localhost:1/".into());
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_deploy(f, f.area(), &lines, None, None))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("listening on"), "the tail is in view");
+        assert!(!text.contains("step 00 done"), "old lines scrolled away");
+    }
+
+    /// The detect checklist holds its row positions for the whole fetch: the
+    /// outage banner lives in a pinned footer, not in the scrolling flow.
+    #[test]
+    fn detect_checklist_does_not_slide_when_the_network_flaps() {
+        use ratatui::backend::TestBackend;
+        let outage = crate::netstatus::NetSummary {
+            down_hosts: 1,
+            since: std::time::Duration::from_secs(4),
+        };
+        let progress_row = |net: Option<crate::netstatus::NetSummary>| {
+            let mut term = Terminal::new(TestBackend::new(120, 34)).unwrap();
+            let started = std::time::Instant::now();
+            term.draw(|f| {
+                draw_detect_input(
+                    f,
+                    f.area(),
+                    "https://github.com/searxng/searxng",
+                    None,
+                    true,
+                    "fetching source",
+                    started,
+                    3,
+                    net,
+                )
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            for y in 0..buf.area.height {
+                let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();
+                if row.contains("Progress") {
+                    return y;
+                }
+            }
+            panic!("no Progress section");
+        };
+        assert_eq!(
+            progress_row(None),
+            progress_row(Some(outage)),
+            "the banner must not push the checklist down"
         );
     }
 }

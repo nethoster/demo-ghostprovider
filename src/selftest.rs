@@ -27,7 +27,7 @@ pub fn run() -> anyhow::Result<()> {
     )?;
 
     let port = find_free_port(28100, 200)?;
-    let self_exe = std::env::current_exe()?;
+    let self_exe = crate::paths::self_exe();
     let exec_start = format!(
         "{} __serve-static {} {port}",
         self_exe.display(),

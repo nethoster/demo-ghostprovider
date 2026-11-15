@@ -45,7 +45,16 @@ pub enum DetectRoute {
 /// library or the deploy pipeline — detection only reads.
 pub(crate) fn spawn_detect(tx: Sender<Msg>, url: String, route: DetectRoute) {
     std::thread::spawn(move || {
-        let out = detect_url(&url).map(Box::new);
+        // Every stage travels to the panel the moment it starts: a slow clone
+        // (or a fetch stuck in permanent retry) must show movement, not one
+        // frozen "detecting stack..." line.
+        let progress = tx.clone();
+        let out = detect_url_with(&url, |label| {
+            let _ = progress.send(Msg::DetectStage {
+                label: label.to_string(),
+            });
+        })
+        .map(Box::new);
         let _ = tx.send(Msg::DetectDone { res: out, route });
     });
 }
@@ -56,7 +65,15 @@ pub(crate) fn spawn_detect(tx: Sender<Msg>, url: String, route: DetectRoute) {
 /// `service.yaml` instead of deploying). The tree never touches the library
 /// or the deploy pipeline — detection only reads.
 pub fn detect_url(url: &str) -> Result<DetectReady, String> {
+    detect_url_with(url, |_| {})
+}
+
+/// Same as [`detect_url`], reporting each pipeline stage as it starts through
+/// `on_stage`. The labels are the ones `DETECT_STAGES` in the panel renders —
+/// keep the two lists in step.
+pub fn detect_url_with(url: &str, mut on_stage: impl FnMut(&str)) -> Result<DetectReady, String> {
     use crate::hoster::{detect, gitclone};
+    on_stage("resolving the GitHub URL");
     let (owner, name) = crate::hoster::github::parse_github_url(url)
         .ok_or_else(|| "must be https://github.com/<owner>/<repo> (optional .git)".to_string())?;
     let nonce: String = crate::atomic::random_hex(4).unwrap_or_else(|_| "tmp".into());
@@ -64,6 +81,7 @@ pub fn detect_url(url: &str) -> Result<DetectReady, String> {
     let wipe = || {
         let _ = gitclone::force_remove_all(&tmp);
     };
+    on_stage("fetching source");
     let status = gitclone::clone(url, &tmp, None);
     if !status.ok {
         wipe();
@@ -73,6 +91,7 @@ pub fn detect_url(url: &str) -> Result<DetectReady, String> {
     // name (unpinned clone); a real git clone has no marker, so fall back
     // to the actual HEAD. Either lands in the commit field, which accepts
     // a SHA or a branch name.
+    on_stage("resolving the commit pin");
     let pin_val = gitclone::pinned_sha(&tmp).unwrap_or_else(|| {
         std::process::Command::new("git")
             .args(["-C", &tmp.to_string_lossy(), "rev-parse", "HEAD"])
@@ -82,9 +101,11 @@ pub fn detect_url(url: &str) -> Result<DetectReady, String> {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default()
     });
+    on_stage("detecting the stack");
     let found = detect::detect_tree(&tmp);
     wipe();
     let d = found.map_err(|e| format!("stack not recognized: {e}"))?;
+    on_stage("preparing the draft");
     let draft = super::wizard::Draft {
         git: url.to_string(),
         commit: pin_val,
@@ -436,8 +457,28 @@ pub struct EgressSnapshot {
 }
 
 pub fn egress_snapshot() -> EgressSnapshot {
-    let files = crate::hoster::library::list();
+    let mut files = crate::hoster::library::list();
     let deployed: Vec<String> = crate::state::list().into_iter().map(|(n, _)| n).collect();
+    // The Egress screen lists what is *running*, not just what sits on the
+    // hand-curated library shelf: a service deployed straight from a GitHub
+    // URL stores no manifest and used to be invisible here — a host with one
+    // active unit showed "No services added yet". Deployed ids without a
+    // manifest get a row whose policy is read back from the unit file.
+    for name in &deployed {
+        if files.iter().any(|e| &e.id == name) {
+            continue;
+        }
+        files.push(crate::hoster::library::LibraryEntry {
+            id: name.clone(),
+            path: crate::paths::user_unit_dir().join(format!("{name}.service")),
+            source_git: crate::state::get(name).map(|e| e.url),
+            valid: false,
+            error: Some(
+                "deployed without a stored manifest — egress policy is read from the unit".into(),
+            ),
+        });
+    }
+    files.sort_by(|a, b| a.id.cmp(&b.id));
     let mut counters = HashMap::new();
     for d in &deployed {
         if let Some(c) = crate::hoster::units::ip_counters(d) {

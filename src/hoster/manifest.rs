@@ -404,11 +404,11 @@ impl ServiceManifest {
         }
         // ── profile ──
         match self.build.profile.as_str() {
-            "bun" | "python" | "go" | "node" => {}
+            "bun" | "python" | "go" | "node" | "static" => {}
             other => anyhow::bail!(
                 "{}",
                 at(&format!(
-                    "build.profile '{other}' unsupported (bun|python|go|node)"
+                    "build.profile '{other}' unsupported (bun|python|go|node|static)"
                 ))
             ),
         }
@@ -897,6 +897,7 @@ pub fn to_leaked_recipe(m: &ServiceManifest) -> super::recipes::DemoRecipe {
     let language: &'static str = match m.build.profile.as_str() {
         "go" => "Go",
         "python" => "Python",
+        "static" => "Static",
         _ => "JavaScript",
     };
     let start_cmd = leak_str(&m.run.command.join(" "));

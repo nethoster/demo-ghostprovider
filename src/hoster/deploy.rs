@@ -75,9 +75,7 @@ pub fn clone_repo(
 
 /// Fill recipe start command placeholders with concrete paths.
 pub fn resolve_start(recipe: &DemoRecipe, project_dir: &Path, port: u16) -> String {
-    let self_exe = std::env::current_exe()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|_| "demo-ghostprovider".into());
+    let self_exe = crate::paths::self_exe().to_string_lossy().into_owned();
 
     let mut cmd = recipe.start_cmd.to_string();
     if recipe.language == "Go" {
@@ -1150,9 +1148,75 @@ fn address_is_non_loopback(addr: &str) -> bool {
     !matches!(host, "127.0.0.1" | "[::1]" | "localhost")
 }
 
-/// True when some process is listening on `port` on a non-loopback address.
-/// Reads the same `ss` table the scan renders; ownership attribution stays
-/// out of it.
+/// Link-local (`169.254.0.0/16`, `fe80::/10`) is never reachable from the LAN.
+/// The deploy shim's `.socket` sits on `169.254.0.21` inside the private
+/// network namespace: `ss` lists that listener, but cannot attribute a PID to
+/// it from outside the namespace, so the PID filter misses it and every single
+/// deploy would warn about exposure that does not exist.
+fn is_link_local(host: &str) -> bool {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    bare.starts_with("169.254.") || bare.to_ascii_lowercase().starts_with("fe80:")
+}
+
+/// Host part of `ss`'s local-address column (`127.0.0.1:8080` → `127.0.0.1`).
+fn ss_row_host(row: &str) -> Option<&str> {
+    let mut cols = row.split_whitespace();
+    let _state = cols.next()?;
+    let _recv = cols.next()?;
+    let _send = cols.next()?;
+    let addr = cols.next()?;
+    Some(addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr))
+}
+
+/// (port, is the address non-loopback?) for one `ss -tlnp` row:
+/// `LISTEN 0 4096 127.0.0.1:8080 0.0.0.0:* users:(("app",pid=7,fd=3))`.
+fn ss_row_listener(row: &str) -> Option<(u16, bool)> {
+    let mut cols = row.split_whitespace();
+    let _state = cols.next()?;
+    let _recv = cols.next()?;
+    let _send = cols.next()?;
+    let addr = cols.next()?;
+    let (_, port) = addr.rsplit_once(':')?;
+    Some((port.parse().ok()?, address_is_non_loopback(addr)))
+}
+
+/// PIDs named in an `ss -p` row (`users:(("socat",pid=42,fd=3))`).
+fn row_pids(row: &str) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut rest = row;
+    while let Some(i) = rest.find("pid=") {
+        rest = &rest[i + 4..];
+        let digits: String = rest
+            .chars()
+            .take_while(|c: &char| c.is_ascii_digit())
+            .collect();
+        if let Ok(pid) = digits.parse() {
+            out.push(pid);
+        }
+    }
+    out
+}
+
+/// True when the listener is one of *our own* worker processes.
+///
+/// Listening on a non-loopback address is exactly what our architecture does
+/// on purpose: the systemd `.socket` unit binds the host-facing port and
+/// `__egress-shim` bridges it into the private netns. Reading that as "the
+/// recipe regressed, your LAN can reach it" put a scary warning on every
+/// single deploy — the false alarm is what this filter removes.
+fn owned_by_our_worker(row: &str) -> bool {
+    row_pids(row).into_iter().any(|pid| {
+        std::fs::read(format!("/proc/{pid}/cmdline"))
+            .map(|raw| {
+                let cmd = String::from_utf8_lossy(&raw).replace('\0', " ");
+                cmd.contains("__egress-shim") || cmd.contains("__serve-static")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// True when a *foreign* process listens on `port` on a non-loopback
+/// address. Reads the same `ss` table the scan renders.
 fn listens_non_loopback(port: u16) -> bool {
     let Ok(out) = Command::new("ss").args(["-tlnp"]).output() else {
         return false;
@@ -1163,8 +1227,64 @@ fn listens_non_loopback(port: u16) -> bool {
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .skip(1)
-        .filter_map(crate::analyzer::probe::parse_ss_row)
-        .any(|p| p.port == port && address_is_non_loopback(&p.address))
+        .filter(|line| ss_row_listener(line).is_some_and(|(p, non_lo)| p == port && non_lo))
+        .filter(|line| !ss_row_host(line).is_some_and(is_link_local))
+        .any(|line| !owned_by_our_worker(line))
+}
+
+#[cfg(test)]
+mod ss_filter_tests {
+    use super::*;
+
+    const LOOPBACK_ROW: &str =
+        "LISTEN 0 4096 127.0.0.1:16429 0.0.0.0:* \t/users:((\"demo-ghostprov\",pid=7,fd=3))/";
+    const SHIM_ROW: &str =
+        "LISTEN 0 4096 169.254.0.21:16429 0.0.0.0:* \t/users:((\"demo-ghostprov\",pid=8,fd=3))/";
+
+    #[test]
+    fn loopback_rows_parse_as_loopback() {
+        assert_eq!(ss_row_listener(LOOPBACK_ROW), Some((16429, false)));
+        assert_eq!(
+            ss_row_listener("LISTEN 0 4096 [::1]:8080 [::]:* users:((\"a\",pid=1,fd=1))"),
+            Some((8080, false))
+        );
+    }
+
+    #[test]
+    fn wildcard_rows_parse_as_non_loopback() {
+        assert_eq!(ss_row_listener(SHIM_ROW), Some((16429, true)));
+        assert_eq!(
+            ss_row_listener("LISTEN 0 4096 *:9000 0.0.0.0:*"),
+            Some((9000, true))
+        );
+        assert_eq!(
+            ss_row_listener("LISTEN 0 4096 [::]:9000 [::]:*"),
+            Some((9000, true))
+        );
+    }
+
+    #[test]
+    fn pids_are_read_from_the_users_column() {
+        assert_eq!(row_pids(SHIM_ROW), vec![8]);
+        assert_eq!(row_pids("LISTEN 0 4096 *:1 0.0.0.0:*"), Vec::<u32>::new());
+        // Two owners (shared socket) both come out.
+        assert_eq!(
+            row_pids("LISTEN 0 5 *:1 0.0.0.0:* users:((\"a\",pid=3,fd=1),(\"b\",pid=4,fd=1))"),
+            vec![3, 4]
+        );
+    }
+
+    #[test]
+    fn a_foreign_listener_is_not_ours() {
+        // pid 1 is init: its cmdline never carries our worker names.
+        assert!(!owned_by_our_worker(
+            "LISTEN 0 5 *:1 0.0.0.0:* users:((\"systemd\",pid=1,fd=1))"
+        ));
+        // Our own test process: cmdline is the harness, not a worker.
+        let me = std::process::id();
+        let row = format!("LISTEN 0 5 *:1 0.0.0.0:* users:((\"x\",pid={me},fd=1))");
+        assert!(!owned_by_our_worker(&row));
+    }
 }
 
 /// Snapshot the text files inside a freshly cloned tree's go:embed
@@ -1678,7 +1798,7 @@ pub enum ReconcileBasis {
 
 /// The single entry-point reconciliation for processes that do not hold the
 /// deploy lock themselves: panel startup, panel exit, the scripted
-/// `__deploy` watchdog, the `tui_v2` exit paths. The journal is the only
+/// `__deploy` watchdog. The journal is the only
 /// "there might be leftovers" signal, and the flock is the only "is the
 /// deploy behind them still alive" signal (see [`crate::hoster::lock`]) —
 /// asking both here means no caller can forget either: entries untouched
@@ -2200,6 +2320,12 @@ mod tests {
         assert!(!address_is_non_loopback("127.0.0.1:8080"));
         assert!(!address_is_non_loopback("[::1]:8080"));
         assert!(!address_is_non_loopback("localhost:8080"));
+        // The shim's netns listener sits on link-local: ss shows it, but no PID
+        // can be mapped to it, so it must not count as LAN exposure.
+        assert!(is_link_local("169.254.0.21"));
+        assert!(is_link_local("[fe80::1]"));
+        assert!(!is_link_local("192.168.0.5"));
+        assert!(!is_link_local("127.0.0.1"));
     }
 
     /// Reconciliation must clean only genuinely unfinished deploys; a finished

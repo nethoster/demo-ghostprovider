@@ -12,6 +12,10 @@ pub const PROFILES: &[(&str, &str)] = &[
     ("bun", "JavaScript with Bun (e.g. SvelteKit / Vite apps)"),
     ("python", "Python with pip (venv, binary wheels)"),
     ("go", "Go (modules seeded on host, offline build)"),
+    (
+        "static",
+        "Static files, served by the built-in server (no toolchain)",
+    ),
 ];
 
 /// Tools the engine can auto-provision; anything else must be installed.
@@ -67,6 +71,16 @@ pub fn defaults_for_profile(profile: &str) -> Option<ProfileDefaults> {
             port: "0".into(),
             memory_max: "384M".into(),
             tasks_max: "300".into(),
+        }),
+        | "static" => Some(ProfileDefaults {
+            // Nothing to download, nothing to build: the built-in static
+            // server is part of this same binary.
+            prefetch: vec![],
+            build: vec![],
+            run_cmd: "{self} __serve-static {project} {port}".into(),
+            port: "8080".into(),
+            memory_max: "96M".into(),
+            tasks_max: "32".into(),
         }),
         | "python" => Some(ProfileDefaults {
             prefetch: vec![
@@ -200,9 +214,11 @@ pub fn check_tasks(tasks: &str) -> Result<(), String> {
 /// This is the single chokepoint every wizard step goes through.
 pub fn build_manifest(draft: &Draft) -> Result<ServiceManifest, String> {
     if PROFILES.iter().all(|(id, _)| *id != draft.profile) {
+        let known: Vec<&str> = PROFILES.iter().map(|(id, _)| *id).collect();
         return Err(format!(
-            "unknown profile '{}' (pick one of: bun, python, go)",
-            draft.profile
+            "unknown profile '{}' (pick one of: {})",
+            draft.profile,
+            known.join(", ")
         ));
     }
     let port = check_port(&draft.port)?;

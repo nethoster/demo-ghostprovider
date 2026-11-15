@@ -122,6 +122,59 @@ pub fn user_unit_dir() -> PathBuf {
     cfg.join("systemd/user")
 }
 
+/// Name of the provider binary: the one that carries the worker subcommands
+/// (`__serve-static`, `__egress-shim`, `__deploy`, …) that unit files re-exec.
+pub const BIN_NAME: &str = "demo-ghostprovider";
+
+/// Absolute path to *the provider binary*, as baked into unit files,
+/// transient probe units and re-execs.
+///
+/// `current_exe()` follows whatever this process was launched from, which is
+/// not the same thing: a `target/debug` build during development, a detached
+/// copy, or the alternative `demo-test` front-end, which ships none of the
+/// workers. Such a path in `ExecStart` yields a unit that starts and then dies
+/// (`os error 6`) trying to serve a directory it has no code for. Precedence:
+/// 1. `GHOSTPROVIDER_SELF` — explicit override (packaging, tests);
+/// 2. this process, when its file name is the provider itself;
+/// 3. `$HOME/.local/bin/demo-ghostprovider` — where `install.sh` puts it;
+/// 4. `BIN_NAME` on `PATH`;
+/// 5. this process anyway: a path beats a bare name.
+pub fn self_exe() -> PathBuf {
+    if let Some(p) = std::env::var_os("GHOSTPROVIDER_SELF")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+    {
+        return p;
+    }
+    let running = std::env::current_exe().ok();
+    if let Some(cur) = &running
+        && cur
+            .file_stem()
+            .is_some_and(|s| s == std::ffi::OsStr::new(BIN_NAME))
+    {
+        return cur.clone();
+    }
+    installed_bin()
+        .or(running)
+        .unwrap_or_else(|| PathBuf::from(BIN_NAME))
+}
+
+/// The installed provider, if one sits where `install.sh` and the panel look
+/// for it: `$HOME/.local/bin` first, then `PATH`.
+fn installed_bin() -> Option<PathBuf> {
+    if let Some(local) = std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin")) {
+        let candidate = local.join(BIN_NAME);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    std::env::var_os("PATH").and_then(|p| {
+        std::env::split_paths(&p)
+            .map(|d| d.join(BIN_NAME))
+            .find(|p| p.is_file())
+    })
+}
+
 /// True when the binary this process is running differs from the file that
 /// now sits at its path — i.e. a newer build was installed (mv-replaced)
 /// while this process stayed up, so every deploy it runs is old code with
@@ -246,6 +299,48 @@ mod tests {
     fn deleted_marker_is_stripped_from_disk_path() {
         assert_eq!(strip_deleted_suffix("/opt/gp/bin"), "/opt/gp/bin");
         assert_eq!(strip_deleted_suffix("/opt/gp/bin (deleted)"), "/opt/gp/bin");
+    }
+
+    #[test]
+    fn self_exe_honours_the_explicit_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = std::env::temp_dir().join(format!("gp-selfexe-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fake = tmp.join(BIN_NAME);
+        std::fs::write(&fake, b"pinned").unwrap();
+        #[allow(unsafe_code)] // test-only env mutation
+        unsafe {
+            std::env::set_var("GHOSTPROVIDER_SELF", &fake);
+        }
+        assert_eq!(self_exe(), fake);
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("GHOSTPROVIDER_SELF");
+        }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_vanished_override_is_ignored() {
+        // A stale override (package uninstalled, path deleted) must fall
+        // through to the real resolution instead of baking a dead path into
+        // ExecStart.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let gone = std::env::temp_dir().join(format!("gp-selfexe-gone-{}", std::process::id()));
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var("GHOSTPROVIDER_SELF", &gone);
+        }
+        assert_ne!(self_exe(), gone);
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var("GHOSTPROVIDER_SELF");
+        }
+    }
+
+    #[test]
+    fn self_exe_never_resolves_to_an_empty_path() {
+        assert!(!self_exe().as_os_str().is_empty());
     }
 
     #[test]

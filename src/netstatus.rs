@@ -81,7 +81,10 @@ pub fn note_down(host: &str) -> bool {
         .last_report
         .map(|l| now.duration_since(l) >= HEARTBEAT)
         .unwrap_or(true);
-    if should_emit(first, due) {
+    // `first && due`: a host that drops again right after recovering used to
+    // re-emit on every flap ("since 0s" storm) because `first` bypassed the
+    // throttle. The transition still prints, but only once per HEARTBEAT.
+    if should_emit(first && due, due) {
         st.last_report = Some(now);
         let n = st.down.len();
         let since = st.since.unwrap_or(now);
@@ -110,7 +113,9 @@ pub fn note_up(host: &str) {
                 fmt_since(since)
             ));
         }
-        st.last_report = None;
+        // Keep the throttle armed across flaps: recovery is reported, but it
+        // must not unlock a fresh burst of "unreachable" lines.
+        st.last_report = Some(Instant::now());
     }
 }
 

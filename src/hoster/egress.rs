@@ -29,6 +29,7 @@
 
 use std::io::Read;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
@@ -189,6 +190,60 @@ pub fn kernel_enforces_ip_filter() -> bool {
         .unwrap_or(false)
 }
 
+/// One-line rendering of a stored manifest's egress policy.
+pub fn describe_policy(allow: &[String], auto: Option<bool>) -> String {
+    if allow.is_empty() {
+        return "deny-all: REAL (private netns)".to_string();
+    }
+    let auto_marker = if auto == Some(true) { " (auto)" } else { "" };
+    let best = if kernel_enforces_ip_filter() {
+        ""
+    } else {
+        " · best-effort"
+    };
+    format!("allow: {}{auto_marker}{best}", allow.join(", "))
+}
+
+/// One-line rendering of a policy read back from a deployed unit.
+///
+/// `netns` decides whether "deny-all" is a real boundary (`PrivateNetwork=yes`
+/// — no route out at all) or only the address filter, which needs the kernel's
+/// BPF support to bite.
+pub fn describe_unit_policy(allow: &[String], netns: bool) -> String {
+    if allow.is_empty() {
+        return if netns {
+            "deny-all: REAL (private netns)".to_string()
+        } else {
+            "deny-all: IP filter only (no netns)".to_string()
+        };
+    }
+    format!("allow: {}", allow.join(", "))
+}
+
+/// Policy of a deployed unit, read from the unit file itself — the only
+/// source for a service deployed straight from a GitHub URL, which has no
+/// stored manifest. Returns the allow-list (default loopback entries
+/// stripped) and whether the unit runs in its own network namespace.
+pub fn policy_from_unit_file(unit: &Path) -> Option<(Vec<String>, bool)> {
+    let text = std::fs::read_to_string(unit).ok()?;
+    let mut netns = false;
+    let mut allow: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "PrivateNetwork=yes" {
+            netns = true;
+        }
+        if let Some(rest) = line.strip_prefix("IPAddressAllow=") {
+            for host in rest.split_whitespace() {
+                if host != "127.0.0.1" && host != "::1" && !allow.iter().any(|a| a == host) {
+                    allow.push(host.to_string());
+                }
+            }
+        }
+    }
+    Some((allow, netns))
+}
+
 /// systemd's `IPAddressAllow=` parses bare addresses (optionally
 /// `ADDRESS/PREFIXLENGTH`) and the special names `any`/`localhost`/
 /// `link-local`/`multicast` — never hostnames: a name in the directive makes
@@ -320,7 +375,7 @@ fn run_filtered_probe(allow: &[String], probed: &[String]) -> Option<Vec<String>
     if !cmd_on_path("systemd-run") {
         return None;
     }
-    let exe = std::env::current_exe().ok()?;
+    let exe = crate::paths::self_exe();
     let unit = format!(
         "ghost-egress-{}.service",
         crate::atomic::random_hex(4).unwrap_or_default()

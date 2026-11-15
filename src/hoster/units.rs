@@ -424,9 +424,7 @@ fn render_unit(spec: &UnitSpec) -> anyhow::Result<String> {
     // inside the namespace. The app command itself is unchanged.
     let netns = spec.egress_allow.is_empty();
     let exec = if netns {
-        let exe = std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "demo-ghostprovider".into());
+        let exe = crate::paths::self_exe().to_string_lossy().into_owned();
         format!(
             "\"{}\" \"__egress-shim\" \"{}\" \"--\" {}",
             escape_unit_value(&exe),

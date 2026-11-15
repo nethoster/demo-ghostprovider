@@ -4,6 +4,7 @@
 //! that the *selected recipe's build tools* are installed — the old check
 //! stayed green and then failed deep inside `bun install` / `go build`.
 
+use std::path::Path;
 use std::process::Command;
 
 /// One human-readable issue per failed check; empty slice = green light.
@@ -19,16 +20,33 @@ pub fn preflight_check(tools: &[&str]) -> Vec<String> {
         Ok(out) => {
             let stdout = String::from_utf8_lossy(&out.stdout);
             if !out.status.success() && !stdout.contains("degraded") {
-                issues.push("systemd not running properly".into());
+                issues.push(
+                    "systemd user manager is not reachable from this shell \
+                     (systemctl --user is-system-running failed) — run from a logged-in session, \
+                     or `loginctl enable-linger $USER` so units outlive the login"
+                        .into(),
+                );
             }
         }
     }
 
     // ── systemd-nspawn ──
-    match Command::new("systemd-nspawn").arg("--version").output() {
-        Err(_) => issues.push("systemd-nspawn not installed".into()),
-        Ok(out) if !out.status.success() => issues.push("systemd-nspawn not available".into()),
-        Ok(_) => {}
+    // Deliberately not a check any more. Nothing in the deploy path launches
+    // nspawn: builds run in `systemd-run --user` (see `sandbox.rs`) and the
+    // binary only ever mentioned it as a label. Requiring it rejected
+    // Debian/Ubuntu hosts — where nspawn is a separate package — while their
+    // deploys worked perfectly.
+
+    // ── cgroup v2 ──
+    // Resource caps (MemoryMax/TasksMax) and the egress IP filters attach to
+    // the unified hierarchy; on v1 hosts they silently degrade.
+    if !cgroup_v2() {
+        issues.push(
+            "cgroup v2 unified hierarchy not found (/sys/fs/cgroup/cgroup.controllers is missing) \
+             — memory/task caps and egress filters need it: boot with \
+             systemd.unified_cgroup_hierarchy=1"
+                .into(),
+        );
     }
 
     // ── network: github.com is what we actually need for clone/API.
@@ -67,6 +85,28 @@ pub fn which(bin: &str) -> bool {
     std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).any(|dir| dir.join(bin).is_file()))
         .unwrap_or(false)
+}
+
+/// Unified cgroup hierarchy: the file exists exactly when v2 is mounted.
+fn cgroup_v2() -> bool {
+    Path::new("/sys/fs/cgroup/cgroup.controllers").is_file()
+}
+
+#[cfg(test)]
+mod nspawn_is_not_a_gate {
+    use super::*;
+
+    #[test]
+    fn missing_nspawn_never_blocks_a_deploy() {
+        // nspawn is not used by the deploy path (builds run in
+        // `systemd-run --user`); its absence on Debian/Ubuntu must never be
+        // reported as an issue.
+        let issues = preflight_check(&[]);
+        assert!(
+            !issues.iter().any(|i| i.to_lowercase().contains("nspawn")),
+            "{issues:?}"
+        );
+    }
 }
 
 fn install_hint(tool: &str) -> &'static str {

@@ -65,7 +65,7 @@ pub fn start(service: &str, unit_name: &str, local_url: &str) -> Result<ShareRec
         crate::paths::safe_component(service),
         crate::atomic::random_hex(4).unwrap_or_else(|_| "connector".into())
     );
-    let exe = std::env::current_exe().map_err(|e| format!("cannot locate own binary: {e}"))?;
+    let exe = crate::paths::self_exe();
     let mut cmd = Command::new(exe);
     cmd.arg("__cloudflared-supervisor")
         .arg("--service")
